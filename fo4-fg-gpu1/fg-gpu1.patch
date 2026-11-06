@@ -3404,7 +3404,7 @@ index 692f459..15205cf 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..556d8e7 100644
+index 9fa46df..ed5c36d 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
 @@ -3,34 +3,508 @@
@@ -3928,7 +3928,7 @@ index 9fa46df..556d8e7 100644
  }
  
  [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
-@@ -45,13 +519,71 @@ void FidelityFX::SetupFrameGeneration()
+@@ -45,13 +519,84 @@ void FidelityFX::SetupFrameGeneration()
  	return singleton.get();
  }
  
@@ -3960,18 +3960,31 @@ index 9fa46df..556d8e7 100644
 +			REX::INFO("[FSR] further camera FOV changes are not logged");
 +			return;
 +		}
++		// For comparison: the vertical FOV the game's FOV setting gives if it is a horizontal angle at
++		// the display aspect, or at 4:3 (the older Creation Engine convention).
 +		auto camera = RE::PlayerCamera::GetSingleton();
++		const float worldDeg = camera ? camera->worldFOV : 0.0f;
++		const float halfTan = std::tan(worldDeg * 0.5f / 57.29578f);
++		const float atDisplay = 2.0f * std::atan(halfTan / a_aspect) * 57.29578f;
++		const float at43 = 2.0f * std::atan(halfTan * 0.75f) * 57.29578f;
 +		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {} (P[1][1] {:.4f}, P[0][0]*aspect {:.4f}; "
-+				  "PlayerCamera worldFOV {:.1f}, firstPersonFOV {:.1f})",
-+			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, camera ? camera->worldFOV : 0.0f,
++				  "PlayerCamera worldFOV {:.1f} = {:.1f} deg vertical if horizontal at the display aspect, {:.1f} deg at 4:3; "
++				  "firstPersonFOV {:.1f})",
++			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, worldDeg, atDisplay, at43,
 +			camera ? camera->firstPersonFOV : 0.0f);
 +	};
 +
 +	if (!perspective) {
-+		static bool loggedReject = false;
-+		if (!loggedReject) {
-+			report("sample rejected (not a perspective projection), keeping", worldFov);
-+			loggedReject = true;
++		// Once per hook: a wrong sampling point shows up in the log without flooding it.
++		static const char* rejectedAt[4]{};
++		for (auto& where : rejectedAt) {
++			if (where == a_where)
++				break;
++			if (!where) {
++				where = a_where;
++				report("sample rejected (not a perspective projection), keeping", worldFov);
++				break;
++			}
 +		}
 +		return;
 +	}
@@ -4003,7 +4016,7 @@ index 9fa46df..556d8e7 100644
  	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
  	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
  
-@@ -60,9 +592,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -60,9 +605,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	if (a_useFrameGeneration) {
  		configParameters.frameGenerationEnabled = true;
  
@@ -4014,7 +4027,7 @@ index 9fa46df..556d8e7 100644
  		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
  
  		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
-@@ -93,7 +623,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -93,7 +636,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
  	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
  
@@ -4023,7 +4036,7 @@ index 9fa46df..556d8e7 100644
  		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
  	}
  
-@@ -113,49 +643,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -113,49 +656,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	QueryPerformanceCounter(&currentFrameTime);
  
  	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
@@ -5141,7 +5154,7 @@ index 0000000..6a69738
 +	bool loggedSizeMismatch = false;
 +};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..0a2b9d6 100644
+index 3483d96..f57aab9 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
 @@ -2,8 +2,11 @@
@@ -5401,7 +5414,7 @@ index 3483d96..0a2b9d6 100644
  	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
  	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
  	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
-@@ -324,6 +452,57 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -324,10 +452,69 @@ void Upscaling::CreateFrameGenerationResources()
  	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
  }
  
@@ -5459,20 +5472,19 @@ index 3483d96..0a2b9d6 100644
  void Upscaling::PreAlpha()
  {
  	auto rendererData = RE::BSGraphics::GetRendererData();
-@@ -348,6 +527,12 @@ void Upscaling::PostAlpha()
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
- 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
- 
-+	// The world camera is the renderer's current camera only during the world pass.
++
++	// The world camera is the renderer's current camera only during the world pass, and the call
++	// this hook wraps leaves a 2D camera behind (P[1][1] 0.0131 right after it), so sample before it.
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 +	if (dx12SwapChain->swapChainDesc.Height)
 +		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
 +		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),
-+			"the world pass (after alpha)");
-+
- 	context->OMSetRenderTargets(0, nullptr, nullptr);
- 
- 	{
-@@ -358,10 +543,16 @@ void Upscaling::PostAlpha()
++			"the world pass (before alpha)");
+ 	
+ 	auto& colorMain = rendererData->renderTargets[(uint)RenderTarget::kMain];
+ 	auto& colorPostAlpha = rendererData->renderTargets[(uint)RenderTarget::kMainTemp];
+@@ -358,10 +545,16 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
@@ -5493,7 +5505,7 @@ index 3483d96..0a2b9d6 100644
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +564,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +566,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -5508,7 +5520,7 @@ index 3483d96..0a2b9d6 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +578,9 @@ void Upscaling::PostAlpha()
+@@ -387,6 +580,9 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
@@ -5518,7 +5530,7 @@ index 3483d96..0a2b9d6 100644
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -401,18 +595,59 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -401,18 +597,59 @@ void Upscaling::CopyBuffersToSharedResources()
  
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -5583,7 +5595,7 @@ index 3483d96..0a2b9d6 100644
  
  
  			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
-@@ -558,22 +793,124 @@ void Upscaling::PostDisplay()
+@@ -558,22 +795,124 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  

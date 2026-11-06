@@ -507,6 +507,14 @@ void Upscaling::PreAlpha()
 {
 	auto rendererData = RE::BSGraphics::GetRendererData();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+
+	// The world camera is the renderer's current camera only during the world pass, and the call
+	// this hook wraps leaves a 2D camera behind (P[1][1] 0.0131 right after it), so sample before it.
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	if (dx12SwapChain->swapChainDesc.Height)
+		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
+		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),
+			"the world pass (before alpha)");
 	
 	auto& colorMain = rendererData->renderTargets[(uint)RenderTarget::kMain];
 	auto& colorPostAlpha = rendererData->renderTargets[(uint)RenderTarget::kMainTemp];
@@ -526,12 +534,6 @@ void Upscaling::PostAlpha()
 
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
-
-	// The world camera is the renderer's current camera only during the world pass.
-	if (dx12SwapChain->swapChainDesc.Height)
-		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
-		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),
-			"the world pass (after alpha)");
 
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 

@@ -546,18 +546,31 @@ void FidelityFX::SampleWorldCameraFov(float a_aspect, const char* a_where)
 			REX::INFO("[FSR] further camera FOV changes are not logged");
 			return;
 		}
+		// For comparison: the vertical FOV the game's FOV setting gives if it is a horizontal angle at
+		// the display aspect, or at 4:3 (the older Creation Engine convention).
 		auto camera = RE::PlayerCamera::GetSingleton();
+		const float worldDeg = camera ? camera->worldFOV : 0.0f;
+		const float halfTan = std::tan(worldDeg * 0.5f / 57.29578f);
+		const float atDisplay = 2.0f * std::atan(halfTan / a_aspect) * 57.29578f;
+		const float at43 = 2.0f * std::atan(halfTan * 0.75f) * 57.29578f;
 		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {} (P[1][1] {:.4f}, P[0][0]*aspect {:.4f}; "
-				  "PlayerCamera worldFOV {:.1f}, firstPersonFOV {:.1f})",
-			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, camera ? camera->worldFOV : 0.0f,
+				  "PlayerCamera worldFOV {:.1f} = {:.1f} deg vertical if horizontal at the display aspect, {:.1f} deg at 4:3; "
+				  "firstPersonFOV {:.1f})",
+			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, worldDeg, atDisplay, at43,
 			camera ? camera->firstPersonFOV : 0.0f);
 	};
 
 	if (!perspective) {
-		static bool loggedReject = false;
-		if (!loggedReject) {
-			report("sample rejected (not a perspective projection), keeping", worldFov);
-			loggedReject = true;
+		// Once per hook: a wrong sampling point shows up in the log without flooding it.
+		static const char* rejectedAt[4]{};
+		for (auto& where : rejectedAt) {
+			if (where == a_where)
+				break;
+			if (!where) {
+				where = a_where;
+				report("sample rejected (not a perspective projection), keeping", worldFov);
+				break;
+			}
 		}
 		return;
 	}

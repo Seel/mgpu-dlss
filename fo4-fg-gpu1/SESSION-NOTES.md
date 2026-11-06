@@ -50,6 +50,15 @@ shows something else (e.g. the 24° camera), the world camera is not current the
 candidates: `UpdateDynamicResolution` (Upscaling.dll's hook at the start of the world render) or
 deriving it from `PlayerCamera`.
 
+**Third run (20:54, 3rd then 1st person):** everything else fine — 98-line log, every gameplay
+frame upscaled (FSR 4.2 ms), 70.9/141.8 steady, no errors. But the world-pass sample **after**
+the call `DrawWorld_Reticle` wraps also saw the 2D camera (P[1][1] 0.0131, rejected), so the FOV
+stayed at the 1 rad default all run. `PlayerCamera` read `worldFOV 98, firstPersonFOV 98` in 3rd
+person. **Change (built 20:58, not yet run):** sample in `PreAlpha` instead (just before that call);
+the log line now also prints what `worldFOV` gives as vertical FOV if it is horizontal at the display
+aspect and if at 4:3, which settles the convention. Rejections are logged once per hook. Not merged
+to `main` yet: the user asked to merge once the logs check out.
+
 Goal: free the 3090 for heavier graphics mods. With `Upscaling.dll`'s
 `iUpscaleMethodPreference = 3`, the 3090 renders the 3D scene at the quality mode's resolution
 (Quality = 2560×1440 at 4K) and the 9060 upscales it with **FSR 4.1.2** (SDK 2.4, ML, works on
