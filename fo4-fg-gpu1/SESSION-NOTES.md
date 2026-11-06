@@ -578,9 +578,9 @@ same `3e237a4` tree. Watch for Community Shaders conflicts.
   but `secondaryGPU` stays true, so `Present` skips both the bridge and the single-GPU path: the
   screen freezes and only a restart recovers. At minimum document it; optionally attempt a degraded
   present.
-- Expose `bSendHudlessFrame` (and the GPU1 mode) in `package/MCM/Config/FrameGeneration/config.json`
-  so it is discoverable in MCM instead of hand-editing the ini.
-- Commit and push the repo (workflow included). The push will trigger the GitHub build.
+- ~~Expose `bSendHudlessFrame` (and the GPU1 mode) in MCM~~ — done: every setting is in MCM.
+- Commit and push the repo (workflow included). The GitHub build is manual only
+  (`workflow_dispatch`; Actions → FO4 FG on GPU1 → Run workflow); pushes do not build.
 - Consider measuring the 9060's FSR3 cost directly (timestamps around the direct-queue work) to
   validate the overlap estimate before building it.
 - Optional: log the 9060's unpack time separately, so "read vs FG" is not inferred.

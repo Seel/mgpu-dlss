@@ -57,7 +57,7 @@ package complete with 0 warnings, and the resulting DLL exports the three F4SE e
 ## Build on GitHub
 
 1. Commit and push; `.github/workflows/fo4-fg-gpu1.yml` is already in place.
-2. On GitHub, open **Actions → FO4 FG on GPU1**. It runs on push, or use **Run workflow**.
+2. On GitHub, open **Actions → FO4 FG on GPU1** and use **Run workflow**. It is manual only; pushes do not start a build.
 3. When it's green, download the **FO4-FG-GPU1** artifact. It's a zip laid out as a mod (`Data\F4SE\Plugins\AAAFrameGeneration.dll`, …).
 
 ## Install

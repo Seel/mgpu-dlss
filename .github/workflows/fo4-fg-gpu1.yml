@@ -1,14 +1,11 @@
 # Builds AAAFrameGeneration.dll from northaxosky/FO4Upscaling (pinned) with the
 # secondary-GPU frame generation changes in fo4-fg-gpu1/overlay copied over it.
 # Output: an artifact "FO4-FG-GPU1" laid out as a mod (Data\...), ready for Vortex/MO2.
+# Manual only (Actions -> FO4 FG on GPU1 -> Run workflow); pushes do not build.
 name: FO4 FG on GPU1
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'fo4-fg-gpu1/**'
-      - '.github/workflows/fo4-fg-gpu1.yml'
 
 permissions:
   contents: read
