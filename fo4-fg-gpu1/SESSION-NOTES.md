@@ -67,6 +67,16 @@ run):** read `State::cameraDataCache` (every camera of the frame) and take the w
 with the upscaler's jitter. The cache is listed in the log once (each entry: jitter flag, P[1][1],
 FOV), and the chosen FOV is printed next to both `worldFOV` conversions.
 
+**Fifth run (21:04) — FOV fixed, merged to `main`.** The cache had 5 cameras: a jittered and an
+unjittered 24° pair (a UI/3D-model camera), one jittered non-perspective one, and the world camera
+as a jittered/unjittered pair at **65.8°**, exactly `worldFOV 98` taken as horizontal at the display
+aspect. Switching to 1st person: **77.6°** = `worldFOV 110` the same way. So FO4's FOV setting is
+horizontal at the display aspect (not 4:3). Single transitional readings (75.5°, 85.6°) during the
+view switch. The latch went to 24° only at the very end (quitting; no further stats lines): with no
+world camera in the list the 24° camera is the widest left. Those frames are not upscaled and get no
+FG, and it switches back when the world is drawn again. Everything else unchanged: 70.4–70.7 / 141,
+FSR 4.1–4.2 ms, 111-line log, no errors.
+
 Goal: free the 3090 for heavier graphics mods. With `Upscaling.dll`'s
 `iUpscaleMethodPreference = 3`, the 3090 renders the 3D scene at the quality mode's resolution
 (Quality = 2560×1440 at 4K) and the 9060 upscales it with **FSR 4.1.2** (SDK 2.4, ML, works on
