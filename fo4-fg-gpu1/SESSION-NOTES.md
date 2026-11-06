@@ -59,6 +59,14 @@ the log line now also prints what `worldFOV` gives as vertical FOV if it is hori
 aspect and if at 4:3, which settles the convention. Rejections are logged once per hook. Not merged
 to `main` yet: the user asked to merge once the logs check out.
 
+**Fourth run (20:59):** `PreAlpha` also sees the 2D camera (P[1][1] 0.0131); the current camera
+state is never the world camera at our hooks. `worldFOV 98` → 65.8° (horizontal at 16:9) or 81.6°
+(at 4:3); the web has no authoritative answer on FO4's convention. **Change (built 21:02, not yet
+run):** read `State::cameraDataCache` (every camera of the frame) and take the widest entry with
+`useJitter` and a perspective projection for the display aspect: the world camera is the one drawn
+with the upscaler's jitter. The cache is listed in the log once (each entry: jitter flag, P[1][1],
+FOV), and the chosen FOV is printed next to both `worldFOV` conversions.
+
 Goal: free the 3090 for heavier graphics mods. With `Upscaling.dll`'s
 `iUpscaleMethodPreference = 3`, the 3090 renders the 3D scene at the quality mode's resolution
 (Quality = 2560×1440 at 4K) and the 9060 upscales it with **FSR 4.1.2** (SDK 2.4, ML, works on

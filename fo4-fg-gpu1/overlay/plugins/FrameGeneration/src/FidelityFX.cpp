@@ -528,16 +528,39 @@ namespace
 
 void FidelityFX::SampleWorldCameraFov(float a_aspect, const char* a_where)
 {
-	// The renderer's camera state is the camera of the pass that ran last: a 2D camera after
-	// imagespace (P[1][1] ~0.013), a narrow one at Present (~24 deg). During the world pass it is the
-	// world camera. projMat is a real projection (it matches inverse(view) * viewProjUnjittered);
-	// accept it only if it looks like a perspective one, P[0][0] * aspect == P[1][1].
+	// The renderer's *current* camera state belongs to whichever pass ran last (a 2D camera in the
+	// world-pass hooks and after imagespace, a narrow ~24 deg one at Present), but cameraDataCache
+	// holds every camera of the frame. The world camera is the one rendered with the upscaler's
+	// jitter and a perspective projection for the display aspect (P[0][0] * aspect == P[1][1]);
+	// projMat is a real projection (it matches inverse(view) * viewProjUnjittered). If several
+	// qualify, the widest is taken (UI/model cameras are narrower).
 	static auto gameViewport = State_GetSingleton();
-	const auto& view = gameViewport->cameraState.camViewData;
-	const float yScale = std::fabs(Component(view.projMat[1], 1));
-	const float xScale = std::fabs(Component(view.projMat[0], 0));
-	const bool perspective = std::isfinite(yScale) && std::isfinite(xScale) && yScale > 0.1f && yScale < 20.0f &&
-	                         std::fabs(xScale * a_aspect - yScale) <= 0.03f * yScale;
+
+	struct Candidate
+	{
+		float p11 = 0.0f;
+		float p00a = 0.0f;
+		bool jitter = false;
+		bool perspective = false;
+	};
+	const auto inspect = [a_aspect](const RE::BSGraphics::CameraStateData& a_state) {
+		Candidate c;
+		c.p11 = std::fabs(Component(a_state.camViewData.projMat[1], 1));
+		c.p00a = std::fabs(Component(a_state.camViewData.projMat[0], 0)) * a_aspect;
+		c.jitter = a_state.useJitter;
+		c.perspective = std::isfinite(c.p11) && std::isfinite(c.p00a) && c.p11 > 0.1f && c.p11 < 20.0f &&
+		                std::fabs(c.p00a - c.p11) <= 0.03f * c.p11;
+		return c;
+	};
+
+	const auto& cache = gameViewport->cameraDataCache;
+	const std::uint32_t count = static_cast<std::uint32_t>(cache.size());
+	float best = 0.0f;
+	for (std::uint32_t i = 0; i < count && i < 64; ++i) {
+		const Candidate c = inspect(cache[i]);
+		if (c.jitter && c.perspective)
+			best = (std::max)(best, 2.0f * std::atan(1.0f / c.p11));
+	}
 
 	const auto report = [&](const char* a_what, float a_fov) {
 		if (fovLogLines > 40)
@@ -553,34 +576,41 @@ void FidelityFX::SampleWorldCameraFov(float a_aspect, const char* a_where)
 		const float halfTan = std::tan(worldDeg * 0.5f / 57.29578f);
 		const float atDisplay = 2.0f * std::atan(halfTan / a_aspect) * 57.29578f;
 		const float at43 = 2.0f * std::atan(halfTan * 0.75f) * 57.29578f;
-		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {} (P[1][1] {:.4f}, P[0][0]*aspect {:.4f}; "
-				  "PlayerCamera worldFOV {:.1f} = {:.1f} deg vertical if horizontal at the display aspect, {:.1f} deg at 4:3; "
-				  "firstPersonFOV {:.1f})",
-			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, worldDeg, atDisplay, at43,
-			camera ? camera->firstPersonFOV : 0.0f);
+		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {}; PlayerCamera worldFOV {:.1f} = {:.1f} deg "
+				  "vertical if horizontal at the display aspect, {:.1f} deg at 4:3; firstPersonFOV {:.1f}",
+			a_what, a_fov, a_fov * 57.29578f, a_where, worldDeg, atDisplay, at43, camera ? camera->firstPersonFOV : 0.0f);
 	};
 
-	if (!perspective) {
-		// Once per hook: a wrong sampling point shows up in the log without flooding it.
-		static const char* rejectedAt[4]{};
-		for (auto& where : rejectedAt) {
-			if (where == a_where)
-				break;
-			if (!where) {
-				where = a_where;
-				report("sample rejected (not a perspective projection), keeping", worldFov);
-				break;
+	// The camera list, once and whenever no world camera is found, so the choice can be checked.
+	static bool listed = false;
+	if (!listed || best == 0.0f) {
+		static int listings = 0;
+		if (listings < 3) {
+			++listings;
+			listed = true;
+			for (std::uint32_t i = 0; i < count && i < 16; ++i) {
+				const Candidate c = inspect(cache[i]);
+				REX::INFO("[FSR] camera {} of {}: jitter {} P[1][1] {:.4f} P[0][0]*aspect {:.4f} -> {}", i, count, c.jitter ? 1 : 0,
+					c.p11, c.p00a, c.perspective ? std::format("{:.1f} deg vertical", 2.0f * std::atan(1.0f / c.p11) * 57.29578f) :
+												   std::string("not a perspective projection"));
 			}
+		}
+	}
+
+	if (best == 0.0f) {
+		static bool loggedMissing = false;
+		if (!loggedMissing) {
+			report("not found (no jittered perspective camera), keeping", worldFov);
+			loggedMissing = true;
 		}
 		return;
 	}
-	const float fov = 2.0f * std::atan(1.0f / yScale);
-	// Logged when it moves by more than a degree (aiming down sights, scopes), not every frame.
-	if (!haveWorldFov || std::fabs(fov - worldFov) > 0.01745f) {
-		worldFov = fov;
-		report(haveWorldFov ? "changed" : "first sample", fov);
+	// Logged when it moves by more than a degree (aiming down sights, scopes, 1st/3rd person).
+	if (!haveWorldFov || std::fabs(best - worldFov) > 0.01745f) {
+		worldFov = best;
+		report(haveWorldFov ? "changed" : "first sample", best);
 	}
-	worldFov = fov;
+	worldFov = best;
 	haveWorldFov = true;
 }
 

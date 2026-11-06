@@ -3404,10 +3404,10 @@ index 692f459..15205cf 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..ed5c36d 100644
+index 9fa46df..ba33d73 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
-@@ -3,34 +3,508 @@
+@@ -3,36 +3,510 @@
  #include "Upscaling.h"
  
  #include "DX12SwapChain.h"
@@ -3752,7 +3752,7 @@ index 9fa46df..ed5c36d 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation swap chain failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
- 
++
 +	std::string swapChainProvider = "3.1.4";
 +	if (sdk24) {
 +		swapChainProvider = ProviderName(swapChainContext);
@@ -3760,7 +3760,7 @@ index 9fa46df..ed5c36d 100644
 +			swapChainProvider.starts_with("3") ? " (no driver-assisted frame pacing; that needs 4.0.0 or newer)" :
 +												 " (driver-assisted frame pacing capable)");
 +	}
-+
+ 
 +	// ---- frame generation
  	ffx::CreateContextDescFrameGeneration createFg{};
 -	createFg.displaySize = { dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height };
@@ -3803,7 +3803,9 @@ index 9fa46df..ed5c36d 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation context failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
-+
+ 
+-	ffx::CreateBackendDX12Desc createBackend{};
+-	createBackend.device = dx12SwapChain->d3d12Device.get();
 +	if (sdk24) {
 +		const auto provider = ProviderName(frameGenContext);
 +		REX::INFO("[FSR] frame generation provider: {} ({})", provider,
@@ -3815,7 +3817,9 @@ index 9fa46df..ed5c36d 100644
 +	}
 +	return true;
 +}
-+
+ 
+-	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
+-		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
 +void FidelityFX::DestroyContexts(IDXGISwapChain4** a_swapChain)
 +{
 +	if (frameGenContext) {
@@ -3830,9 +3834,9 @@ index 9fa46df..ed5c36d 100644
 +	if (a_swapChain && *a_swapChain) {
 +		(*a_swapChain)->Release();
 +		*a_swapChain = nullptr;
-+	}
-+}
-+
+ 	}
+ }
+ 
 +bool FidelityFX::CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, uint32_t a_renderHeight,
 +	uint32_t a_displayWidth, uint32_t a_displayHeight, bool a_debugChecking)
 +{
@@ -3886,9 +3890,7 @@ index 9fa46df..ed5c36d 100644
 +			a_displayWidth, a_displayHeight, ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
- 
--	ffx::CreateBackendDX12Desc createBackend{};
--	createBackend.device = dx12SwapChain->d3d12Device.get();
++
 +	upscalerProvider = ProviderName(upscaleContext);
 +	FfxApiEffectMemoryUsage memory{};
 +	ffx::QueryDescUpscaleGetGPUMemoryUsage memoryQuery{};
@@ -3908,9 +3910,7 @@ index 9fa46df..ed5c36d 100644
 +		return ffx::ReturnCode::Error;
 +	return ffxm::Dispatch(upscaleContext, a_dispatch);
 +}
- 
--	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
--		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
++
 +void FidelityFX::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
 +	ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain)
 +{
@@ -3923,12 +3923,14 @@ index 9fa46df..ed5c36d 100644
 +		DestroyContexts(a_swapChain);
 +		if (LoadRuntime(Runtime::kLegacy) && CreateContexts(a_dxgiFactory, a_desc, a_window, a_queue, a_swapChain))
 +			return;
- 	}
++	}
 +	REX::CRITICAL("[FidelityFX] Failed to create the frame generation swap chain or context!");
- }
- 
++}
++
  [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
-@@ -45,13 +519,84 @@ void FidelityFX::SetupFrameGeneration()
+ {
+ 	REL::Relocation<RE::BSGraphics::State*> singleton{ REL::ID({ 600795, 2704621, 2704621 }) };
+@@ -45,13 +519,114 @@ void FidelityFX::SetupFrameGeneration()
  	return singleton.get();
  }
  
@@ -3942,16 +3944,39 @@ index 9fa46df..ed5c36d 100644
 +
 +void FidelityFX::SampleWorldCameraFov(float a_aspect, const char* a_where)
 +{
-+	// The renderer's camera state is the camera of the pass that ran last: a 2D camera after
-+	// imagespace (P[1][1] ~0.013), a narrow one at Present (~24 deg). During the world pass it is the
-+	// world camera. projMat is a real projection (it matches inverse(view) * viewProjUnjittered);
-+	// accept it only if it looks like a perspective one, P[0][0] * aspect == P[1][1].
++	// The renderer's *current* camera state belongs to whichever pass ran last (a 2D camera in the
++	// world-pass hooks and after imagespace, a narrow ~24 deg one at Present), but cameraDataCache
++	// holds every camera of the frame. The world camera is the one rendered with the upscaler's
++	// jitter and a perspective projection for the display aspect (P[0][0] * aspect == P[1][1]);
++	// projMat is a real projection (it matches inverse(view) * viewProjUnjittered). If several
++	// qualify, the widest is taken (UI/model cameras are narrower).
 +	static auto gameViewport = State_GetSingleton();
-+	const auto& view = gameViewport->cameraState.camViewData;
-+	const float yScale = std::fabs(Component(view.projMat[1], 1));
-+	const float xScale = std::fabs(Component(view.projMat[0], 0));
-+	const bool perspective = std::isfinite(yScale) && std::isfinite(xScale) && yScale > 0.1f && yScale < 20.0f &&
-+	                         std::fabs(xScale * a_aspect - yScale) <= 0.03f * yScale;
++
++	struct Candidate
++	{
++		float p11 = 0.0f;
++		float p00a = 0.0f;
++		bool jitter = false;
++		bool perspective = false;
++	};
++	const auto inspect = [a_aspect](const RE::BSGraphics::CameraStateData& a_state) {
++		Candidate c;
++		c.p11 = std::fabs(Component(a_state.camViewData.projMat[1], 1));
++		c.p00a = std::fabs(Component(a_state.camViewData.projMat[0], 0)) * a_aspect;
++		c.jitter = a_state.useJitter;
++		c.perspective = std::isfinite(c.p11) && std::isfinite(c.p00a) && c.p11 > 0.1f && c.p11 < 20.0f &&
++		                std::fabs(c.p00a - c.p11) <= 0.03f * c.p11;
++		return c;
++	};
++
++	const auto& cache = gameViewport->cameraDataCache;
++	const std::uint32_t count = static_cast<std::uint32_t>(cache.size());
++	float best = 0.0f;
++	for (std::uint32_t i = 0; i < count && i < 64; ++i) {
++		const Candidate c = inspect(cache[i]);
++		if (c.jitter && c.perspective)
++			best = (std::max)(best, 2.0f * std::atan(1.0f / c.p11));
++	}
 +
 +	const auto report = [&](const char* a_what, float a_fov) {
 +		if (fovLogLines > 40)
@@ -3967,34 +3992,41 @@ index 9fa46df..ed5c36d 100644
 +		const float halfTan = std::tan(worldDeg * 0.5f / 57.29578f);
 +		const float atDisplay = 2.0f * std::atan(halfTan / a_aspect) * 57.29578f;
 +		const float at43 = 2.0f * std::atan(halfTan * 0.75f) * 57.29578f;
-+		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {} (P[1][1] {:.4f}, P[0][0]*aspect {:.4f}; "
-+				  "PlayerCamera worldFOV {:.1f} = {:.1f} deg vertical if horizontal at the display aspect, {:.1f} deg at 4:3; "
-+				  "firstPersonFOV {:.1f})",
-+			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, worldDeg, atDisplay, at43,
-+			camera ? camera->firstPersonFOV : 0.0f);
++		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {}; PlayerCamera worldFOV {:.1f} = {:.1f} deg "
++				  "vertical if horizontal at the display aspect, {:.1f} deg at 4:3; firstPersonFOV {:.1f}",
++			a_what, a_fov, a_fov * 57.29578f, a_where, worldDeg, atDisplay, at43, camera ? camera->firstPersonFOV : 0.0f);
 +	};
 +
-+	if (!perspective) {
-+		// Once per hook: a wrong sampling point shows up in the log without flooding it.
-+		static const char* rejectedAt[4]{};
-+		for (auto& where : rejectedAt) {
-+			if (where == a_where)
-+				break;
-+			if (!where) {
-+				where = a_where;
-+				report("sample rejected (not a perspective projection), keeping", worldFov);
-+				break;
++	// The camera list, once and whenever no world camera is found, so the choice can be checked.
++	static bool listed = false;
++	if (!listed || best == 0.0f) {
++		static int listings = 0;
++		if (listings < 3) {
++			++listings;
++			listed = true;
++			for (std::uint32_t i = 0; i < count && i < 16; ++i) {
++				const Candidate c = inspect(cache[i]);
++				REX::INFO("[FSR] camera {} of {}: jitter {} P[1][1] {:.4f} P[0][0]*aspect {:.4f} -> {}", i, count, c.jitter ? 1 : 0,
++					c.p11, c.p00a, c.perspective ? std::format("{:.1f} deg vertical", 2.0f * std::atan(1.0f / c.p11) * 57.29578f) :
++												   std::string("not a perspective projection"));
 +			}
++		}
++	}
++
++	if (best == 0.0f) {
++		static bool loggedMissing = false;
++		if (!loggedMissing) {
++			report("not found (no jittered perspective camera), keeping", worldFov);
++			loggedMissing = true;
 +		}
 +		return;
 +	}
-+	const float fov = 2.0f * std::atan(1.0f / yScale);
-+	// Logged when it moves by more than a degree (aiming down sights, scopes), not every frame.
-+	if (!haveWorldFov || std::fabs(fov - worldFov) > 0.01745f) {
-+		worldFov = fov;
-+		report(haveWorldFov ? "changed" : "first sample", fov);
++	// Logged when it moves by more than a degree (aiming down sights, scopes, 1st/3rd person).
++	if (!haveWorldFov || std::fabs(best - worldFov) > 0.01745f) {
++		worldFov = best;
++		report(haveWorldFov ? "changed" : "first sample", best);
 +	}
-+	worldFov = fov;
++	worldFov = best;
 +	haveWorldFov = true;
 +}
 +
@@ -4016,7 +4048,7 @@ index 9fa46df..ed5c36d 100644
  	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
  	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
  
-@@ -60,9 +605,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -60,9 +635,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	if (a_useFrameGeneration) {
  		configParameters.frameGenerationEnabled = true;
  
@@ -4027,7 +4059,7 @@ index 9fa46df..ed5c36d 100644
  		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
  
  		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
-@@ -93,7 +636,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -93,7 +666,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
  	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
  
@@ -4036,7 +4068,7 @@ index 9fa46df..ed5c36d 100644
  		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
  	}
  
-@@ -113,49 +656,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -113,49 +686,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	QueryPerformanceCounter(&currentFrameTime);
  
  	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
@@ -5154,7 +5186,7 @@ index 0000000..6a69738
 +	bool loggedSizeMismatch = false;
 +};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..f57aab9 100644
+index 3483d96..e7c143d 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
 @@ -2,8 +2,11 @@
@@ -5474,8 +5506,8 @@ index 3483d96..f57aab9 100644
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 +
-+	// The world camera is the renderer's current camera only during the world pass, and the call
-+	// this hook wraps leaves a 2D camera behind (P[1][1] 0.0131 right after it), so sample before it.
++	// FSR's camera FOV: by now the frame's camera list holds the world camera (FidelityFX::
++	// SampleWorldCameraFov), in time for this frame's FSR 4.1 dispatch and frame generation.
 +	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 +	if (dx12SwapChain->swapChainDesc.Height)
 +		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
@@ -5536,7 +5568,7 @@ index 3483d96..f57aab9 100644
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 -	
 +
-+	// The world camera is the renderer's current camera only during the world pass.
++	// FSR's camera FOV (when the hook above did not run this frame).
 +	if (dx12SwapChain->swapChainDesc.Height)
 +		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
 +		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),

@@ -508,8 +508,8 @@ void Upscaling::PreAlpha()
 	auto rendererData = RE::BSGraphics::GetRendererData();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 
-	// The world camera is the renderer's current camera only during the world pass, and the call
-	// this hook wraps leaves a 2D camera behind (P[1][1] 0.0131 right after it), so sample before it.
+	// FSR's camera FOV: by now the frame's camera list holds the world camera (FidelityFX::
+	// SampleWorldCameraFov), in time for this frame's FSR 4.1 dispatch and frame generation.
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 	if (dx12SwapChain->swapChainDesc.Height)
 		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
@@ -598,7 +598,7 @@ void Upscaling::CopyBuffersToSharedResources()
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 
-	// The world camera is the renderer's current camera only during the world pass.
+	// FSR's camera FOV (when the hook above did not run this frame).
 	if (dx12SwapChain->swapChainDesc.Height)
 		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
 		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),
