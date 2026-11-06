@@ -1,6 +1,5 @@
 #include "DX12SwapChain.h"
 
-#include <dx12/ffx_api_dx12.hpp>
 #include <dxgi1_6.h>
 
 #include "CrossAdapterBridge.h"
@@ -152,24 +151,13 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
 
 void DX12SwapChain::CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
 {
-	REX::INFO("[FG] Creating FSR3 swap chain via FFX");
-
-	ffx::CreateContextDescFrameGenerationSwapChainForHwndDX12 ffxSwapChainDesc{};
-	ffxSwapChainDesc.desc = &swapChainDesc;
-	ffxSwapChainDesc.dxgiFactory = a_dxgiFactory;
-	ffxSwapChainDesc.fullscreenDesc = nullptr;
-	ffxSwapChainDesc.gameQueue = commandQueue.get();
-	ffxSwapChainDesc.hwnd = a_swapChainDesc.OutputWindow;
-	ffxSwapChainDesc.swapchain = &swapChain;
-
 	auto fidelityFX = FidelityFX::GetSingleton();
+	REX::INFO("[FG] Creating FSR3 swap chain via FFX ({})", fidelityFX->RuntimeName());
 
-	if (ffx::CreateContext(fidelityFX->swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
-		REX::CRITICAL("[FidelityFX] Failed to create swap chain context!");
-	}
-
-	fidelityFX->SetupFrameGeneration();
-	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
+	// Swap chain context + frame generation context; with iFSRRuntime = 1 this logs the providers
+	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
+	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
+	REX::INFO("[FG] FSR3 swap chain created: {}x{} ({})", swapChainDesc.Width, swapChainDesc.Height, fidelityFX->RuntimeName());
 }
 
 void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
@@ -557,6 +545,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
 		SyncInterval = 1;
 
+	// FSR SDK 2.4: the 4.0.0 swap chain's driver-assisted frame pacing switches itself off while
+	// VSync is on, and nothing else reports that.
+	if (SyncInterval > 0 && upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 &&
+		FidelityFX::GetSingleton()->runtime == FidelityFX::Runtime::kSDK24) {
+		static bool loggedVSync = false;
+		if (!loggedVSync) {
+			REX::INFO("[FSR] VSync is on (SyncInterval {}): driver-assisted frame pacing stays off. Set iPresentInterval=0 "
+					  "in Fallout4Prefs.ini to allow it", SyncInterval);
+			loggedVSync = true;
+		}
+	}
+
 	// Latch UI frame index for the compositor before Streamline's Present
 	// The real Present hook needs to know which UIColorAlpha buffer was last written
 	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
@@ -616,8 +616,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
 	// FSR3/DLSS-G wrapped swap chains manage latency internally)
 	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
-	if (frameLatencyWaitableObject)
+	if (frameLatencyWaitableObject) {
 		WaitForSingleObjectEx(frameLatencyWaitableObject, INFINITE, TRUE);
+		// FSR SDK 2.x swap chains return a fresh duplicate on every call, which the caller must
+		// close (null here unless the swap chain is created with the waitable-object flag).
+		if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 &&
+			FidelityFX::GetSingleton()->runtime == FidelityFX::Runtime::kSDK24)
+			CloseHandle(frameLatencyWaitableObject);
+	}
 
 	if (crossAdapter) {
 		LARGE_INTEGER waitEnd{};

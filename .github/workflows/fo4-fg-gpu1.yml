@@ -73,6 +73,23 @@ jobs:
         working-directory: FO4Upscaling
         run: bash scripts/fetch-sdks.sh
 
+      # iFSRRuntime = 1: FSR SDK 2.4 loader + frame-generation DLL, pinned to the v2.4.0 commit
+      # (same files and hashes as build-local.ps1; the release has no binary asset).
+      - name: Fetch FSR SDK 2.4 runtime
+        shell: bash
+        working-directory: FO4Upscaling
+        run: |
+          set -e
+          COMMIT=7539ae8b6568ad29ed78a753404351daf3b5cca7
+          DEST=package/F4SE/Plugins/FrameGeneration/FidelityFX
+          mkdir -p "$DEST"
+          fetch() {
+            curl -fSL "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/$COMMIT/Kits/FidelityFX/signedbin/$1" -o "$DEST/$1"
+            echo "$2  $DEST/$1" | sha256sum -c -
+          }
+          fetch amd_fidelityfx_loader_dx12.dll e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb
+          fetch amd_fidelityfx_framegeneration_dx12.dll e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6
+
       - name: Package
         shell: bash
         run: |
@@ -84,6 +101,9 @@ jobs:
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/"*.hlsl "$OUT/F4SE/Plugins/FrameGeneration/"
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/LICENSE.txt" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_loader_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_framegeneration_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/LICENSE-FSR-SDK-2.4.txt" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
           cp -r "$SRC/package/MCM/Config/FrameGeneration/." "$OUT/MCM/Config/FrameGeneration/"
           cp "$SRC/COPYING" "$SRC/LICENSE" "$SRC/EXCEPTIONS.md" staging/ 2>/dev/null || true
           cp mgpu-dlss/fo4-fg-gpu1/README.md staging/FG-GPU1-README.md

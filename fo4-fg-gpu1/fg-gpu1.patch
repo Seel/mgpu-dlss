@@ -134,7 +134,7 @@ index 0000000..9533257
 +#endif
 +}
 diff --git a/package/MCM/Config/FrameGeneration/config.json b/package/MCM/Config/FrameGeneration/config.json
-index 554ba18..3475eca 100644
+index 554ba18..09a78b7 100644
 --- a/package/MCM/Config/FrameGeneration/config.json
 +++ b/package/MCM/Config/FrameGeneration/config.json
 @@ -22,7 +22,15 @@
@@ -195,10 +195,57 @@ index 554ba18..3475eca 100644
  			"valueOptions": {
  				"sourceType": "ModSettingInt",
  				"options": [
-@@ -92,15 +100,99 @@
+@@ -92,15 +100,146 @@
  			"text": "",
  			"type": "text"
  		},
++		{
++			"text": "FSR RUNTIME",
++			"type": "section"
++		},
++		{
++			"id": "iFSRRuntime:Settings",
++			"text": "FSR Runtime (restart)",
++			"type": "stepper",
++			"help": "FSR SDK 2.4 uses the newest FSR frame generation your driver and Windows offer: the 4.0.0 swap chain (driver-assisted frame pacing on RX 9000 with Adrenalin 26.10.1+, VSync off, fullscreen/borderless, inside the VRR range) and FSR 4 ML frame generation where available (Windows 11 + RX 9000), otherwise FSR 3.1.6. The log lists what was offered and used. SDK 1.1.4 is the FSR 3.1.4 runtime this mod was tested with. Requires a game restart. (Default: FSR SDK 2.4)",
++			"valueOptions": {
++				"sourceType": "ModSettingInt",
++				"options": [
++					"FidelityFX SDK 1.1.4 (FSR 3.1.4)",
++					"FSR SDK 2.4 (newest offered)"
++				]
++			}
++		},
++		{
++			"id": "iFSRSwapChainProvider:Settings",
++			"text": "FSR 2.4 Swap Chain (restart)",
++			"type": "stepper",
++			"help": "FSR SDK 2.4 only. Newest: the newest swap chain offered (4.0.0 on RX 9000, with driver-assisted frame pacing). 3.x: the newest 3.x swap chain (3.1.7), which paces frames itself - for comparing pacing. Requires a game restart. (Default: Newest)",
++			"valueOptions": {
++				"sourceType": "ModSettingInt",
++				"options": [
++					"Newest offered",
++					"3.x only"
++				]
++			}
++		},
++		{
++			"id": "iFSRFrameGenProvider:Settings",
++			"text": "FSR 2.4 Frame Generation (restart)",
++			"type": "stepper",
++			"help": "FSR SDK 2.4 only. Newest: FSR 4 ML frame generation where offered (Windows 11 + RX 9000), otherwise the newest FSR 3 interpolator (3.1.6). 3.x: always the FSR 3 interpolator - for comparing image quality and cost. Requires a game restart. (Default: Newest)",
++			"valueOptions": {
++				"sourceType": "ModSettingInt",
++				"options": [
++					"Newest offered",
++					"3.x only"
++				]
++			}
++		},
++		{
++			"text": "",
++			"type": "text"
++		},
 +		{
 +			"text": "SECOND GPU (FG-GPU1)",
 +			"type": "section"
@@ -298,10 +345,10 @@ index 554ba18..3475eca 100644
  				"sourceType": "ModSettingBool"
  			}
 diff --git a/package/MCM/Config/FrameGeneration/settings.ini b/package/MCM/Config/FrameGeneration/settings.ini
-index fa75993..e947f7b 100644
+index fa75993..1535640 100644
 --- a/package/MCM/Config/FrameGeneration/settings.ini
 +++ b/package/MCM/Config/FrameGeneration/settings.ini
-@@ -8,13 +8,13 @@ bFrameGenerationMode = 1
+@@ -8,18 +8,86 @@ bFrameGenerationMode = 1
  ; Default: true
  bFrameLimitMode = 1
  
@@ -318,7 +365,24 @@ index fa75993..e947f7b 100644
  
  ; DLSS-G frame multiplier (requires game restart, RTX 50+ for 3x/4x)
  ; Default: 0 (0=2x, 1=3x MFG, 2=4x MFG)
-@@ -23,3 +23,55 @@ iFrameGenFrames = 0
+ iFrameGenFrames = 0
+ 
++; FSR runtime used for FSR frame generation (requires game restart).
++;   0 = FidelityFX SDK 1.1.4 (FSR 3.1.4), the runtime this mod was first tested with.
++;   1 = FSR SDK 2.4: the newest FSR frame generation the driver and Windows offer. On an RX 9000
++;       with Adrenalin 26.10.1+ that is the 4.0.0 swap chain (driver-assisted frame pacing when
++;       VSync is off, the game covers the display and runs inside the VRR range), plus FSR 4 ML
++;       frame generation on Windows 11 - otherwise the FSR 3.1.6 interpolator. The log lists
++;       what was offered and what is used. If 2.4 fails to start, the plugin falls back to 1.1.4.
++; Default: 1
++iFSRRuntime = 1
++
++; FSR SDK 2.4 only (requires game restart): which swap chain / interpolator to use.
++;   0 = newest offered, 1 = newest 3.x (swap chain 3.1.7 / FSR 3.1.6), for A/B comparisons.
++; Default: 0
++iFSRSwapChainProvider = 0
++iFSRFrameGenProvider = 0
++
  ; Enables verbose Streamline logging for troubleshooting. Requires game restart.
  ; Default: false
  bEnableDebugLogging = 0
@@ -2669,18 +2733,20 @@ index 81be80f..5f5de78 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..80c0a23 100644
+index e10d528..6cabc1d 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-@@ -3,6 +3,7 @@
- #include <dx12/ffx_api_dx12.hpp>
+@@ -1,8 +1,8 @@
+ #include "DX12SwapChain.h"
+ 
+-#include <dx12/ffx_api_dx12.hpp>
  #include <dxgi1_6.h>
  
 +#include "CrossAdapterBridge.h"
  #include "FidelityFX.h"
  #include "Streamline.h"
  #include "UICompositor.h"
-@@ -29,6 +30,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
+@@ -29,6 +29,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
  	REX::INFO("[FG] D3D12 device created");
  }
  
@@ -2724,7 +2790,7 @@ index e10d528..80c0a23 100644
  void DX12SwapChain::CreateD3D12CommandQueues()
  {
  	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-@@ -44,9 +82,32 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+@@ -44,9 +81,32 @@ void DX12SwapChain::CreateD3D12CommandQueues()
  		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
  		commandLists[i]->Close();
  	}
@@ -2757,7 +2823,37 @@ index e10d528..80c0a23 100644
  void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
  {
  	swapChainDesc = {};
-@@ -145,9 +206,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -91,24 +151,13 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+ 
+ void DX12SwapChain::CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
+ {
+-	REX::INFO("[FG] Creating FSR3 swap chain via FFX");
+-
+-	ffx::CreateContextDescFrameGenerationSwapChainForHwndDX12 ffxSwapChainDesc{};
+-	ffxSwapChainDesc.desc = &swapChainDesc;
+-	ffxSwapChainDesc.dxgiFactory = a_dxgiFactory;
+-	ffxSwapChainDesc.fullscreenDesc = nullptr;
+-	ffxSwapChainDesc.gameQueue = commandQueue.get();
+-	ffxSwapChainDesc.hwnd = a_swapChainDesc.OutputWindow;
+-	ffxSwapChainDesc.swapchain = &swapChain;
+-
+ 	auto fidelityFX = FidelityFX::GetSingleton();
++	REX::INFO("[FG] Creating FSR3 swap chain via FFX ({})", fidelityFX->RuntimeName());
+ 
+-	if (ffx::CreateContext(fidelityFX->swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
+-		REX::CRITICAL("[FidelityFX] Failed to create swap chain context!");
+-	}
+-
+-	fidelityFX->SetupFrameGeneration();
+-	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
++	// Swap chain context + frame generation context; with iFSRRuntime = 1 this logs the providers
++	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
++	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
++	REX::INFO("[FG] FSR3 swap chain created: {}x{} ({})", swapChainDesc.Width, swapChainDesc.Height, fidelityFX->RuntimeName());
+ }
+ 
+ void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
+@@ -145,9 +194,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -2773,7 +2869,7 @@ index e10d528..80c0a23 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +231,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +219,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -2782,7 +2878,7 @@ index e10d528..80c0a23 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +244,16 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +232,16 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -2801,7 +2897,7 @@ index e10d528..80c0a23 100644
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -239,17 +312,53 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +300,53 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -2860,7 +2956,7 @@ index e10d528..80c0a23 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -361,6 +470,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -361,6 +458,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
  	}
  
@@ -2870,7 +2966,7 @@ index e10d528..80c0a23 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +482,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +470,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -2885,6 +2981,25 @@ index e10d528..80c0a23 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
+@@ -437,6 +545,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
+ 		SyncInterval = 1;
+ 
++	// FSR SDK 2.4: the 4.0.0 swap chain's driver-assisted frame pacing switches itself off while
++	// VSync is on, and nothing else reports that.
++	if (SyncInterval > 0 && upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 &&
++		FidelityFX::GetSingleton()->runtime == FidelityFX::Runtime::kSDK24) {
++		static bool loggedVSync = false;
++		if (!loggedVSync) {
++			REX::INFO("[FSR] VSync is on (SyncInterval {}): driver-assisted frame pacing stays off. Set iPresentInterval=0 "
++					  "in Fallout4Prefs.ini to allow it", SyncInterval);
++			loggedVSync = true;
++		}
++	}
++
+ 	// Latch UI frame index for the compositor before Streamline's Present
+ 	// The real Present hook needs to know which UIColorAlpha buffer was last written
+ 	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
 @@ -445,7 +565,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
@@ -2935,10 +3050,20 @@ index e10d528..80c0a23 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -457,9 +619,28 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
- 	if (frameLatencyWaitableObject)
+@@ -454,12 +616,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
+ 	// FSR3/DLSS-G wrapped swap chains manage latency internally)
+ 	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
+-	if (frameLatencyWaitableObject)
++	if (frameLatencyWaitableObject) {
  		WaitForSingleObjectEx(frameLatencyWaitableObject, INFINITE, TRUE);
- 
++		// FSR SDK 2.x swap chains return a fresh duplicate on every call, which the caller must
++		// close (null here unless the swap chain is created with the waitable-object flag).
++		if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 &&
++			FidelityFX::GetSingleton()->runtime == FidelityFX::Runtime::kSDK24)
++			CloseHandle(frameLatencyWaitableObject);
++	}
++
 +	if (crossAdapter) {
 +		LARGE_INTEGER waitEnd{};
 +		QueryPerformanceCounter(&waitEnd);
@@ -2950,7 +3075,7 @@ index e10d528..80c0a23 100644
 +		bridge->AddPresentBlock(static_cast<double>(presentEnd.QuadPart - presentStart.QuadPart) * qpcToMs,
 +			static_cast<double>(waitEnd.QuadPart - presentEnd.QuadPart) * qpcToMs);
 +	}
-+
+ 
  	// Update the frame index
  	frameIndex = swapChain->GetCurrentBackBufferIndex();
  
@@ -3018,10 +3143,504 @@ index 692f459..15205cf 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..feeb677 100644
+index 9fa46df..8e474ab 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
-@@ -126,18 +126,31 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -3,34 +3,432 @@
+ #include "Upscaling.h"
+ 
+ #include "DX12SwapChain.h"
+-#include <dx12/ffx_api_dx12.hpp>
++
++#include <atomic>
++#include <cmath>
++#include <cwctype>
++#include <initializer_list>
++#include <vector>
+ 
+ ffxFunctions ffxModule;
+ 
++namespace
++{
++	constexpr const wchar_t* kFfxFolder = L"Data\\F4SE\\Plugins\\FrameGeneration\\FidelityFX\\";
++	constexpr const wchar_t* kLegacyDll = L"amd_fidelityfx_dx12.dll";
++	constexpr const wchar_t* kLoaderDll = L"amd_fidelityfx_loader_dx12.dll";
++	constexpr const wchar_t* kFrameGenDll = L"amd_fidelityfx_framegeneration_dx12.dll";
++
++	std::string Narrow(const wchar_t* a_text)
++	{
++		if (!a_text || !*a_text)
++			return {};
++		const int size = WideCharToMultiByte(CP_UTF8, 0, a_text, -1, nullptr, 0, nullptr, nullptr);
++		if (size <= 1)
++			return {};
++		std::string out(static_cast<size_t>(size - 1), '\0');
++		WideCharToMultiByte(CP_UTF8, 0, a_text, -1, out.data(), size, nullptr, nullptr);
++		return out;
++	}
++
++	// FFX runtime messages, SDK 2.4 only. FFX calls this from its own threads too; the log sinks
++	// are the thread-safe (_mt) spdlog sinks.
++	void FfxMessage(uint32_t a_type, const wchar_t* a_message)
++	{
++		static std::atomic<uint32_t> count{ 0 };
++		const uint32_t n = count.fetch_add(1);
++		if (n > 200)
++			return;
++		if (n == 200) {
++			REX::WARN("[FSR] further FFX runtime messages are not logged");
++			return;
++		}
++		if (a_type == FFX_API_MESSAGE_TYPE_ERROR)
++			REX::ERROR("[FSR] runtime: {}", Narrow(a_message));
++		else
++			REX::WARN("[FSR] runtime: {}", Narrow(a_message));
++	}
++
++	// Generated-frame dispatches. The FFX swap chain calls this from its own thread when it
++	// presents; a failure here means that frame shows no generated frame, nothing else.
++	std::atomic<uint64_t> callbackOk{ 0 };
++	std::atomic<uint64_t> callbackFailed{ 0 };
++	std::atomic<uint32_t> callbackLastError{ 0 };
++
++	ffxReturnCode_t FrameGenerationCallback(ffxDispatchDescFrameGeneration* a_params, void* a_userCtx)
++	{
++		const ffxReturnCode_t rc = ffxModule.Dispatch(reinterpret_cast<ffxContext*>(a_userCtx), &a_params->header);
++		if (rc == FFX_API_RETURN_OK) {
++			callbackOk.fetch_add(1, std::memory_order_relaxed);
++		} else {
++			callbackLastError.store(rc, std::memory_order_relaxed);
++			if (callbackFailed.fetch_add(1, std::memory_order_relaxed) == 0)
++				REX::ERROR("[FSR] generating a frame failed: {} ({}); frames are shown without generation while this lasts",
++					ffxm::ReturnCodeName(rc), rc);
++		}
++		return rc;
++	}
++
++	// Links the non-null headers in order; returns the first. The SDK's LinkHeaders needs a fixed
++	// set of descriptors, and which optional ones are chained here depends on the runtime.
++	ffxApiHeader* Chain(std::initializer_list<ffxApiHeader*> a_headers)
++	{
++		ffxApiHeader* first = nullptr;
++		ffxApiHeader* last = nullptr;
++		for (auto* header : a_headers) {
++			if (!header)
++				continue;
++			header->pNext = nullptr;
++			if (last)
++				last->pNext = header;
++			else
++				first = header;
++			last = header;
++		}
++		return first;
++	}
++
++	struct ProviderList
++	{
++		std::vector<uint64_t> ids;
++		std::vector<std::string> names;  // copied: the runtime may reuse its name buffers
++	};
++
++	ProviderList QueryProviders(uint64_t a_createDescType, ID3D12Device* a_device)
++	{
++		ProviderList list;
++		ffx::QueryDescGetVersions query{};
++		query.createDescType = a_createDescType;
++		query.device = a_device;
++		uint64_t count = 0;
++		query.outputCount = &count;
++		if (ffxm::QueryGlobal(query) != ffx::ReturnCode::Ok || count == 0)
++			return list;
++
++		std::vector<uint64_t> ids(count, 0);
++		std::vector<const char*> names(count, nullptr);
++		query.versionIds = ids.data();
++		query.versionNames = names.data();
++		if (ffxm::QueryGlobal(query) != ffx::ReturnCode::Ok)
++			return list;
++
++		for (uint64_t i = 0; i < count && i < ids.size(); ++i) {
++			list.ids.push_back(ids[i]);
++			list.names.emplace_back(names[i] ? names[i] : "?");
++		}
++		return list;
++	}
++
++	std::string Join(const ProviderList& a_list)
++	{
++		if (a_list.names.empty())
++			return "none";
++		std::string out;
++		for (const auto& name : a_list.names) {
++			if (!out.empty())
++				out += ", ";
++			out += name;
++		}
++		return out;
++	}
++
++	bool HasMajor(const ProviderList& a_list, char a_major)
++	{
++		for (const auto& name : a_list.names)
++			if (!name.empty() && name[0] == a_major)
++				return true;
++		return false;
++	}
++
++	// iFSR*Provider = 1 pins the newest 3.x provider (the lists come newest first). Only IDs the
++	// runtime itself returned are used, as AMD requires. 0 = no override (newest offered).
++	uint64_t PickOverride(const ProviderList& a_list, int a_preference, const char* a_what)
++	{
++		if (a_preference != 1)
++			return 0;
++		for (size_t i = 0; i < a_list.ids.size(); ++i)
++			if (a_list.names[i].starts_with("3."))
++				return a_list.ids[i];
++		REX::WARN("[FSR] no 3.x {} provider offered; using the newest", a_what);
++		return 0;
++	}
++
++	std::string ProviderName(ffx::Context& a_context)
++	{
++		ffx::InitHelper<ffxQueryGetProviderVersion> query{};
++		if (ffxm::Query(a_context, query) != ffx::ReturnCode::Ok || !query.versionName)
++			return "unknown";
++		return query.versionName;
++	}
++
++	void LogModule(const wchar_t* a_name)
++	{
++		HMODULE handle = GetModuleHandleW(a_name);
++		if (!handle) {
++			REX::INFO("[FSR] {} is not loaded", Narrow(a_name));
++			return;
++		}
++		wchar_t path[MAX_PATH]{};
++		GetModuleFileNameW(handle, path, MAX_PATH);
++		std::wstring lower = path;
++		for (auto& c : lower)
++			c = static_cast<wchar_t>(towlower(c));
++		// The SDK 2.4 loader looks for effect DLLs next to Fallout4.exe before its own folder.
++		if (lower.find(L"\\f4se\\plugins\\framegeneration\\fidelityfx\\") == std::wstring::npos)
++			REX::WARN("[FSR] {} was loaded from {}, not from this plugin's FidelityFX folder (another mod's copy?)",
++				Narrow(a_name), Narrow(path));
++		else
++			REX::INFO("[FSR] {} loaded from {}", Narrow(a_name), Narrow(path));
++	}
++
++	float Component(const __m128& a_v, int a_i)
++	{
++		alignas(16) float f[4];
++		_mm_store_ps(f, a_v);
++		return f[a_i];
++	}
++
++	void StoreUnit(float (&a_out)[3], const __m128& a_v)
++	{
++		alignas(16) float f[4];
++		_mm_store_ps(f, a_v);
++		const float length = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
++		const float scale = length > 1e-6f ? 1.0f / length : 0.0f;
++		a_out[0] = f[0] * scale;
++		a_out[1] = f[1] * scale;
++		a_out[2] = f[2] * scale;
++	}
++}
++
++const char* ffxm::ReturnCodeName(uint32_t a_rc)
++{
++	switch (a_rc) {
++	case FFX_API_RETURN_OK:
++		return "OK";
++	case FFX_API_RETURN_ERROR:
++		return "ERROR";
++	case FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE:
++		return "UNKNOWN_DESCTYPE";
++	case FFX_API_RETURN_ERROR_RUNTIME_ERROR:
++		return "RUNTIME_ERROR";
++	case FFX_API_RETURN_NO_PROVIDER:
++		return "NO_PROVIDER";
++	case FFX_API_RETURN_ERROR_MEMORY:
++		return "ERROR_MEMORY";
++	case FFX_API_RETURN_ERROR_PARAMETER:
++		return "ERROR_PARAMETER";
++	case FFX_API_RETURN_PROVIDER_NO_SUPPORT_NEW_DESCTYPE:
++		return "PROVIDER_NO_SUPPORT_NEW_DESCTYPE";
++	default:
++		return "?";
++	}
++}
++
++const char* FidelityFX::RuntimeName() const
++{
++	return runtime == Runtime::kSDK24 ? "FSR SDK 2.4" : "FidelityFX SDK 1.1.4 (FSR 3.1.4)";
++}
++
++bool FidelityFX::LoadRuntime(Runtime a_runtime)
++{
++	const std::wstring path = std::wstring(kFfxFolder) + (a_runtime == Runtime::kSDK24 ? kLoaderDll : kLegacyDll);
++	HMODULE handle = LoadLibraryW(path.c_str());
++	if (!handle) {
++		const DWORD error = GetLastError();
++		REX::WARN("[FSR] could not load {} (error {})", Narrow(path.c_str()), error);
++		return false;
++	}
++
++	ffxFunctions functions{};
++	ffxLoadFunctions(&functions, handle);
++	if (!functions.CreateContext || !functions.DestroyContext || !functions.Configure || !functions.Query || !functions.Dispatch) {
++		REX::WARN("[FSR] {} does not export the FFX API", Narrow(path.c_str()));
++		FreeLibrary(handle);
++		return false;
++	}
++
++	module = handle;
++	ffxModule = functions;
++	runtime = a_runtime;
++	REX::INFO("[FSR] runtime: {} ({})", RuntimeName(), Narrow(path.c_str()));
++
++	if (runtime == Runtime::kSDK24) {
++		// Route FFX's own error/warning messages into this log.
++		ffx::ConfigureDescGlobalDebug debug{};
++		debug.effectId = FFX_API_EFFECT_ID_FRAMEGENERATION;
++		debug.fpMessage = FfxMessage;
++		debug.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
++		auto rc = ffxModule.Configure(nullptr, &debug.header);
++		if (rc != FFX_API_RETURN_OK) {
++			debug.effectId = FFX_API_EFFECT_ID_GENERAL;
++			rc = ffxModule.Configure(nullptr, &debug.header);
++		}
++		if (rc != FFX_API_RETURN_OK)
++			REX::INFO("[FSR] runtime messages are not available ({})", ffxm::ReturnCodeName(rc));
++	}
++	return true;
++}
++
+ void FidelityFX::LoadFFX()
+ {
+-	module = LoadLibrary(L"Data\\F4SE\\Plugins\\FrameGeneration\\FidelityFX\\amd_fidelityfx_dx12.dll");
++	const auto wanted = Upscaling::GetSingleton()->settings.fsrRuntime == 1 ? Runtime::kSDK24 : Runtime::kLegacy;
++	if (LoadRuntime(wanted))
++		return;
++	if (wanted == Runtime::kSDK24) {
++		REX::WARN("[FSR] iFSRRuntime = 1 but the FSR SDK 2.4 runtime did not load; using FidelityFX SDK 1.1.4");
++		LoadRuntime(Runtime::kLegacy);
++	}
++}
+ 
+-	if (module)
+-		ffxLoadFunctions(&ffxModule, module);
++void FidelityFX::LogEnvironment(HWND a_window)
++{
++	// Driver-Assisted Frame Pacing (swap chain 4.0.0+) is chosen by the driver without telling the
++	// application. Of its conditions, only these two are visible from here: the window must cover
++	// the display, and VSync must be off (logged at Present).
++	RECT client{};
++	POINT origin{ 0, 0 };
++	MONITORINFO monitor{};
++	monitor.cbSize = sizeof(monitor);
++	if (!GetClientRect(a_window, &client) || !ClientToScreen(a_window, &origin) ||
++		!GetMonitorInfoW(MonitorFromWindow(a_window, MONITOR_DEFAULTTONEAREST), &monitor))
++		return;
++
++	const auto& m = monitor.rcMonitor;
++	const bool covers = origin.x <= m.left && origin.y <= m.top && origin.x + client.right >= m.right && origin.y + client.bottom >= m.bottom;
++	REX::INFO("[FSR] window {}x{} at ({},{}), display {}x{} at ({},{}): {}", client.right, client.bottom, origin.x, origin.y,
++		m.right - m.left, m.bottom - m.top, m.left, m.top,
++		covers ? "covers the display" :
++				 "does NOT cover the display - driver-assisted frame pacing needs fullscreen or a borderless window covering it");
+ }
+ 
+-void FidelityFX::SetupFrameGeneration()
++bool FidelityFX::CreateContexts(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
++	ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain)
+ {
+-	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	auto upscaling = Upscaling::GetSingleton();
++	auto device = DX12SwapChain::GetSingleton()->d3d12Device.get();
++	const bool sdk24 = runtime == Runtime::kSDK24;
++
++	// ---- swap chain
++	ffx::CreateContextDescFrameGenerationSwapChainForHwndDX12 swapChainDesc{};
++	swapChainDesc.desc = a_desc;
++	swapChainDesc.dxgiFactory = a_dxgiFactory;
++	swapChainDesc.fullscreenDesc = nullptr;
++	swapChainDesc.gameQueue = a_queue;
++	swapChainDesc.hwnd = a_window;
++	swapChainDesc.swapchain = a_swapChain;
++
++	uint32_t rc = FFX_API_RETURN_OK;
++	if (sdk24) {
++		const auto offered = QueryProviders(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12, device);
++		REX::INFO("[FSR] swap chain providers offered: {}", Join(offered));
++
++		ffx::CreateContextDescFrameGenerationSwapChainVersionDX12 version{};
++		version.version = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION;
++		ffx::CreateContextDescOverrideVersion pin{};
++		pin.versionId = PickOverride(offered, upscaling->settings.fsrSwapChainProvider, "swap chain");
++
++		rc = ffxModule.CreateContext(&swapChainContext,
++			Chain({ &swapChainDesc.header, &version.header, pin.versionId ? &pin.header : nullptr }), nullptr);
++	} else {
++		rc = ffxModule.CreateContext(&swapChainContext, Chain({ &swapChainDesc.header }), nullptr);
++	}
++	if (rc != FFX_API_RETURN_OK || !*a_swapChain) {
++		REX::ERROR("[FSR] {}: creating the frame generation swap chain failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
++		return false;
++	}
++
++	std::string swapChainProvider = "3.1.4";
++	if (sdk24) {
++		swapChainProvider = ProviderName(swapChainContext);
++		REX::INFO("[FSR] swap chain provider: {}{}", swapChainProvider,
++			swapChainProvider.starts_with("3") ? " (no driver-assisted frame pacing; that needs 4.0.0 or newer)" :
++												 " (driver-assisted frame pacing capable)");
++	}
+ 
++	// ---- frame generation
+ 	ffx::CreateContextDescFrameGeneration createFg{};
+-	createFg.displaySize = { dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height };
++	createFg.displaySize = { a_desc->Width, a_desc->Height };
+ 	createFg.maxRenderSize = createFg.displaySize;
+ 	createFg.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
+-	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(dx12SwapChain->swapChainDesc.Format);
++	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(a_desc->Format);
++
++	ffx::CreateBackendDX12Desc backend{};
++	backend.device = device;
++
++	if (sdk24) {
++		const auto offered = QueryProviders(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, device);
++		REX::INFO("[FSR] frame generation providers offered: {}", Join(offered));
++		if (!HasMajor(offered, '4'))
++			REX::INFO("[FSR] FSR 4 (ML) frame generation is not offered on this system. AMD requires Windows 11 and an "
++					  "RX 9000-series GPU for it; the analytical FSR 3 interpolator is used");
++
++		ffx::CreateContextDescFrameGenerationVersion version{};
++		version.version = FFX_FRAMEGENERATION_VERSION;
++
++		// The HUD-less copy is always RGBA8 (Upscaling::CreateFrameGenerationResources). Declare it
++		// when the back buffer is something else, e.g. BGRA8.
++		ffx::CreateContextDescFrameGenerationHudless hudless{};
++		hudless.hudlessBackBufferFormat = ffxApiGetSurfaceFormatDX12(DXGI_FORMAT_R8G8B8A8_UNORM);
++		const bool declareHudless = hudless.hudlessBackBufferFormat != createFg.backBufferFormat;
++
++		ffx::CreateContextDescOverrideVersion pin{};
++		pin.versionId = PickOverride(offered, upscaling->settings.fsrFrameGenProvider, "frame generation");
++
++		rc = ffxModule.CreateContext(&frameGenContext,
++			Chain({ &createFg.header, &backend.header, &version.header, declareHudless ? &hudless.header : nullptr,
++				pin.versionId ? &pin.header : nullptr }),
++			nullptr);
++	} else {
++		rc = ffxModule.CreateContext(&frameGenContext, Chain({ &createFg.header, &backend.header }), nullptr);
++	}
++	if (rc != FFX_API_RETURN_OK) {
++		REX::ERROR("[FSR] {}: creating the frame generation context failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
++		return false;
++	}
++
++	if (sdk24) {
++		const auto provider = ProviderName(frameGenContext);
++		REX::INFO("[FSR] frame generation provider: {} ({})", provider,
++			provider.starts_with("4") ? "FSR 4 ML frame generation" : "analytical FSR 3 interpolation");
++		REX::INFO("[FSR] in use: swap chain {} + frame generation {}", swapChainProvider, provider);
++		LogModule(kLoaderDll);
++		LogModule(kFrameGenDll);
++		LogEnvironment(a_window);
++	}
++	return true;
++}
+ 
+-	ffx::CreateBackendDX12Desc createBackend{};
+-	createBackend.device = dx12SwapChain->d3d12Device.get();
++void FidelityFX::DestroyContexts(IDXGISwapChain4** a_swapChain)
++{
++	if (frameGenContext) {
++		ffxModule.DestroyContext(&frameGenContext, nullptr);
++		frameGenContext = nullptr;
++	}
++	if (swapChainContext) {
++		ffxModule.DestroyContext(&swapChainContext, nullptr);
++		swapChainContext = nullptr;
++	}
++	// The context held its own reference; this is the one handed to us at creation.
++	if (a_swapChain && *a_swapChain) {
++		(*a_swapChain)->Release();
++		*a_swapChain = nullptr;
++	}
++}
+ 
+-	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
+-		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
++void FidelityFX::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
++	ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain)
++{
++	window = a_window;
++	if (CreateContexts(a_dxgiFactory, a_desc, a_window, a_queue, a_swapChain))
++		return;
++
++	if (runtime == Runtime::kSDK24) {
++		REX::ERROR("[FSR] falling back to FidelityFX SDK 1.1.4 for this session (set iFSRRuntime = 0 to start with it)");
++		DestroyContexts(a_swapChain);
++		if (LoadRuntime(Runtime::kLegacy) && CreateContexts(a_dxgiFactory, a_desc, a_window, a_queue, a_swapChain))
++			return;
+ 	}
++	REX::CRITICAL("[FidelityFX] Failed to create the frame generation swap chain or context!");
+ }
+ 
+ [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
+@@ -50,7 +448,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+ 	auto upscaling = Upscaling::GetSingleton();
+ 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+ 	auto commandList = dx12SwapChain->commandLists[dx12SwapChain->frameIndex].get();
+-	
++
+ 	auto HUDLessColor = upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
+ 	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
+ 	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
+@@ -60,9 +458,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+ 	if (a_useFrameGeneration) {
+ 		configParameters.frameGenerationEnabled = true;
+ 
+-		configParameters.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* pUserCtx) -> ffxReturnCode_t {
+-			return ffxModule.Dispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
+-			};
++		configParameters.frameGenerationCallback = FrameGenerationCallback;
+ 		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
+ 
+ 		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
+@@ -93,7 +489,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+ 	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
+ 	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
+ 
+-	if (ffx::Configure(frameGenContext, configParameters) != ffx::ReturnCode::Ok) {
++	if (ffxm::Configure(frameGenContext, configParameters) != ffx::ReturnCode::Ok) {
+ 		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
+ 	}
+ 
+@@ -113,49 +509,115 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+ 	QueryPerformanceCounter(&currentFrameTime);
+ 
+ 	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
+-	
+-	lastFrameTime = currentFrameTime;
+ 
+-	if (a_useFrameGeneration) {
+-		ffx::DispatchDescFrameGenerationPrepare dispatchParameters{};
++	lastFrameTime = currentFrameTime;
+ 
+-		dispatchParameters.commandList = commandList;
++	// SDK 2.4: tell FSR when generation restarts (menus, loading) instead of letting it
++	// interpolate across the gap. The 1.1.4 prepare struct has no working reset field.
++	static bool wasGenerating = false;
++	const bool resetHistory = a_useFrameGeneration && !wasGenerating;
++	wasGenerating = a_useFrameGeneration;
+ 
++	if (a_useFrameGeneration) {
+ 		static auto gameViewport = State_GetSingleton();
+ 		static auto renderTargetManager = RenderTargetManager_GetSingleton();
  
  		auto screenSize = float2(float(gameViewport->screenWidth), float(gameViewport->screenHeight));
  		auto renderSize = float2(screenSize.x * renderTargetManager->dynamicWidthRatio, screenSize.y * renderTargetManager->dynamicHeightRatio);
@@ -3039,27 +3658,215 @@ index 9fa46df..feeb677 100644
 +			jitterScale = 0.5f;
 +		}
  
- 		dispatchParameters.motionVectorScale.x = renderSize.x;
- 		dispatchParameters.motionVectorScale.y = renderSize.y;
+-		dispatchParameters.motionVectorScale.x = renderSize.x;
+-		dispatchParameters.motionVectorScale.y = renderSize.y;
 -		dispatchParameters.renderSize.width = static_cast<uint>(renderSize.x);
 -		dispatchParameters.renderSize.height = static_cast<uint>(renderSize.y);
 -		
-+		dispatchParameters.renderSize.width = renderWidth;
-+		dispatchParameters.renderSize.height = renderHeight;
-+
  		float2 jitter;
  		jitter.x = -gameViewport->offsetX * screenSize.x / 2.0f;
  		jitter.y = gameViewport->offsetY * screenSize.y / 2.0f;
  
 -		dispatchParameters.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio;
 -		dispatchParameters.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio;
-+		dispatchParameters.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale;
-+		dispatchParameters.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale;
+-
+-		dispatchParameters.frameTimeDelta = deltaTime * 1000.f;
+-
+-		dispatchParameters.cameraNear = *(float*)REL::ID({ 57985, 2712882, 2712882 }).address();
+-		dispatchParameters.cameraFar = *(float*)REL::ID({ 958877, 2712883, 2712883 }).address();
+-
+-		dispatchParameters.cameraFovAngleVertical = 1.0f;
+-		dispatchParameters.viewSpaceToMetersFactor = 0.01428222656f;
+-
+-		dispatchParameters.frameID = frameID;
+-
+-		dispatchParameters.depth = ffxApiGetResourceDX12(depth);
+-		dispatchParameters.motionVectors = ffxApiGetResourceDX12(motionVectors);
++		// The fields both prepare structs share, filled the same way for both runtimes.
++		auto fillCommon = [&](auto& a_prepare) {
++			a_prepare.commandList = commandList;
++			a_prepare.motionVectorScale.x = renderSize.x;
++			a_prepare.motionVectorScale.y = renderSize.y;
++			a_prepare.renderSize.width = renderWidth;
++			a_prepare.renderSize.height = renderHeight;
++			a_prepare.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale;
++			a_prepare.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale;
++			a_prepare.frameTimeDelta = deltaTime * 1000.f;
++			a_prepare.cameraNear = *(float*)REL::ID({ 57985, 2712882, 2712882 }).address();
++			a_prepare.cameraFar = *(float*)REL::ID({ 958877, 2712883, 2712883 }).address();
++			a_prepare.cameraFovAngleVertical = 1.0f;
++			a_prepare.viewSpaceToMetersFactor = 0.01428222656f;
++			a_prepare.frameID = frameID;
++			a_prepare.depth = ffxApiGetResourceDX12(depth);
++			a_prepare.motionVectors = ffxApiGetResourceDX12(motionVectors);
++		};
++
++		ffx::ReturnCode prepareResult;
++		if (runtime == Runtime::kSDK24) {
++			// PrepareV2 carries the camera FSR 4 ML frame generation needs (FSR 3.1.6 accepts it too).
++			ffx::DispatchDescFrameGenerationPrepareV2 dispatchParameters{};
++			fillCommon(dispatchParameters);
++			dispatchParameters.reset = resetHistory;
++
++			// Fallout 4 renders camera-relative: the view matrix carries no translation, and
++			// posAdjust is the camera's world position (the DLSS-G path uses it the same way).
++			const auto& cameraState = gameViewport->cameraState;
++			const auto& view = cameraState.camViewData;
++			dispatchParameters.cameraPosition[0] = cameraState.posAdjust.x;
++			dispatchParameters.cameraPosition[1] = cameraState.posAdjust.y;
++			dispatchParameters.cameraPosition[2] = cameraState.posAdjust.z;
++			StoreUnit(dispatchParameters.cameraUp, view.viewUp);
++			StoreUnit(dispatchParameters.cameraRight, view.viewRight);
++			StoreUnit(dispatchParameters.cameraForward, view.viewDir);
++
++			// Vertical FOV from the projection (P[1][1] = 1 / tan(fovY / 2); jitter does not touch it).
++			const float yScale = Component(view.projMat[1], 1);
++			if (std::isfinite(yScale) && yScale > 0.01f)
++				dispatchParameters.cameraFovAngleVertical = 2.0f * std::atan(1.0f / yScale);
++
++			prepareResult = ffxm::Dispatch(frameGenContext, dispatchParameters);
++		} else {
++#pragma warning(push)
++#pragma warning(disable: 4996)  // deprecated in 2.x headers; the only prepare struct 1.1.4 knows
++			ffxDispatchDescFrameGenerationPrepare dispatchParameters{};
++			dispatchParameters.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
++			fillCommon(dispatchParameters);
++			prepareResult = ffxm::Dispatch(frameGenContext, dispatchParameters);
++#pragma warning(pop)
++		}
  
- 		dispatchParameters.frameTimeDelta = deltaTime * 1000.f;
+-		if (ffx::Dispatch(frameGenContext, dispatchParameters) != ffx::ReturnCode::Ok) {
++		if (prepareResult != ffx::ReturnCode::Ok) {
+ 			REX::CRITICAL("[FidelityFX] Failed to dispatch frame generation!");
+ 		}
+ 	}
  
+ 	frameID++;
++
++	// Generated-frame dispatch failures (and, once, the SDK 2.4 tally) every 10 s.
++	static LARGE_INTEGER reportStart = currentFrameTime;
++	static bool reportedOnce = false;
++	if (static_cast<double>(currentFrameTime.QuadPart - reportStart.QuadPart) >= 10.0 * static_cast<double>(frequency.QuadPart)) {
++		const uint64_t ok = callbackOk.exchange(0);
++		const uint64_t failed = callbackFailed.exchange(0);
++		if (failed > 0) {
++			const uint32_t last = callbackLastError.load();
++			REX::ERROR("[FSR] generated frames in the last 10 s: {} dispatched, {} failed (last error {} ({}))", ok, failed,
++				ffxm::ReturnCodeName(last), last);
++		} else if (runtime == Runtime::kSDK24 && !reportedOnce) {
++			REX::INFO("[FSR] generated frames in the first 10 s: {} dispatched, none failed", ok);
++		}
++		if (runtime == Runtime::kSDK24 && !reportedOnce && window)
++			LogEnvironment(window);
++		reportedOnce = true;
++		reportStart = currentFrameTime;
++	}
+ }
+diff --git a/plugins/FrameGeneration/src/FidelityFX.h b/plugins/FrameGeneration/src/FidelityFX.h
+index 78bb041..ec01a79 100644
+--- a/plugins/FrameGeneration/src/FidelityFX.h
++++ b/plugins/FrameGeneration/src/FidelityFX.h
+@@ -1,13 +1,57 @@
+ #pragma once
+ 
+-#include <dx12/ffx_api_dx12.h>
+-#include <ffx_api.hpp>
+-#include <ffx_api_loader.h>
+-#include <ffx_api_types.h>
+-#include <ffx_framegeneration.hpp>
++// FSR SDK 2.4 API headers, vendored unmodified under include/ffx2 (MIT). They describe both
++// runtimes this plugin can load: the struct type IDs and layouts used with FidelityFX SDK 1.1.4
++// are unchanged in 2.4, so the old runtime is driven with the same headers and simply never
++// receives the structs that only 2.x knows (version descriptors, PrepareV2, HUD-less format).
++#include <ffx2/api/include/ffx_api.hpp>
++#include <ffx2/api/include/ffx_api_loader.h>
++#include <ffx2/api/include/ffx_api_types.h>
++#include <ffx2/api/include/dx12/ffx_api_dx12.hpp>
++#include <ffx2/framegeneration/include/ffx_framegeneration.hpp>
++#include <ffx2/framegeneration/include/dx12/ffx_api_framegeneration_dx12.hpp>
+ 
+ #include "Buffer.h"
+ 
++// Entry points of whichever runtime DLL LoadFFX() loaded. The SDK's own ffx:: call helpers call
++// the ffx* exports directly (meant for linking an import library), so calls go through here.
++extern ffxFunctions ffxModule;
++
++namespace ffxm
++{
++	template <class... Desc>
++	inline ffx::ReturnCode CreateContext(ffx::Context& a_context, Desc&... a_desc)
++	{
++		return static_cast<ffx::ReturnCode>(ffxModule.CreateContext(&a_context, ffx::LinkHeaders(a_desc.header...), nullptr));
++	}
++
++	template <class... Desc>
++	inline ffx::ReturnCode Configure(ffx::Context& a_context, Desc&... a_desc)
++	{
++		return static_cast<ffx::ReturnCode>(ffxModule.Configure(&a_context, ffx::LinkHeaders(a_desc.header...)));
++	}
++
++	template <class... Desc>
++	inline ffx::ReturnCode Dispatch(ffx::Context& a_context, Desc&... a_desc)
++	{
++		return static_cast<ffx::ReturnCode>(ffxModule.Dispatch(&a_context, ffx::LinkHeaders(a_desc.header...)));
++	}
++
++	template <class... Desc>
++	inline ffx::ReturnCode Query(ffx::Context& a_context, Desc&... a_desc)
++	{
++		return static_cast<ffx::ReturnCode>(ffxModule.Query(&a_context, ffx::LinkHeaders(a_desc.header...)));
++	}
++
++	template <class... Desc>
++	inline ffx::ReturnCode QueryGlobal(Desc&... a_desc)
++	{
++		return static_cast<ffx::ReturnCode>(ffxModule.Query(nullptr, ffx::LinkHeaders(a_desc.header...)));
++	}
++
++	const char* ReturnCodeName(uint32_t a_rc);
++}
++
+ class FidelityFX
+ {
+ public:
+@@ -17,12 +61,33 @@ public:
+ 		return &singleton;
+ 	}
+ 
++	// iFSRRuntime. kLegacy is what this plugin shipped with and is driven exactly as before.
++	enum class Runtime : int
++	{
++		kLegacy = 0,  // FidelityFX SDK 1.1.4: amd_fidelityfx_dx12.dll, FSR 3.1.4
++		kSDK24 = 1    // FSR SDK 2.4: amd_fidelityfx_loader_dx12.dll + amd_fidelityfx_framegeneration_dx12.dll
++	};
++
+ 	HMODULE module = nullptr;
++	Runtime runtime = Runtime::kLegacy;
+ 
+ 	ffx::Context swapChainContext{};
+-	ffx::Context frameGenContext;
++	ffx::Context frameGenContext{};
++	HWND window = nullptr;
+ 
+ 	void LoadFFX();
+-	void SetupFrameGeneration();
++	// Creates the FFX frame-generation swap chain and the frame generation context. With the SDK
++	// 2.4 runtime a creation failure falls back to SDK 1.1.4 once, so the game still starts.
++	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
++		ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain);
+ 	void Present(bool a_useFrameGeneration);
++
++	[[nodiscard]] const char* RuntimeName() const;
++
++private:
++	bool LoadRuntime(Runtime a_runtime);
++	bool CreateContexts(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
++		ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain);
++	void DestroyContexts(IDXGISwapChain4** a_swapChain);
++	void LogEnvironment(HWND a_window);
+ };
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..1fdc7c5 100644
+index 3483d96..cc7bd45 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
 @@ -2,6 +2,7 @@
@@ -3089,7 +3896,7 @@ index 3483d96..1fdc7c5 100644
  		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
  		if (shaderErrors) shaderErrors->Release();
  		if (shaderBlob) shaderBlob->Release();
-@@ -131,6 +133,18 @@ void Upscaling::LoadSettings()
+@@ -131,6 +133,21 @@ void Upscaling::LoadSettings()
  	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
  	// MCM stepper is 0-indexed (0=2x, 1=3x, 2=4x) but we store as numFramesToGenerate (1, 2, 3)
  	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
@@ -3105,10 +3912,13 @@ index 3483d96..1fdc7c5 100644
 +	settings.earlyTransfer = ini.GetBoolValue("Settings", "bEarlyTransfer", true);
 +	settings.earlyUnpack = ini.GetBoolValue("Settings", "bEarlyUnpack", true);
 +	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iHalfResDepthMV", 1)), 0, 2);
++	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRRuntime", 1)), 0, 1);
++	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRSwapChainProvider", 0)), 0, 1);
++	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRFrameGenProvider", 0)), 0, 1);
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +152,19 @@ void Upscaling::LoadSettings()
+@@ -138,6 +155,22 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -3125,10 +3935,13 @@ index 3483d96..1fdc7c5 100644
 +		REX::INFO("[Frame Generation] iHalfResDepthMV: {} (0=full, 1=half-res depth rebuilt on the display GPU, "
 +				  "2=half-res depth and motion vectors)",
 +			settings.halfResDepthMV);
++		REX::INFO("[Frame Generation] iFSRRuntime: {} (0=FidelityFX SDK 1.1.4 / FSR 3.1.4, 1=FSR SDK 2.4, newest provider offered) "
++				  "iFSRSwapChainProvider: {} iFSRFrameGenProvider: {} (0=newest offered, 1=newest 3.x)",
++			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
  		loggedOnce = true;
  	}
  }
-@@ -169,6 +196,15 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,6 +202,15 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
@@ -3144,7 +3957,7 @@ index 3483d96..1fdc7c5 100644
  
  	for (int index = 0; index < 2; index++) {
  		D3D11_TEXTURE2D_DESC texDesc{};
-@@ -204,6 +240,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -204,6 +246,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -3155,7 +3968,7 @@ index 3483d96..1fdc7c5 100644
  		depthBufferShared[index] = new Texture2D(texDesc);
  		depthBufferShared[index]->CreateSRV(srvDesc);
  		depthBufferShared[index]->CreateRTV(rtvDesc);
-@@ -218,6 +258,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -218,6 +264,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -3166,7 +3979,7 @@ index 3483d96..1fdc7c5 100644
  		motionVectorBufferShared[index] = new Texture2D(texDesc);
  		motionVectorBufferShared[index]->CreateSRV(srvDesc);
  		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
-@@ -228,14 +272,14 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -228,14 +278,14 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -3183,7 +3996,7 @@ index 3483d96..1fdc7c5 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +292,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +298,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -3192,7 +4005,7 @@ index 3483d96..1fdc7c5 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +312,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +318,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -3201,7 +4014,7 @@ index 3483d96..1fdc7c5 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +332,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +338,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -3210,7 +4023,7 @@ index 3483d96..1fdc7c5 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +352,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +358,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -3219,7 +4032,7 @@ index 3483d96..1fdc7c5 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,6 +361,50 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,6 +367,50 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
@@ -3270,7 +4083,7 @@ index 3483d96..1fdc7c5 100644
  	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
  	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
  	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
-@@ -324,6 +412,49 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -324,6 +418,49 @@ void Upscaling::CreateFrameGenerationResources()
  	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
  }
  
@@ -3320,7 +4133,7 @@ index 3483d96..1fdc7c5 100644
  void Upscaling::PreAlpha()
  {
  	auto rendererData = RE::BSGraphics::GetRendererData();
-@@ -358,10 +489,13 @@ void Upscaling::PostAlpha()
+@@ -358,10 +495,13 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
@@ -3337,7 +4150,7 @@ index 3483d96..1fdc7c5 100644
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +507,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +513,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -3352,7 +4165,7 @@ index 3483d96..1fdc7c5 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +521,9 @@ void Upscaling::PostAlpha()
+@@ -387,6 +527,9 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
@@ -3362,7 +4175,7 @@ index 3483d96..1fdc7c5 100644
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -405,8 +542,34 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -405,8 +548,34 @@ void Upscaling::CopyBuffersToSharedResources()
  	context->OMSetRenderTargets(0, nullptr, nullptr);
  
  	auto& motionVector = rendererData->renderTargets[(uint)RenderTarget::kMotionVectors];
@@ -3398,7 +4211,7 @@ index 3483d96..1fdc7c5 100644
  	{
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
-@@ -558,14 +721,16 @@ void Upscaling::PostDisplay()
+@@ -558,14 +727,16 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
@@ -3417,7 +4230,7 @@ index 3483d96..1fdc7c5 100644
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource);
  
-@@ -574,6 +739,9 @@ void Upscaling::PostDisplay()
+@@ -574,6 +745,9 @@ void Upscaling::PostDisplay()
  		REX::INFO("[FG] PostDisplay captured HUDLess (frameIdx={})", dx12SwapChain->frameIndex);
  		loggedOnce = true;
  	}
@@ -3428,10 +4241,10 @@ index 3483d96..1fdc7c5 100644
  
  void Upscaling::GenerateUIBuffer()
 diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
-index 838f927..1e78966 100644
+index 838f927..c4bfa2e 100644
 --- a/plugins/FrameGeneration/src/Upscaling.h
 +++ b/plugins/FrameGeneration/src/Upscaling.h
-@@ -23,10 +23,25 @@ public:
+@@ -23,10 +23,28 @@ public:
  		bool debugLogging = false;
  		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
  		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
@@ -3442,6 +4255,9 @@ index 838f927..1e78966 100644
 +		bool earlyTransfer = true;       ///< Copy depth/MVs/HUD-less at their frame hooks, not at Present
 +		bool earlyUnpack = true;         ///< ...and queue the display GPU's read of them there too
 +		int halfResDepthMV = 1;          ///< 0 full, 1 depth at half res (rebuilt on the display GPU), 2 depth + MVs at half res
++		int fsrRuntime = 1;              ///< 0 FidelityFX SDK 1.1.4 (FSR 3.1.4), 1 FSR SDK 2.4 (newest provider offered)
++		int fsrSwapChainProvider = 0;    ///< SDK 2.4 only: 0 newest offered, 1 newest 3.x (A/B against 4.0.0 pacing)
++		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
  	};
  
  	Settings settings;
@@ -3457,7 +4273,7 @@ index 838f927..1e78966 100644
  	bool highFPSPhysicsFixLoaded = false;
  
  	FrameGenType activeFrameGenType = FrameGenType::kFSR3;
-@@ -46,6 +61,8 @@ public:
+@@ -46,6 +64,8 @@ public:
  	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
  	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
  	ID3D11ComputeShader* generateUIBufferCS = nullptr;
@@ -3466,7 +4282,7 @@ index 838f927..1e78966 100644
  
  	bool setupBuffers = false;
  
-@@ -57,6 +74,8 @@ public:
+@@ -57,6 +77,8 @@ public:
  	void PostPostLoad();
  
  	void CreateFrameGenerationResources();

@@ -146,6 +146,27 @@ try {
     if (-not $entry) { throw "amd_fidelityfx_dx12.dll not in the FidelityFX zip" }
     [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, "$plugins\FrameGeneration\FidelityFX\amd_fidelityfx_dx12.dll", $true)
 } finally { $zip.Dispose() }
+
+# FSR SDK 2.4 runtime (iFSRRuntime = 1): the loader and the frame-generation effect DLL. The v2.4.0
+# release has no binary asset (its source archive is ~250 MB), so the two signed DLLs are fetched
+# one by one from the tagged commit and checked against pinned hashes. The loader finds the effect
+# DLL next to itself, so both go into the same FidelityFX folder as the 1.1.4 DLL.
+$fsr2Commit = "7539ae8b6568ad29ed78a753404351daf3b5cca7"   # tag v2.4.0
+$fsr2Cache = "$WorkDir\fsr-sdk-2.4.0"
+New-Item -ItemType Directory -Force $fsr2Cache | Out-Null
+$fsr2Dlls = [ordered]@{
+    "amd_fidelityfx_loader_dx12.dll"          = "e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb"
+    "amd_fidelityfx_framegeneration_dx12.dll" = "e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6"
+}
+foreach ($name in $fsr2Dlls.Keys) {
+    $cached = "$fsr2Cache\$name"
+    if (-not (Test-Path $cached)) {
+        Invoke-WebRequest "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/$fsr2Commit/Kits/FidelityFX/signedbin/$name" -OutFile $cached
+    }
+    if ((Get-FileHash $cached -Algorithm SHA256).Hash.ToLower() -ne $fsr2Dlls[$name]) { Remove-Item $cached; throw "$name hash mismatch" }
+    Copy-Item $cached "$plugins\FrameGeneration\FidelityFX\$name"
+}
+Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\FidelityFX\LICENSE-FSR-SDK-2.4.txt" "$plugins\FrameGeneration\FidelityFX"
 Copy-Item "$Here\README.md" "$pkg\FG-GPU1-README.md"
 
 Step "Done"

@@ -2,6 +2,72 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
+## Latest: FSR SDK 2.4 runtime option (built; first in-game run OK)
+
+**First run, 2026-11-06 18:30, 4K, raised graphics settings, `iFSRSwapChainProvider = 0`:** swap
+chain **4.0.0** + frame generation **3.1.6**, both DLLs from the plugin folder, window covers the
+display, no VSync line, no FFX messages, no failed generated-frame dispatches. Steady
+**63.7–64.9 game → 127.5–129.8 presented (50% generated)**, below the 71 cap: the 3090 is GPU-bound
+at these settings (`3090 copy` starts 5–6 ms *after* Present, i.e. it is still rendering).
+`FFX Present` block avg 7.9–8.8 ms, max 10–11.7 ms. Subjectively very smooth. Not yet comparable
+with 1.1.4: the graphics settings changed, and driver-assisted pacing is not observable in the log.
+Next: same settings and spot, `iFSRSwapChainProvider = 1` and `iFSRRuntime = 0`, ideally with
+PresentMon. (The one-time "first 10 s" tally fired during loading, so it read 1 dispatch.)
+
+**PresentMon A/B, 18:44–18:55** (`fo4-fg-gpu1/tools`, captures in `D:\fgb\presentmon\captures`,
+60 s each, ~125 fps presented, 0 dropped, VSync off, tearing allowed):
+
+| swap chain | sd ms | p99 ms | 1% low | jitter ms (p95) | frames >10 ms / >12 ms | max ms | mode |
+|---|---|---|---|---|---|---|---|
+| **4.0.0** (SDK 2.4) | **0.27** | **8.94** | **112** | **0.20 (0.49)** | **15 / 1** | 15.0 | Hardware Composed: Independent Flip |
+| 3.1.7 (SDK 2.4), run 1* | 0.36 | 9.29 | 108 | 0.26 (0.73) | 38 / 7 | 16.5 | Hardware: Independent Flip |
+| 3.1.7 (SDK 2.4), run 2 | 0.37 | 9.23 | 108 | 0.26 (0.67) | 40 / 11 | 16.5 | Hardware: Independent Flip |
+| 3.1.4 (SDK 1.1.4, 19:01) | 0.39 | 9.51 | 105 | 0.28 (0.65) | 56 / 11 | 15.7 | Hardware: Independent Flip |
+
+All ~125–126 fps presented (62.5–63.5 base), 0 dropped. 4.0.0: real vs generated frames on screen
+8.05 / 7.88 ms (no double step); none of the runs shows one. **Verdict: the 4.0.0 swap chain cuts
+the long frames 2.5–4× and the frame-to-frame jitter ~30% against 1.1.4**, at the same frame
+rate; 3.1.7 sits between. Its switch to an overlay plane fits driver-assisted pacing, though the API
+does not confirm it. One 60 s run per config (two for 3.1.7, which agree), same spot. *Run 1's
+settings are inferred (log overwritten, no frame types, numbers match run 2); the 18:53 capture
+labelled `fsr114` was really 3.1.7 per its log. The capture script now saves the config the game
+really used (`*.config.txt`, from the plugin log) and the summary shows it.
+
+`iFSRRuntime` (default **1** in the shipped settings.ini) switches FSR frame generation from
+FidelityFX SDK 1.1.4 / FSR 3.1.4 to FSR SDK 2.4. `0` restores exactly the previous behaviour; the
+1.1.4 code path was not changed. Background: DeepSeek's `research/FSR41-FG-PORT-REPORT.md` (sound on
+the SDK facts; two corrections — there is no HUD-less/back-buffer format mismatch here, both are
+RGBA8, and `posAdjust`, not the inverse view matrix, is the camera's world position because FO4
+renders camera-relative) and the README section "FSR SDK 2.4".
+
+- **What 2.4 can give on this PC (Windows 10):** the **4.0.0 swap chain** (driver-assisted frame
+  pacing, if the driver engages it) with the **3.1.6** analytical interpolator. FSR 4 ML frame
+  generation (4.0.2) is not offered at all on Windows 10: the provider query returns only 3.1.6, with
+  or without a device (`D:\fsr-probe\inbox\probe.exe`), so there is no ID to force.
+- **Driver pacing conditions on this setup:** `iPresentInterval=0` (VSync off), 4K window covering
+  the display (`bFull Screen=1` in the prefs; the plugin's own swap chain is windowed and covers
+  the monitor), 71 → 142 inside the 144 Hz VRR range. Not reported by the API; compare frame-time
+  variance against `iFSRSwapChainProvider = 1` (3.1.7, software pacing).
+- **Code:** `FidelityFX.h/.cpp` load either runtime (`LoadFFX`), create both contexts with the 2.x
+  version descriptors, optional provider pins and the HUD-less format descriptor (only chained when
+  the back buffer is not RGBA8 — here it is format 28, RGBA8, so it is not), and dispatch
+  `PrepareV2` with camera position (`posAdjust`), up/right/forward, FOV from `projMat[1][1]` and
+  `reset` after menus. Failed creation under 2.4 falls back to 1.1.4 for the session.
+  Generated-frame dispatch failures are counted and logged every 10 s.
+- **Headers:** SDK 2.4 API headers vendored unmodified in `overlay/include/ffx2/` (MIT). The
+  upstream 1.1.4 headers in `include/` are no longer used by the plugin; the struct type IDs and
+  layouts the 1.1.4 path uses are identical in 2.4 (checked).
+- **Runtime DLLs:** `amd_fidelityfx_loader_dx12.dll` + `amd_fidelityfx_framegeneration_dx12.dll`
+  from commit `7539ae8` (tag v2.4.0), fetched per file with pinned SHA-256 (the release has no
+  binary asset). Licence text shipped as `FidelityFX/LICENSE-FSR-SDK-2.4.txt`.
+- **Build:** clean (`/W4 /WX`, 0 warnings). Package `D:\fgb\package`, zip
+  `D:\fgb\FO4-FG-GPU1-fsr24.zip` (the older `D:\fgb\FO4-FG-GPU1.zip` is the previous build).
+- **First in-game test:** install the fsr24 zip, play 30–60 s at 4K, then grep the log for `[FSR]`:
+  providers offered/used, `window ... covers the display`, `generated frames in the first 10 s`, any
+  `generating a frame failed` / `runtime:` lines, and compare `presented/game` and
+  `render thread blocked: FFX Present` with the 1.1.4 numbers below. Then repeat with
+  `iFSRSwapChainProvider = 1` for the pacing A/B (PresentMon for frame-time variance).
+
 ## Where we are
 
 The prototype **works end to end**. Fallout 4 renders on the RTX 3090, the RX 9060 XT runs FSR3

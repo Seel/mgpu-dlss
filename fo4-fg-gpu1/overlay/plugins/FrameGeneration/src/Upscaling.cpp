@@ -145,6 +145,9 @@ void Upscaling::LoadSettings()
 	settings.earlyTransfer = ini.GetBoolValue("Settings", "bEarlyTransfer", true);
 	settings.earlyUnpack = ini.GetBoolValue("Settings", "bEarlyUnpack", true);
 	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iHalfResDepthMV", 1)), 0, 2);
+	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRRuntime", 1)), 0, 1);
+	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRSwapChainProvider", 0)), 0, 1);
+	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRFrameGenProvider", 0)), 0, 1);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -165,6 +168,9 @@ void Upscaling::LoadSettings()
 		REX::INFO("[Frame Generation] iHalfResDepthMV: {} (0=full, 1=half-res depth rebuilt on the display GPU, "
 				  "2=half-res depth and motion vectors)",
 			settings.halfResDepthMV);
+		REX::INFO("[Frame Generation] iFSRRuntime: {} (0=FidelityFX SDK 1.1.4 / FSR 3.1.4, 1=FSR SDK 2.4, newest provider offered) "
+				  "iFSRSwapChainProvider: {} iFSRFrameGenProvider: {} (0=newest offered, 1=newest 3.x)",
+			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
 		loggedOnce = true;
 	}
 }

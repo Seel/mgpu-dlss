@@ -30,6 +30,9 @@ public:
 		bool earlyTransfer = true;       ///< Copy depth/MVs/HUD-less at their frame hooks, not at Present
 		bool earlyUnpack = true;         ///< ...and queue the display GPU's read of them there too
 		int halfResDepthMV = 1;          ///< 0 full, 1 depth at half res (rebuilt on the display GPU), 2 depth + MVs at half res
+		int fsrRuntime = 1;              ///< 0 FidelityFX SDK 1.1.4 (FSR 3.1.4), 1 FSR SDK 2.4 (newest provider offered)
+		int fsrSwapChainProvider = 0;    ///< SDK 2.4 only: 0 newest offered, 1 newest 3.x (A/B against 4.0.0 pacing)
+		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
 	};
 
 	Settings settings;

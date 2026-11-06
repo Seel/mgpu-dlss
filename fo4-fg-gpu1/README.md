@@ -24,8 +24,10 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | Path | What |
 |---|---|
 | `overlay/` | Full copies of the changed/new upstream files. The build copies them over the pinned checkout. |
-| `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review |
+| `overlay/include/ffx2/` | FSR SDK 2.4 API headers (unmodified, MIT), used for both FSR runtimes |
+| `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review (without the vendored SDK headers and licence text) |
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
+| `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
 | `../.github/workflows/fo4-fg-gpu1.yml` | GitHub Actions build (seen from this folder) |
 
@@ -76,7 +78,13 @@ bEarlyTransfer = 1           ; 1 = depth/MVs/HUD-less cross during the frame (de
 bEarlyUnpack = 1             ; 1 = the 9060 reads them as they land, before Present (default); 0 = reads queued at Present
 iHalfResDepthMV = 1          ; 0 = full res; 1 = half-res depth, rebuilt on the 9060 (default); 2 = half-res depth + MVs
 iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
+iFSRRuntime = 1              ; 0 = FidelityFX SDK 1.1.4 (FSR 3.1.4); 1 = FSR SDK 2.4, newest provider offered (default)
+iFSRSwapChainProvider = 0    ; SDK 2.4: 0 = newest swap chain (4.0.0 on RX 9000); 1 = newest 3.x (3.1.7), for A/B
+iFSRFrameGenProvider = 0     ; SDK 2.4: 0 = newest interpolator (4.0.2 ML on Win11 + RX 9000, else 3.1.6); 1 = 3.x
 ```
+
+`iFSRRuntime` picks the FSR runtime; see [FSR SDK 2.4](#fsr-sdk-24-ifsrruntime) below. It applies
+in both GPU1 and single-GPU FSR3 mode.
 
 `bSendHudlessFrame` is the "extra UI-free frame" switch. On (default) the 3090 sends a second copy
 of each frame with the HUD removed; FSR3 uses it so the HUD is not interpolated. Off removes that
@@ -191,6 +199,61 @@ chain nothing.
 
 If anything fails during setup, the plugin logs why and falls back to running FG on the 3090. Failures that happen after the swap chain exists are logged as `CRITICAL`.
 
+## FSR SDK 2.4 (`iFSRRuntime`)
+
+The package ships two FSR runtimes in `Data\F4SE\Plugins\FrameGeneration\FidelityFX\`:
+
+| `iFSRRuntime` | DLLs | what you get |
+|---|---|---|
+| `0` | `amd_fidelityfx_dx12.dll` (FidelityFX SDK 1.1.4) | FSR 3.1.4: what this mod was developed and measured with |
+| `1` (default) | `amd_fidelityfx_loader_dx12.dll` + `amd_fidelityfx_framegeneration_dx12.dll` (FSR SDK 2.4) | the newest frame generation the driver and Windows offer |
+
+With 2.4, AMD's runtime offers different parts depending on the machine. The plugin takes the newest
+of each unless you pin one:
+
+| part | Windows 10, RX 9060 XT, Adrenalin 26.10.1 (probed) | Windows 11, RX 9000 |
+|---|---|---|
+| swap chain (pacing) | **4.0.0**, or 3.1.7 | 4.0.0, or 3.1.7 |
+| interpolator | **3.1.6** only (analytical, same kind as 3.1.4) | **4.0.2** (FSR 4 ML), or 3.1.6 |
+
+So on Windows 10 the image-quality upgrade (ML frame generation) is **not available**; AMD's runtime
+does not even list it. What 2.4 can still bring there is the 4.0.0 swap chain's
+**driver-assisted frame pacing**, where the AMD driver times the presents instead of a user-mode
+busy-wait. AMD enables it on its own, with no API flag and no report, when all of these hold:
+RX 9000-series GPU, Adrenalin 26.10.1+, swap chain 4.0.0+, fullscreen or a borderless window
+covering the display, VSync off, and presenting inside the display's VRR range (AMD says it is tuned
+for Windows 11 with hardware-accelerated GPU scheduling). The log reports the two conditions the
+plugin can see: whether the window covers the display, and VSync. To see whether pacing improved,
+compare frame-time variance (e.g. PresentMon's `msBetweenPresents`) against `iFSRSwapChainProvider = 1`,
+which keeps everything else the same but uses the 3.1.7 swap chain and its own pacing.
+
+What the plugin does differently with 2.4 (the 1.1.4 path is untouched):
+- adds the version descriptors 2.x needs to enable its newer API;
+- dispatches `PrepareV2` with the camera's world position (`posAdjust`) and its up/right/forward
+  vectors (FSR 4 ML needs them; FSR 3.1.6 accepts them), the vertical FOV from the projection
+  matrix instead of a fixed 1 rad, and `reset` when generation restarts after a menu or loading;
+- declares the HUD-less copy's RGBA8 format when the back buffer is something else;
+- logs which providers were offered and which are used, where the DLLs were loaded from, FSR's own
+  error/warning messages, and failed generated-frame dispatches.
+
+If the 2.4 DLLs are missing or a context cannot be created, the plugin logs why and runs that
+session on 1.1.4. The 2.4 loader looks for `amd_fidelityfx_framegeneration_dx12.dll` next to
+`Fallout4.exe` *before* its own folder, so a copy left there by another mod (OptiScaler, for
+example) wins; the log warns when that happens.
+
+```
+[FSR] runtime: FSR SDK 2.4 (Data\F4SE\Plugins\FrameGeneration\FidelityFX\amd_fidelityfx_loader_dx12.dll)
+[FSR] swap chain providers offered: 4.0.0, 3.1.7
+[FSR] swap chain provider: 4.0.0 (driver-assisted frame pacing capable)
+[FSR] frame generation providers offered: 3.1.6
+[FSR] FSR 4 (ML) frame generation is not offered on this system. AMD requires Windows 11 and an RX 9000-series GPU for it; ...
+[FSR] in use: swap chain 4.0.0 + frame generation 3.1.6
+[FSR] window 3840x2160 at (0,0), display 3840x2160 at (0,0): covers the display
+[FSR] generated frames in the first 10 s: 690 dispatched, none failed
+```
+
+(Expected lines, not a capture; the provider lists are what the Windows 10 probe returned.)
+
 ## Frame generation is not upscaling
 
 GPU1 mode renders the game at whatever resolution the game asks for, on the 3090, and doubles the
@@ -224,6 +287,12 @@ path. That is why `bAsyncUnpack` streams the buffers lane by lane: the 9060's re
 3090's copy instead of following it. See SESSION-NOTES.md for the numbers.
 
 ## Known risks / first things to check
+
+- **FSR SDK 2.4 has had one in-game run.** At 4K it used swap chain 4.0.0 + FSR 3.1.6, doubled
+  64 → 128 fps with no errors and felt smooth, but it has not yet been A/B-tested against 1.1.4 or
+  the 3.1.7 swap chain at the same settings. If 2.4 misbehaves (no generated frames,
+  `[FSR] generating a frame failed`, stutter, a crash), set `iFSRRuntime = 0` to go back to
+  exactly the previous behaviour.
 
 - **Cross-adapter heap 3090 → 9060 XT.** MGPU Bridge proved AMD → NVIDIA. This direction should work the same way, and if it fails the code tries the reverse automatically. If both fail, the log shows the HRESULT and frame generation stays on the 3090.
 - **A failure after startup is not recovered.** Once the bridge is up, the first failed HRESULT — including the 2 s timeout waiting for the previous frame's copy if the secondary GPU's queue stalls — disables the transport for the rest of the session. `secondaryGPU` stays selected, so the game keeps running but no new frame reaches the screen (`CRITICAL [FG-GPU1] transport is down`). Restart the game; there is no automatic single-GPU fallback after this point.
