@@ -1,0 +1,5 @@
+# Reference clones of third-party projects (large, each with its own .git)
+/research/
+
+# Local build log
+build-local.log

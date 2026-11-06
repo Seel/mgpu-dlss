@@ -1,0 +1,99 @@
+# Builds AAAFrameGeneration.dll from northaxosky/FO4Upscaling (pinned) with the
+# secondary-GPU frame generation changes in fo4-fg-gpu1/overlay copied over it.
+# Output: an artifact "FO4-FG-GPU1" laid out as a mod (Data\...), ready for Vortex/MO2.
+name: FO4 FG on GPU1
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'fo4-fg-gpu1/**'
+      - '.github/workflows/fo4-fg-gpu1.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      UPSTREAM_SHA: 3e237a44269a8dc8cab54aab4ef0aae83c284a43
+
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: mgpu-dlss
+
+      - name: Checkout FO4Upscaling (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: northaxosky/FO4Upscaling
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: FO4Upscaling
+          submodules: recursive
+          lfs: true
+
+      - name: Apply the GPU1 overlay
+        shell: bash
+        run: |
+          cp -rv mgpu-dlss/fo4-fg-gpu1/overlay/. FO4Upscaling/
+          cd FO4Upscaling
+          git status --short
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'b472291f295551b7127359ea38fdd2ca092f6f1b'
+          vcpkgJsonGlob: 'FO4Upscaling/vcpkg.json'
+
+      - name: Prepare CommonLibF4
+        shell: bash
+        working-directory: FO4Upscaling
+        run: cp cmake/CommonLibF4.cmake.txt extern/CommonLibF4/CMakeLists.txt
+
+      - name: Configure
+        shell: pwsh
+        working-directory: FO4Upscaling
+        run: |
+          # The preset names VS 2022; use whichever Visual Studio the runner image has.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $major = (& $vswhere -latest -property installationVersion).Split('.')[0]
+          $generator = switch ($major) { '18' { 'Visual Studio 18 2026' } default { 'Visual Studio 17 2022' } }
+          Write-Host "Using generator: $generator"
+          cmake -S . --preset=default -G "$generator"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build AAAFrameGeneration
+        working-directory: FO4Upscaling
+        run: cmake --build build --config Release --target AAAFrameGeneration
+
+      - name: Fetch FidelityFX runtime
+        shell: bash
+        working-directory: FO4Upscaling
+        run: bash scripts/fetch-sdks.sh
+
+      - name: Package
+        shell: bash
+        run: |
+          SRC=FO4Upscaling
+          OUT=staging/Data
+          mkdir -p "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX" "$OUT/MCM/Config/FrameGeneration"
+          cp "$SRC/build/plugins/FrameGeneration/Release/AAAFrameGeneration.dll" "$OUT/F4SE/Plugins/"
+          cp "$SRC/build/plugins/FrameGeneration/Release/AAAFrameGeneration.pdb" "$OUT/F4SE/Plugins/" || true
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/"*.hlsl "$OUT/F4SE/Plugins/FrameGeneration/"
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/LICENSE.txt" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
+          cp -r "$SRC/package/MCM/Config/FrameGeneration/." "$OUT/MCM/Config/FrameGeneration/"
+          cp "$SRC/COPYING" "$SRC/LICENSE" "$SRC/EXCEPTIONS.md" staging/ 2>/dev/null || true
+          cp mgpu-dlss/fo4-fg-gpu1/README.md staging/FG-GPU1-README.md
+          find staging -type f
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FO4-FG-GPU1
+          path: staging/

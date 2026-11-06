@@ -1,0 +1,1546 @@
+diff --git a/package/MCM/Config/FrameGeneration/settings.ini b/package/MCM/Config/FrameGeneration/settings.ini
+index fa75993..c0fdb86 100644
+--- a/package/MCM/Config/FrameGeneration/settings.ini
++++ b/package/MCM/Config/FrameGeneration/settings.ini
+@@ -13,8 +13,8 @@ bFrameLimitMode = 1
+ bDisableInMenus = 1
+ 
+ ; Frame generation backend (requires game restart to change)
+-; Default: 1 (0=FSR3, 1=DLSS-G, 2=XeSS-FG)
+-iFrameGenType = 1
++; Default: 1 (0=FSR3, 1=DLSS-G, 2=XeSS-FG). Ignored (FSR3) when bFrameGenOnSecondaryGPU = 1.
++iFrameGenType = 0
+ 
+ ; DLSS-G frame multiplier (requires game restart, RTX 50+ for 3x/4x)
+ ; Default: 0 (0=2x, 1=3x MFG, 2=4x MFG)
+@@ -23,3 +23,20 @@ iFrameGenFrames = 0
+ ; Enables verbose Streamline logging for troubleshooting. Requires game restart.
+ ; Default: false
+ bEnableDebugLogging = 0
++
++; [FG-GPU1] Run FSR3 frame generation and present on a SECOND GPU - the one the monitor is
++; plugged into - while the game keeps rendering on its own GPU. Every frame's colour,
++; HUD-less colour, depth and motion vectors are copied across PCIe. Requires game restart.
++; Not supported with ENB yet. Default: false
++bFrameGenOnSecondaryGPU = 1
++
++; [FG-GPU1] Optional: part of the secondary GPU's name, e.g. "9060". Leave empty to pick the
++; GPU that drives the monitor the game window is on. Requires game restart.
++sSecondaryGPUName =
++
++; [FG-GPU1] Send an EXTRA, UI-free copy of every frame to the frame-generation GPU.
++;   On  = generated frames keep a clean HUD (recommended).
++;   Off = ~25% less PCIe traffic, but the HUD is interpolated with the scene and smears
++;         during camera movement.
++; Requires restart. Default: true
++bSendHudlessFrame = 1
+diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
+new file mode 100644
+index 0000000..8872eca
+--- /dev/null
++++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
+@@ -0,0 +1,824 @@
++#include "CrossAdapterBridge.h"
++
++#include <algorithm>
++#include <cctype>
++
++namespace
++{
++	constexpr UINT64 kHeapAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;  // 64 KiB
++
++	UINT64 AlignUp(UINT64 a_value, UINT64 a_alignment)
++	{
++		return (a_value + a_alignment - 1) & ~(a_alignment - 1);
++	}
++
++	bool LuidEqual(const LUID& a_left, const LUID& a_right)
++	{
++		return a_left.LowPart == a_right.LowPart && a_left.HighPart == a_right.HighPart;
++	}
++
++	std::string Narrow(const wchar_t* a_text)
++	{
++		std::string out;
++		for (; a_text && *a_text; ++a_text)
++			out += (*a_text < 0x80) ? static_cast<char>(*a_text) : '?';
++		return out;
++	}
++
++	std::string Lower(std::string a_text)
++	{
++		std::transform(a_text.begin(), a_text.end(), a_text.begin(),
++			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++		return a_text;
++	}
++
++	bool OwnsMonitor(IDXGIAdapter1* a_adapter, HMONITOR a_monitor)
++	{
++		if (!a_monitor)
++			return false;
++		for (UINT index = 0;; ++index) {
++			winrt::com_ptr<IDXGIOutput> output;
++			const HRESULT hr = a_adapter->EnumOutputs(index, output.put());
++			if (hr == DXGI_ERROR_NOT_FOUND)
++				return false;
++			if (FAILED(hr))
++				return false;
++			DXGI_OUTPUT_DESC desc{};
++			// An output that is not attached to the desktop cannot be the monitor the game
++			// window is on; its Monitor field is not a live handle.
++			if (output && SUCCEEDED(output->GetDesc(&desc)) && desc.AttachedToDesktop && desc.Monitor == a_monitor)
++				return true;
++		}
++	}
++
++	bool HasAttachedOutput(IDXGIAdapter1* a_adapter)
++	{
++		for (UINT index = 0;; ++index) {
++			winrt::com_ptr<IDXGIOutput> output;
++			const HRESULT hr = a_adapter->EnumOutputs(index, output.put());
++			if (hr == DXGI_ERROR_NOT_FOUND)
++				return false;
++			if (FAILED(hr))
++				return false;
++			DXGI_OUTPUT_DESC desc{};
++			if (SUCCEEDED(output->GetDesc(&desc)) && desc.AttachedToDesktop)
++				return true;
++		}
++	}
++
++	void LogOutputs(IDXGIAdapter1* a_adapter, const std::string& a_name)
++	{
++		UINT count = 0;
++		for (UINT index = 0;; ++index) {
++			winrt::com_ptr<IDXGIOutput> output;
++			const HRESULT hr = a_adapter->EnumOutputs(index, output.put());
++			if (hr == DXGI_ERROR_NOT_FOUND)
++				break;
++			if (FAILED(hr)) {
++				REX::WARN("[FG-GPU1]   output[{}] EnumOutputs failed hr={:#010x}", index, static_cast<std::uint32_t>(hr));
++				break;
++			}
++			DXGI_OUTPUT_DESC desc{};
++			if (SUCCEEDED(output->GetDesc(&desc))) {
++				REX::INFO("[FG-GPU1]   output[{}] \"{}\" attached={} monitor={:#x}", index, Narrow(desc.DeviceName),
++					desc.AttachedToDesktop ? 1 : 0, reinterpret_cast<std::uintptr_t>(desc.Monitor));
++				++count;
++			}
++		}
++		REX::INFO("[FG-GPU1]   \"{}\" outputs: {}", a_name, count);
++	}
++
++	D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before,
++		D3D12_RESOURCE_STATES a_after)
++	{
++		D3D12_RESOURCE_BARRIER barrier{};
++		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++		barrier.Transition.pResource = a_resource;
++		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		barrier.Transition.StateBefore = a_before;
++		barrier.Transition.StateAfter = a_after;
++		return barrier;
++	}
++
++	double QpcMs(const LARGE_INTEGER& a_from, const LARGE_INTEGER& a_to, const LARGE_INTEGER& a_frequency)
++	{
++		return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1000.0 /
++		       static_cast<double>(a_frequency.QuadPart);
++	}
++}
++
++winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::PickRenderAdapter(IDXGIAdapter* a_gameAdapter)
++{
++	if (!a_gameAdapter)
++		return nullptr;
++
++	DXGI_ADAPTER_DESC gameDesc{};
++	if (FAILED(a_gameAdapter->GetDesc(&gameDesc)))
++		return nullptr;
++
++	winrt::com_ptr<IDXGIFactory1> factory;
++	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put()))))
++		return nullptr;
++
++	winrt::com_ptr<IDXGIAdapter1> display;
++	std::vector<winrt::com_ptr<IDXGIAdapter1>> headless;
++	for (UINT index = 0;; ++index) {
++		winrt::com_ptr<IDXGIAdapter1> adapter;
++		if (factory->EnumAdapters1(index, adapter.put()) == DXGI_ERROR_NOT_FOUND)
++			break;
++		DXGI_ADAPTER_DESC1 desc{};
++		if (FAILED(adapter->GetDesc1(&desc)))
++			continue;
++		if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414)
++			continue;
++		if (HasAttachedOutput(adapter.get()))
++			display = adapter;
++		else
++			headless.push_back(adapter);
++	}
++
++	// Only act when the split is unambiguous: one GPU drives the display, one drives nothing.
++	if (!display || headless.size() != 1)
++		return nullptr;
++
++	DXGI_ADAPTER_DESC1 displayDesc{};
++	if (FAILED(display->GetDesc1(&displayDesc)))
++		return nullptr;
++
++	// Only move rendering when the game picked the display GPU. The target has no display
++	// attached, so this cannot invert the intended roles if detection is off.
++	if (!LuidEqual(gameDesc.AdapterLuid, displayDesc.AdapterLuid))
++		return nullptr;
++
++	return headless.front();
++}
++
++std::string CrossAdapterBridge::AdapterName(IDXGIAdapter* a_adapter){
++	DXGI_ADAPTER_DESC desc{};
++	if (!a_adapter || FAILED(a_adapter->GetDesc(&desc)))
++		return "<unknown>";
++	return Narrow(desc.Description);
++}
++
++winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::SelectSecondaryAdapter(IDXGIAdapter* a_gameAdapter,
++	HWND a_window, const std::string& a_nameFilter)
++{
++	DXGI_ADAPTER_DESC gameDesc{};
++	if (!a_gameAdapter || FAILED(a_gameAdapter->GetDesc(&gameDesc))) {
++		REX::ERROR("[FG-GPU1] Cannot read the game's adapter; staying on one GPU");
++		return nullptr;
++	}
++
++	winrt::com_ptr<IDXGIFactory1> factory;
++	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
++		REX::ERROR("[FG-GPU1] CreateDXGIFactory1 failed; staying on one GPU");
++		return nullptr;
++	}
++
++	const HMONITOR monitor = a_window ? MonitorFromWindow(a_window, MONITOR_DEFAULTTONEAREST) : nullptr;
++	const std::string filter = Lower(a_nameFilter);
++
++	{
++		MONITORINFOEXW info{};
++		info.cbSize = sizeof(info);
++		const bool resolved = monitor && GetMonitorInfoW(monitor, &info);
++		REX::INFO("[FG-GPU1] game window monitor {:#x} \"{}\"", reinterpret_cast<std::uintptr_t>(monitor),
++			resolved ? Narrow(info.szDevice) : "unresolved");
++	}
++
++	std::vector<winrt::com_ptr<IDXGIAdapter1>> candidates;
++	std::vector<winrt::com_ptr<IDXGIAdapter1>> named;
++	std::vector<winrt::com_ptr<IDXGIAdapter1>> displaying;
++	std::vector<winrt::com_ptr<IDXGIAdapter1>> withOutputs;
++
++	for (UINT index = 0;; ++index) {
++		winrt::com_ptr<IDXGIAdapter1> adapter;
++		if (factory->EnumAdapters1(index, adapter.put()) == DXGI_ERROR_NOT_FOUND)
++			break;
++		DXGI_ADAPTER_DESC1 desc{};
++		if (FAILED(adapter->GetDesc1(&desc)))
++			continue;
++
++		const std::string name = Narrow(desc.Description);
++		const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414;
++		const bool isGame = LuidEqual(desc.AdapterLuid, gameDesc.AdapterLuid);
++		const bool ownsMonitor = OwnsMonitor(adapter.get(), monitor);
++		const bool hasOutput = HasAttachedOutput(adapter.get());
++
++		REX::INFO("[FG-GPU1] adapter[{}] \"{}\" vendor={:#06x} luid={:#010x}-{:#010x} vram={}MB{}{}{}{}",
++			index, name, desc.VendorId,
++			static_cast<std::uint32_t>(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart,
++			desc.DedicatedVideoMemory / (1024 * 1024),
++			isGame ? " [game]" : "", software ? " [software]" : "", ownsMonitor ? " [game window's monitor]" : "",
++			hasOutput ? " [display]" : "");
++		LogOutputs(adapter.get(), name);
++
++		if (software || isGame)
++			continue;
++		candidates.push_back(adapter);
++		if (!filter.empty() && Lower(name).find(filter) != std::string::npos)
++			named.push_back(adapter);
++		if (ownsMonitor)
++			displaying.push_back(adapter);
++		if (hasOutput)
++			withOutputs.push_back(adapter);
++	}
++
++	const auto pick = [](const std::vector<winrt::com_ptr<IDXGIAdapter1>>& a_list, const char* a_rule)
++		-> winrt::com_ptr<IDXGIAdapter1> {
++		if (a_list.size() != 1)
++			return nullptr;
++		REX::INFO("[FG-GPU1] SELECTED \"{}\" ({})", AdapterName(a_list.front().get()), a_rule);
++		return a_list.front();
++	};
++
++	if (!filter.empty()) {
++		if (auto adapter = pick(named, "sSecondaryGPUName match"))
++			return adapter;
++		REX::ERROR("[FG-GPU1] sSecondaryGPUName=\"{}\" matched {} non-game hardware adapters (need exactly 1); staying on one GPU",
++			a_nameFilter, named.size());
++		return nullptr;
++	}
++	if (auto adapter = pick(displaying, "owns the monitor the game window is on"))
++		return adapter;
++	if (auto adapter = pick(withOutputs, "drives a display"))
++		return adapter;
++	if (auto adapter = pick(candidates, "only other hardware adapter"))
++		return adapter;
++
++	REX::ERROR("[FG-GPU1] {} candidate adapters and none is unambiguous; set sSecondaryGPUName. Staying on one GPU",
++		candidates.size());
++	return nullptr;
++}
++
++void CrossAdapterBridge::Fail(const char* a_where, HRESULT a_hr)
++{
++	if (active)
++		REX::CRITICAL("[FG-GPU1] {} failed (hr={:#010x}); cross-adapter transport disabled", a_where,
++			static_cast<std::uint32_t>(a_hr));
++	active = false;
++}
++
++HRESULT CrossAdapterBridge::CreateSharedFencePair(UINT64 a_initial, winrt::com_ptr<ID3D12Fence>& a_onA,
++	winrt::com_ptr<ID3D12Fence>& a_onB)
++{
++	// Create on one GPU, open on the other. Render GPU -> secondary first; the other
++	// direction is the one MGPU Bridge proved for AMD -> NVIDIA, kept as a fallback.
++	const auto attempt = [a_initial](ID3D12Device* a_owner, ID3D12Device* a_other,
++							 winrt::com_ptr<ID3D12Fence>& a_created, winrt::com_ptr<ID3D12Fence>& a_opened) {
++		a_created = nullptr;
++		a_opened = nullptr;
++		HRESULT hr = a_owner->CreateFence(a_initial,
++			D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER, IID_PPV_ARGS(a_created.put()));
++		if (FAILED(hr))
++			return hr;
++		HANDLE handle = nullptr;
++		hr = a_owner->CreateSharedHandle(a_created.get(), nullptr, GENERIC_ALL, nullptr, &handle);
++		if (FAILED(hr))
++			return hr;
++		hr = a_other->OpenSharedHandle(handle, IID_PPV_ARGS(a_opened.put()));
++		CloseHandle(handle);
++		return hr;
++	};
++	HRESULT hr = attempt(deviceA.get(), deviceB.get(), a_onA, a_onB);
++	if (FAILED(hr)) {
++		REX::WARN("[FG-GPU1] cross-adapter fence render->secondary failed (hr={:#010x}), trying secondary->render",
++			static_cast<std::uint32_t>(hr));
++		hr = attempt(deviceB.get(), deviceA.get(), a_onB, a_onA);
++	}
++	return hr;
++}
++
++HRESULT CrossAdapterBridge::CreateSharedHeapPair(UINT64 a_size, winrt::com_ptr<ID3D12Heap>& a_onA,
++	winrt::com_ptr<ID3D12Heap>& a_onB)
++{
++	D3D12_HEAP_DESC heapDesc{};
++	heapDesc.SizeInBytes = a_size;
++	heapDesc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
++	heapDesc.Alignment = kHeapAlignment;
++	heapDesc.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
++
++	const auto attempt = [&heapDesc](ID3D12Device* a_owner, ID3D12Device* a_other,
++							 winrt::com_ptr<ID3D12Heap>& a_created, winrt::com_ptr<ID3D12Heap>& a_opened) {
++		a_created = nullptr;
++		a_opened = nullptr;
++		HRESULT hr = a_owner->CreateHeap(&heapDesc, IID_PPV_ARGS(a_created.put()));
++		if (FAILED(hr))
++			return hr;
++		HANDLE handle = nullptr;
++		hr = a_owner->CreateSharedHandle(a_created.get(), nullptr, GENERIC_ALL, nullptr, &handle);
++		if (FAILED(hr))
++			return hr;
++		hr = a_other->OpenSharedHandle(handle, IID_PPV_ARGS(a_opened.put()));
++		CloseHandle(handle);
++		return hr;
++	};
++	HRESULT hr = attempt(deviceA.get(), deviceB.get(), a_onA, a_onB);
++	if (FAILED(hr)) {
++		REX::WARN("[FG-GPU1] cross-adapter heap render->secondary failed (hr={:#010x}), trying secondary->render",
++			static_cast<std::uint32_t>(hr));
++		hr = attempt(deviceB.get(), deviceA.get(), a_onB, a_onA);
++	}
++	return hr;
++}
++
++HRESULT CrossAdapterBridge::WaitCpu(ID3D12Fence* a_fence, UINT64 a_value)
++{
++	if (a_fence->GetCompletedValue() >= a_value)
++		return S_OK;
++	++statCpuWaits;
++	HRESULT hr = a_fence->SetEventOnCompletion(a_value, fenceEvent);
++	if (FAILED(hr))
++		return hr;
++	if (WaitForSingleObject(fenceEvent, 2000) != WAIT_OBJECT_0)
++		return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
++	return S_OK;
++}
++
++bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
++	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11)
++{
++	Shutdown();
++	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
++		return false;
++
++	deviceA.copy_from(a_deviceA);
++	deviceB.copy_from(a_deviceB);
++	context11.copy_from(a_context11);
++	active = true;
++
++	const auto check = [this](HRESULT a_hr, const char* a_what) {
++		if (FAILED(a_hr))
++			Fail(a_what, a_hr);
++		return SUCCEEDED(a_hr);
++	};
++
++	D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
++	if (SUCCEEDED(deviceB->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
++		REX::INFO("[FG-GPU1] secondary device: CrossNodeSharingTier={} CrossAdapterRowMajorTextureSupported={}",
++			static_cast<int>(options.CrossNodeSharingTier), options.CrossAdapterRowMajorTextureSupported ? 1 : 0);
++
++	D3D12_COMMAND_QUEUE_DESC queueDesc{};
++	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
++	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
++	if (!check(deviceA->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(copyQueueA.put())), "copy queue on the render GPU"))
++		return false;
++	copyQueueA->SetName(L"FG-GPU1 transfer (render GPU copy queue)");
++
++	for (auto& allocator : allocatorsA) {
++		if (!check(deviceA->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(allocator.put())),
++				"copy allocator"))
++			return false;
++	}
++	if (!check(deviceA->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, allocatorsA[0].get(), nullptr,
++				   IID_PPV_ARGS(listA.put())),
++			"copy command list"))
++		return false;
++	listA->Close();
++
++	if (!check(CreateSharedFencePair(0, transferFenceA, transferFenceB), "cross-adapter transfer fence"))
++		return false;
++	if (!check(CreateSharedFencePair(0, consumedFenceA, consumedFenceB), "cross-adapter consumed fence"))
++		return false;
++
++	if (!check(deviceA->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(copyDoneFenceA.put())), "copy-done fence"))
++		return false;
++	{
++		HANDLE handle = nullptr;
++		if (!check(deviceA->CreateSharedHandle(copyDoneFenceA.get(), nullptr, GENERIC_ALL, nullptr, &handle),
++				"copy-done fence handle"))
++			return false;
++		const HRESULT hr = a_device11->OpenSharedFence(handle, IID_PPV_ARGS(copyDoneFence11.put()));
++		CloseHandle(handle);
++		if (!check(hr, "opening the copy-done fence on D3D11"))
++			return false;
++	}
++
++	fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++	if (!fenceEvent) {
++		Fail("CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
++		return false;
++	}
++
++	// Copy-queue timestamps are optional; the transport works without them.
++	D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
++	if (SUCCEEDED(deviceA->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))) &&
++		options3.CopyQueueTimestampQueriesSupported &&
++		SUCCEEDED(copyQueueA->GetTimestampFrequency(&timestampFrequency)) && timestampFrequency) {
++		D3D12_QUERY_HEAP_DESC heapDesc{};
++		heapDesc.Type = D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP;
++		heapDesc.Count = kSlots * 2;
++		D3D12_HEAP_PROPERTIES readbackProps{};
++		readbackProps.Type = D3D12_HEAP_TYPE_READBACK;
++		D3D12_RESOURCE_DESC bufferDesc{};
++		bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++		bufferDesc.Width = sizeof(UINT64) * kSlots * 2;
++		bufferDesc.Height = 1;
++		bufferDesc.DepthOrArraySize = 1;
++		bufferDesc.MipLevels = 1;
++		bufferDesc.SampleDesc.Count = 1;
++		bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++		if (FAILED(deviceA->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(timestampHeap.put()))) ||
++			FAILED(deviceA->CreateCommittedResource(&readbackProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
++				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(timestampReadback.put())))) {
++			timestampHeap = nullptr;
++			timestampReadback = nullptr;
++		}
++	}
++	if (!timestampHeap)
++		REX::INFO("[FG-GPU1] copy-queue timestamps unavailable; copy time will not be reported");
++
++	QueryPerformanceFrequency(&qpcFrequency);
++	QueryPerformanceCounter(&statLastLog);
++
++	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> secondary GPU");
++	return true;
++}
++
++int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
++	bool a_createMirror)
++{
++	if (!active)
++		return -1;
++	if (!a_sourceSlot0 || !a_sourceSlot1) {
++		Fail("AddLane (null source)", E_POINTER);
++		return -1;
++	}
++
++	Lane lane;
++	lane.name = a_name;
++	lane.sourceA[0].copy_from(a_sourceSlot0);
++	lane.sourceA[1].copy_from(a_sourceSlot1);
++	lane.desc = a_sourceSlot0->GetDesc();
++
++	if (lane.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || lane.desc.MipLevels != 1 ||
++		lane.desc.DepthOrArraySize != 1 || lane.desc.SampleDesc.Count != 1) {
++		REX::CRITICAL("[FG-GPU1] lane '{}' is not a single-subresource 2D texture", lane.name);
++		Fail("AddLane (unsupported texture)", E_INVALIDARG);
++		return -1;
++	}
++
++	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprintA{};
++	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprintB{};
++	UINT64 totalA = 0;
++	UINT64 totalB = 0;
++	deviceA->GetCopyableFootprints(&lane.desc, 0, 1, 0, &footprintA, nullptr, nullptr, &totalA);
++	deviceB->GetCopyableFootprints(&lane.desc, 0, 1, 0, &footprintB, nullptr, nullptr, &totalB);
++	if (footprintA.Footprint.RowPitch != footprintB.Footprint.RowPitch || totalA != totalB || totalA == 0) {
++		REX::CRITICAL("[FG-GPU1] lane '{}': footprints differ between GPUs (pitch {} vs {}, size {} vs {})",
++			lane.name, footprintA.Footprint.RowPitch, footprintB.Footprint.RowPitch, totalA, totalB);
++		Fail("AddLane (footprint mismatch)", E_FAIL);
++		return -1;
++	}
++	lane.footprint = footprintA;
++	lane.bytes = totalA;
++	lane.slotStride = AlignUp(totalA, kHeapAlignment);
++
++	const UINT64 heapSize = lane.slotStride * kSlots;
++	HRESULT hr = CreateSharedHeapPair(heapSize, lane.heapA, lane.heapB);
++	if (FAILED(hr)) {
++		Fail("cross-adapter heap (CreateHeap SHARED | SHARED_CROSS_ADAPTER / OpenSharedHandle)", hr);
++		return -1;
++	}
++
++	D3D12_RESOURCE_DESC bufferDesc{};
++	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++	bufferDesc.Width = heapSize;
++	bufferDesc.Height = 1;
++	bufferDesc.DepthOrArraySize = 1;
++	bufferDesc.MipLevels = 1;
++	bufferDesc.SampleDesc.Count = 1;
++	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++	bufferDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
++
++	hr = deviceA->CreatePlacedResource(lane.heapA.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(lane.stagingA.put()));
++	if (FAILED(hr)) {
++		Fail("CreatePlacedResource(staging) on the render GPU", hr);
++		return -1;
++	}
++	hr = deviceB->CreatePlacedResource(lane.heapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(lane.stagingB.put()));
++	if (FAILED(hr)) {
++		Fail("CreatePlacedResource(staging) on the secondary GPU", hr);
++		return -1;
++	}
++
++	if (a_createMirror) {
++		D3D12_RESOURCE_DESC mirrorDesc = lane.desc;
++		mirrorDesc.Alignment = 0;
++		mirrorDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++		mirrorDesc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
++		D3D12_HEAP_PROPERTIES defaultHeap{};
++		defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
++		for (UINT slot = 0; slot < kSlots; ++slot) {
++			hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &mirrorDesc,
++				D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(lane.mirrorB[slot].put()));
++			if (FAILED(hr)) {
++				Fail("CreateCommittedResource(mirror) on the secondary GPU", hr);
++				return -1;
++			}
++		}
++	}
++
++	bytesPerFrame += lane.bytes;
++	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total){}",
++		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
++		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
++		a_createMirror ? "" : " (unpacked into caller's destination)");
++
++	lanes.push_back(std::move(lane));
++	return static_cast<int>(lanes.size() - 1);
++}
++
++ID3D12Resource* CrossAdapterBridge::Mirror(int a_lane, UINT a_slot) const noexcept
++{
++	if (a_lane < 0 || static_cast<size_t>(a_lane) >= lanes.size() || a_slot >= kSlots)
++		return nullptr;
++	return lanes[static_cast<size_t>(a_lane)].mirrorB[a_slot].get();
++}
++
++HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
++	ID3D12CommandQueue* a_queueB)
++{
++	if (!active)
++		return E_FAIL;
++	if (a_slot >= kSlots || !a_producerFenceA || !a_queueB) {
++		Fail("Transfer (bad arguments)", E_INVALIDARG);
++		return E_INVALIDARG;
++	}
++
++	LARGE_INTEGER submitStart{};
++	QueryPerformanceCounter(&submitStart);
++
++	// The allocator and timestamp pair of this slot were last used by slotTransfer[a_slot].
++	const UINT64 previous = slotTransfer[a_slot];
++	if (previous) {
++		HRESULT hr = WaitCpu(copyDoneFenceA.get(), previous);
++		if (FAILED(hr)) {
++			Fail("waiting for the previous copy of this slot", hr);
++			return hr;
++		}
++		if (timestampHeap) {
++			const D3D12_RANGE range{ sizeof(UINT64) * a_slot * 2, sizeof(UINT64) * (a_slot * 2 + 2) };
++			void* mapped = nullptr;
++			if (SUCCEEDED(timestampReadback->Map(0, &range, &mapped))) {
++				const auto* ticks = reinterpret_cast<const UINT64*>(static_cast<const std::uint8_t*>(mapped) + range.Begin);
++				if (ticks[1] > ticks[0]) {
++					const double ms = static_cast<double>(ticks[1] - ticks[0]) * 1000.0 /
++					                  static_cast<double>(timestampFrequency);
++					statGpuCopyMs += ms;
++					statGpuCopyMaxMs = (std::max)(statGpuCopyMaxMs, ms);
++					++statGpuCopySamples;
++				}
++				const D3D12_RANGE nothingWritten{ 0, 0 };
++				timestampReadback->Unmap(0, &nothingWritten);
++			}
++		}
++	}
++
++	const UINT64 value = ++transferValue;
++	auto* allocator = allocatorsA[a_slot].get();
++	HRESULT hr = allocator->Reset();
++	if (SUCCEEDED(hr))
++		hr = listA->Reset(allocator, nullptr);
++	if (FAILED(hr)) {
++		Fail("resetting the copy list", hr);
++		return hr;
++	}
++
++	if (timestampHeap)
++		listA->EndQuery(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2);
++
++	for (auto& lane : lanes) {
++		D3D12_TEXTURE_COPY_LOCATION dst{};
++		dst.pResource = lane.stagingA.get();
++		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++		dst.PlacedFootprint = lane.footprint;
++		dst.PlacedFootprint.Offset = lane.slotStride * a_slot;
++
++		D3D12_TEXTURE_COPY_LOCATION src{};
++		src.pResource = lane.sourceA[a_slot].get();
++		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++		src.SubresourceIndex = 0;
++
++		// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
++		// COPY_SOURCE implicitly and they decay back when the list completes.
++		listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++	}
++
++	if (timestampHeap) {
++		listA->EndQuery(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2 + 1);
++		listA->ResolveQueryData(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2, 2,
++			timestampReadback.get(), sizeof(UINT64) * a_slot * 2);
++	}
++
++	hr = listA->Close();
++	if (FAILED(hr)) {
++		Fail("closing the copy list", hr);
++		return hr;
++	}
++
++	// The game's D3D11 work for this frame (the producer of every source).
++	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
++	// The secondary GPU finished reading this slot's staging area the last time round.
++	if (SUCCEEDED(hr) && previous)
++		hr = copyQueueA->Wait(consumedFenceA.get(), previous);
++	if (FAILED(hr)) {
++		Fail("copy queue Wait", hr);
++		return hr;
++	}
++
++	ID3D12CommandList* lists[] = { listA.get() };
++	copyQueueA->ExecuteCommandLists(1, lists);
++
++	hr = copyQueueA->Signal(transferFenceA.get(), value);
++	if (SUCCEEDED(hr))
++		hr = copyQueueA->Signal(copyDoneFenceA.get(), value);
++	if (SUCCEEDED(hr))
++		hr = a_queueB->Wait(transferFenceB.get(), value);
++	if (FAILED(hr)) {
++		Fail("transfer fence Signal/Wait", hr);
++		return hr;
++	}
++
++	slotTransfer[a_slot] = value;
++
++	LARGE_INTEGER submitEnd{};
++	QueryPerformanceCounter(&submitEnd);
++	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
++	++statFrames;
++	const UINT64 consumed = consumedFenceA->GetCompletedValue();
++	statMaxLag = (std::max)(statMaxLag, value > consumed ? value - consumed : 0);
++	return S_OK;
++}
++
++void CrossAdapterBridge::RecordUnpack(ID3D12GraphicsCommandList* a_listB, UINT a_slot)
++{
++	if (!active || !a_listB || a_slot >= kSlots)
++		return;
++
++	std::vector<D3D12_RESOURCE_BARRIER> before;
++	std::vector<D3D12_RESOURCE_BARRIER> after;
++	for (auto& lane : lanes) {
++		if (auto* mirror = lane.mirrorB[a_slot].get()) {
++			before.push_back(Transition(mirror, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST));
++			after.push_back(Transition(mirror, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON));
++		}
++	}
++	if (before.empty())
++		return;
++
++	a_listB->ResourceBarrier(static_cast<UINT>(before.size()), before.data());
++	for (auto& lane : lanes) {
++		auto* mirror = lane.mirrorB[a_slot].get();
++		if (!mirror)
++			continue;
++		D3D12_TEXTURE_COPY_LOCATION dst{};
++		dst.pResource = mirror;
++		dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++		dst.SubresourceIndex = 0;
++
++		D3D12_TEXTURE_COPY_LOCATION src{};
++		src.pResource = lane.stagingB.get();
++		src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++		src.PlacedFootprint = lane.footprint;
++		src.PlacedFootprint.Offset = lane.slotStride * a_slot;
++
++		a_listB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++	}
++	a_listB->ResourceBarrier(static_cast<UINT>(after.size()), after.data());
++}
++
++void CrossAdapterBridge::RecordUnpackTo(ID3D12GraphicsCommandList* a_listB, int a_lane, UINT a_slot,
++	ID3D12Resource* a_destB, D3D12_RESOURCE_STATES a_destState)
++{
++	if (!active || !a_listB || !a_destB || a_slot >= kSlots || a_lane < 0 ||
++		static_cast<size_t>(a_lane) >= lanes.size())
++		return;
++	auto& lane = lanes[static_cast<size_t>(a_lane)];
++
++	const D3D12_RESOURCE_DESC destDesc = a_destB->GetDesc();
++	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
++	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
++	if (destDesc.Width != lane.desc.Width || destDesc.Height != lane.desc.Height ||
++		destFootprint.Footprint.RowPitch != lane.footprint.Footprint.RowPitch) {
++		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
++		static bool logged = false;
++		if (!logged) {
++			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
++				lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format), destDesc.Width,
++				destDesc.Height, static_cast<int>(destDesc.Format));
++			logged = true;
++		}
++		return;
++	}
++
++	auto barrier = Transition(a_destB, a_destState, D3D12_RESOURCE_STATE_COPY_DEST);
++	a_listB->ResourceBarrier(1, &barrier);
++
++	D3D12_TEXTURE_COPY_LOCATION dst{};
++	dst.pResource = a_destB;
++	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++	dst.SubresourceIndex = 0;
++
++	D3D12_TEXTURE_COPY_LOCATION src{};
++	src.pResource = lane.stagingB.get();
++	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++	src.PlacedFootprint = lane.footprint;
++	src.PlacedFootprint.Offset = lane.slotStride * a_slot;
++	// Same width/height; a typeless/UNORM/SRGB difference between the back buffer and the
++	// D3D11 texture is allowed by CopyTextureRegion as long as the formats are copy-compatible.
++	src.PlacedFootprint.Footprint.Format = destDesc.Format;
++
++	a_listB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++
++	barrier = Transition(a_destB, D3D12_RESOURCE_STATE_COPY_DEST, a_destState);
++	a_listB->ResourceBarrier(1, &barrier);
++}
++
++HRESULT CrossAdapterBridge::SignalConsumed(ID3D12CommandQueue* a_queueB)
++{
++	if (!active || !a_queueB)
++		return E_FAIL;
++	const HRESULT hr = a_queueB->Signal(consumedFenceB.get(), transferValue);
++	if (FAILED(hr))
++		Fail("consumed fence Signal", hr);
++	return hr;
++}
++
++HRESULT CrossAdapterBridge::GateD3D11(UINT a_nextSlot)
++{
++	if (!active || a_nextSlot >= kSlots || !slotTransfer[a_nextSlot])
++		return S_OK;
++	const HRESULT hr = context11->Wait(copyDoneFence11.get(), slotTransfer[a_nextSlot]);
++	if (FAILED(hr))
++		Fail("D3D11 Wait on the copy-done fence", hr);
++	return hr;
++}
++
++void CrossAdapterBridge::LogStats()
++{
++	if (!active || !statFrames)
++		return;
++	LARGE_INTEGER now{};
++	QueryPerformanceCounter(&now);
++	const double elapsedMs = QpcMs(statLastLog, now, qpcFrequency);
++	if (elapsedMs < 10000.0)
++		return;
++
++	const double fps = static_cast<double>(statFrames) * 1000.0 / elapsedMs;
++	const double mbPerFrame = static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0);
++	if (statGpuCopySamples) {
++		const double avgCopy = statGpuCopyMs / static_cast<double>(statGpuCopySamples);
++		REX::INFO("[FG-GPU1] {:.1f} game fps | {:.1f} MB/frame = {:.2f} GB/s | copy on render GPU avg {:.2f} ms max {:.2f} ms "
++				  "(~{:.2f} GB/s link) | submit {:.3f} ms | max lag {} | cpu waits {}",
++			fps, mbPerFrame, mbPerFrame * fps / 1024.0, avgCopy, statGpuCopyMaxMs,
++			avgCopy > 0.0 ? mbPerFrame / 1024.0 / (avgCopy / 1000.0) : 0.0,
++			statCpuSubmitMs / static_cast<double>(statFrames), statMaxLag, statCpuWaits);
++	} else {
++		REX::INFO("[FG-GPU1] {:.1f} game fps | {:.1f} MB/frame = {:.2f} GB/s | submit {:.3f} ms | max lag {} | cpu waits {}",
++			fps, mbPerFrame, mbPerFrame * fps / 1024.0, statCpuSubmitMs / static_cast<double>(statFrames), statMaxLag,
++			statCpuWaits);
++	}
++
++	statFrames = 0;
++	statGpuCopyMs = 0.0;
++	statGpuCopySamples = 0;
++	statGpuCopyMaxMs = 0.0;
++	statCpuSubmitMs = 0.0;
++	statMaxLag = 0;
++	statCpuWaits = 0;
++	statLastLog = now;
++}
++
++void CrossAdapterBridge::Shutdown() noexcept
++{
++	if (copyQueueA && copyDoneFenceA && fenceEvent && transferValue)
++		WaitCpu(copyDoneFenceA.get(), transferValue);
++	active = false;
++	lanes.clear();
++	bytesPerFrame = 0;
++	transferValue = 0;
++	slotTransfer = {};
++	timestampHeap = nullptr;
++	timestampReadback = nullptr;
++	listA = nullptr;
++	for (auto& allocator : allocatorsA)
++		allocator = nullptr;
++	copyQueueA = nullptr;
++	transferFenceA = nullptr;
++	transferFenceB = nullptr;
++	consumedFenceA = nullptr;
++	consumedFenceB = nullptr;
++	copyDoneFenceA = nullptr;
++	copyDoneFence11 = nullptr;
++	if (fenceEvent) {
++		CloseHandle(fenceEvent);
++		fenceEvent = nullptr;
++	}
++	context11 = nullptr;
++	deviceA = nullptr;
++	deviceB = nullptr;
++}
+diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
+new file mode 100644
+index 0000000..5b4c9e5
+--- /dev/null
++++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
+@@ -0,0 +1,176 @@
++#pragma once
++
++// CrossAdapterBridge - frame generation on a second GPU.
++//
++// The game renders with D3D11 on the render GPU (e.g. RTX 3090). Stock
++// AAAFrameGeneration opens the game's shared D3D11 textures on a D3D12 device
++// on that SAME adapter and runs FSR3 FG + presents there. In secondary-GPU mode
++// there are two D3D12 devices:
++//
++//   device A  "interop"  render GPU   opens the D3D11 NT-handle textures (as before)
++//   device B  "fg"       display GPU  FFX FG context, FFX swap chain, present
++//
++// and this class moves every input from A to B once per game frame:
++//
++//   D3D11 Signal(producer) -> A copy queue: Wait(producer), Wait(consumed[slot]),
++//   CopyTextureRegion texture -> row-major buffer placed in a
++//   D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER heap, Signal(transfer) + Signal(copyDone)
++//   -> B direct queue: Wait(transfer), buffer -> texture (mirror or back buffer),
++//   ... FFX ..., Signal(consumed)
++//   D3D11 context: Wait(copyDone of the previous transfer) before the game
++//   writes the slot again, so the render GPU never waits on PCIe for the
++//   frame it is working on.
++//
++// Everything runs on the game's render thread (Present and the render hooks).
++// No method throws; failures are logged and reported through the return value.
++
++#include <d3d11_4.h>
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <winrt/base.h>
++
++#include <array>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++class CrossAdapterBridge
++{
++public:
++	static constexpr UINT kSlots = 2;  // AAAFrameGeneration double-buffers every input by frameIndex
++
++	static CrossAdapterBridge* GetSingleton()
++	{
++		static CrossAdapterBridge singleton;
++		return &singleton;
++	}
++
++	// Picks the adapter that frame generation should run and present on.
++	// Never the game's adapter, never a software adapter. With a name filter, the
++	// single hardware adapter whose description contains it (case-insensitive).
++	// Without one, the adapter that owns the monitor a_window is on; failing that,
++	// the only remaining hardware adapter. Ambiguity returns null rather than guessing.
++	static winrt::com_ptr<IDXGIAdapter1> SelectSecondaryAdapter(IDXGIAdapter* a_gameAdapter,
++		HWND a_window, const std::string& a_nameFilter);
++
++	static std::string AdapterName(IDXGIAdapter* a_adapter);
++
++	// The game is usually placed on the GPU that drives the display, because old games
++	// enumerate adapters and take the first one. For secondary-GPU mode the game must render
++	// on the headless GPU instead. Returns that GPU when a_gameAdapter is the display GPU and
++	// there is exactly one hardware adapter with no display attached; otherwise null.
++	static winrt::com_ptr<IDXGIAdapter1> PickRenderAdapter(IDXGIAdapter* a_gameAdapter);
++
++	// a_deviceA: on the game's adapter. a_deviceB: on the secondary adapter.
++	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).
++	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
++		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11);
++
++	[[nodiscard]] bool IsActive() const noexcept { return active; }
++
++	// Registers one double-buffered input. a_sourcesA[slot] are single-subresource
++	// textures on device A. With a_createMirror, same-sized textures are created on
++	// device B and returned by Mirror(); without it, the caller unpacks the lane into
++	// its own destination with RecordUnpackTo (used for the back buffer).
++	// Returns the lane index, or -1 (logged; the bridge is deactivated).
++	int AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
++		bool a_createMirror);
++
++	[[nodiscard]] ID3D12Resource* Mirror(int a_lane, UINT a_slot) const noexcept;
++
++	// Once per game frame, after the D3D11 context signalled a_producerFenceA
++	// (the fence object opened on device A) to a_producerValue. Records and
++	// submits the A-side copies for a_slot and makes a_queueB wait for them.
++	HRESULT Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
++		ID3D12CommandQueue* a_queueB);
++
++	// On B's command list for this frame: staging -> mirror for every mirrored lane.
++	void RecordUnpack(ID3D12GraphicsCommandList* a_listB, UINT a_slot);
++
++	// On B's command list: staging -> a_destB for an unmirrored lane. a_destB is in
++	// a_destState before and after.
++	void RecordUnpackTo(ID3D12GraphicsCommandList* a_listB, int a_lane, UINT a_slot,
++		ID3D12Resource* a_destB, D3D12_RESOURCE_STATES a_destState);
++
++	// After B executed the list that unpacked this frame.
++	HRESULT SignalConsumed(ID3D12CommandQueue* a_queueB);
++
++	// After Present, before the game's D3D11 work for the next frame is recorded:
++	// the D3D11 context waits (on the GPU) for the transfer that last read
++	// a_nextSlot, which the next frame is about to overwrite. With strict
++	// alternation that is the previous frame's transfer, so the render GPU does
++	// not wait for the copy of the frame it just finished.
++	HRESULT GateD3D11(UINT a_nextSlot);
++
++	// Every ~10 s: payload size, copy time, queue lag.
++	void LogStats();
++
++	void Shutdown() noexcept;
++
++private:
++	struct Lane
++	{
++		std::string name;
++		D3D12_RESOURCE_DESC desc{};
++		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};  // Offset relative to the slot base
++		UINT64 slotStride = 0;
++		UINT64 bytes = 0;
++		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> sourceA;
++		winrt::com_ptr<ID3D12Heap> heapA;
++		winrt::com_ptr<ID3D12Heap> heapB;
++		winrt::com_ptr<ID3D12Resource> stagingA;
++		winrt::com_ptr<ID3D12Resource> stagingB;
++		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> mirrorB;
++	};
++
++	HRESULT CreateSharedFencePair(UINT64 a_initial, winrt::com_ptr<ID3D12Fence>& a_onA,
++		winrt::com_ptr<ID3D12Fence>& a_onB);
++	HRESULT CreateSharedHeapPair(UINT64 a_size, winrt::com_ptr<ID3D12Heap>& a_onA,
++		winrt::com_ptr<ID3D12Heap>& a_onB);
++	HRESULT WaitCpu(ID3D12Fence* a_fence, UINT64 a_value);
++	void Fail(const char* a_where, HRESULT a_hr);
++
++	bool active = false;
++
++	winrt::com_ptr<ID3D12Device> deviceA;
++	winrt::com_ptr<ID3D12Device> deviceB;
++	winrt::com_ptr<ID3D11DeviceContext4> context11;
++
++	winrt::com_ptr<ID3D12CommandQueue> copyQueueA;
++	std::array<winrt::com_ptr<ID3D12CommandAllocator>, kSlots> allocatorsA;
++	winrt::com_ptr<ID3D12GraphicsCommandList> listA;
++
++	// A signals, B waits. Cross-adapter.
++	winrt::com_ptr<ID3D12Fence> transferFenceA;
++	winrt::com_ptr<ID3D12Fence> transferFenceB;
++	// B signals, A waits. Cross-adapter.
++	winrt::com_ptr<ID3D12Fence> consumedFenceA;
++	winrt::com_ptr<ID3D12Fence> consumedFenceB;
++	// A signals, D3D11 waits. Same adapter.
++	winrt::com_ptr<ID3D12Fence> copyDoneFenceA;
++	winrt::com_ptr<ID3D11Fence> copyDoneFence11;
++
++	HANDLE fenceEvent = nullptr;
++
++	UINT64 transferValue = 0;                        // value of the latest Transfer
++	std::array<UINT64, kSlots> slotTransfer{};       // transfer value that last used each slot
++
++	std::vector<Lane> lanes;
++	UINT64 bytesPerFrame = 0;
++
++	// Copy-queue GPU timestamps, when the driver supports them.
++	winrt::com_ptr<ID3D12QueryHeap> timestampHeap;
++	winrt::com_ptr<ID3D12Resource> timestampReadback;
++	UINT64 timestampFrequency = 0;
++
++	// Statistics since the last LogStats.
++	UINT64 statFrames = 0;
++	double statGpuCopyMs = 0.0;
++	UINT64 statGpuCopySamples = 0;
++	double statGpuCopyMaxMs = 0.0;
++	double statCpuSubmitMs = 0.0;
++	UINT64 statMaxLag = 0;
++	UINT64 statCpuWaits = 0;
++	LARGE_INTEGER statLastLog{};
++	LARGE_INTEGER qpcFrequency{};
++};
+diff --git a/plugins/FrameGeneration/src/DX11Hooks.cpp b/plugins/FrameGeneration/src/DX11Hooks.cpp
+index 81be80f..5f5de78 100644
+--- a/plugins/FrameGeneration/src/DX11Hooks.cpp
++++ b/plugins/FrameGeneration/src/DX11Hooks.cpp
+@@ -4,6 +4,7 @@
+ #pragma comment(lib, "d3d11.lib")
+ 
+ #include "Upscaling.h"
++#include "CrossAdapterBridge.h"
+ #include "DX12SwapChain.h"
+ #include "FidelityFX.h"
+ #include "Streamline.h"
+@@ -188,8 +189,19 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
+ 
+ 		bool hasBackend = fidelityFX->module;
+ 
++		// Secondary-GPU mode runs FSR3 only: DLSS-G needs an RTX 40+ device to run on, and
++		// XeSS-FG on the secondary GPU is untested. With ENB the alternative swap chain path is
++		// used, which this mode does not support yet.
++		const bool useSecondaryGPU = upscaling->settings.secondaryGPU && !enbLoaded;
++		if (upscaling->settings.secondaryGPU && enbLoaded)
++			REX::WARN("[FG-GPU1] bFrameGenOnSecondaryGPU is not supported with ENB yet; using the game's GPU");
++		if (useSecondaryGPU && upscaling->settings.frameGenType != 0)
++			REX::INFO("[FG-GPU1] iFrameGenType={} ignored: secondary-GPU mode uses FSR3", upscaling->settings.frameGenType);
++
+ 		// For DLSS-G, tentatively enable — actual init after D3D12 device creation
+-		if (upscaling->settings.frameGenType == 1) {
++		if (useSecondaryGPU) {
++			upscaling->activeFrameGenType = Upscaling::FrameGenType::kFSR3;
++		} else if (upscaling->settings.frameGenType == 1) {
+ 			upscaling->activeFrameGenType = Upscaling::FrameGenType::kDLSSG;
+ 			hasBackend = true;
+ 		} else if (upscaling->settings.frameGenType == 2) {
+@@ -204,9 +216,24 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
+ 			upscaling->d3d12Interop = true;
+ 			upscaling->refreshRate = Upscaling::GetRefreshRate(pSwapChainDesc->OutputWindow);
+ 
+-			IDXGIFactory4* dxgiFactory;
+-			pAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory));
++			// Old games enumerate adapters and take the one driving the display. Secondary-GPU
++			// mode needs the opposite: render on the GPU with no display attached, present on
++			// the other. Only the unambiguous two-GPU case is moved.
++			IDXGIAdapter* deviceAdapter = pAdapter;
++			D3D_DRIVER_TYPE deviceDriverType = DriverType;
++			winrt::com_ptr<IDXGIAdapter1> renderPick;
++			if (useSecondaryGPU) {
++				renderPick = CrossAdapterBridge::PickRenderAdapter(pAdapter);
++				if (renderPick) {
++					deviceAdapter = renderPick.get();
++					deviceDriverType = D3D_DRIVER_TYPE_UNKNOWN;  // required with an explicit adapter
++					REX::INFO("[FG-GPU1] the game picked the display GPU; rendering on \"{}\" instead",
++						CrossAdapterBridge::AdapterName(deviceAdapter));
++				}
++			}
+ 
++			IDXGIFactory4* dxgiFactory;
++			deviceAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory));
+ 			const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_1;
+ 			pFeatureLevels = &featureLevel;
+ 			FeatureLevels = 1;
+@@ -216,8 +243,8 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
+ 			}
+ 			else {
+ 				DX::ThrowIfFailed(D3D11CreateDevice(
+-					pAdapter,
+-					DriverType,
++					deviceAdapter,
++					deviceDriverType,
+ 					Software,
+ 					Flags,
+ 					pFeatureLevels,
+@@ -249,7 +276,10 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
+ 					dlssg->InitStreamline();
+ 				}
+ 
+-				proxy->CreateD3D12Device(adapter);
++				if (useSecondaryGPU)
++					proxy->CreateD3D12DevicesSecondaryGPU(adapter, pSwapChainDesc->OutputWindow);
++				else
++					proxy->CreateD3D12Device(adapter);
+ 				adapter->Release();
+ 
+ 				// XeSS-FG: create contexts after D3D12 device, no device/factory upgrade needed
+@@ -342,7 +372,9 @@ void DX11Hooks::Install()
+ 	// Always load FidelityFX as fallback
+ 	fidelityFX->LoadFFX();
+ 
+-	if (upscaling->settings.frameGenType == 1) {
++	if (upscaling->settings.secondaryGPU) {
++		REX::INFO("[FG-GPU1] secondary-GPU mode requested: FSR3 only, Streamline/XeSS not loaded");
++	} else if (upscaling->settings.frameGenType == 1) {
+ 		REX::INFO("[FG] DLSS-G requested, loading Streamline interposer");
+ 		auto dlssg = StreamlineFG::GetSingleton();
+ 		dlssg->LoadInterposer();
+diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
+index e10d528..e535f21 100644
+--- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
++++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
+@@ -3,6 +3,7 @@
+ #include <dx12/ffx_api_dx12.hpp>
+ #include <dxgi1_6.h>
+ 
++#include "CrossAdapterBridge.h"
+ #include "FidelityFX.h"
+ #include "Streamline.h"
+ #include "UICompositor.h"
+@@ -29,6 +30,42 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
+ 	REX::INFO("[FG] D3D12 device created");
+ }
+ 
++void DX12SwapChain::CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, HWND a_window)
++{
++	auto upscaling = Upscaling::GetSingleton();
++	auto bridge = CrossAdapterBridge::GetSingleton();
++
++	const auto fallBack = [&](const char* a_reason) {
++		REX::ERROR("[FG-GPU1] {}; running frame generation on the game's GPU instead", a_reason);
++		bridge->Shutdown();
++		interopDevice = nullptr;
++		d3d12Device = nullptr;
++		secondaryGPU = false;
++		CreateD3D12Device(a_gameAdapter);
++	};
++
++	REX::INFO("[FG-GPU1] game renders on \"{}\"", CrossAdapterBridge::AdapterName(a_gameAdapter));
++
++	auto secondary = CrossAdapterBridge::SelectSecondaryAdapter(a_gameAdapter, a_window, upscaling->settings.secondaryGPUName);
++	if (!secondary)
++		return fallBack("no secondary GPU selected");
++
++	HRESULT hr = D3D12CreateDevice(a_gameAdapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(interopDevice.put()));
++	if (FAILED(hr))
++		return fallBack("D3D12CreateDevice on the game's GPU failed");
++
++	hr = D3D12CreateDevice(secondary.get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(d3d12Device.put()));
++	if (FAILED(hr))
++		return fallBack("D3D12CreateDevice on the secondary GPU failed");
++
++	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get()))
++		return fallBack("cross-adapter bridge initialisation failed");
++
++	secondaryGPU = true;
++	REX::INFO("[FG-GPU1] interop device on \"{}\", frame generation + present on \"{}\"",
++		CrossAdapterBridge::AdapterName(a_gameAdapter), CrossAdapterBridge::AdapterName(secondary.get()));
++}
++
+ void DX12SwapChain::CreateD3D12CommandQueues()
+ {
+ 	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+@@ -145,9 +182,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+ 
+ void DX12SwapChain::CreateInterop()
+ {
++	// The D3D11 producer fence and every D3D11 shared texture live on the game's adapter,
++	// so they are opened on the interop device (== d3d12Device in single-GPU mode).
++	auto interop = GetInteropDevice();
++
+ 	HANDLE sharedFenceHandle;
+-	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&d3d12Fence)));
+-	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
++	DX::ThrowIfFailed(interop->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&d3d12Fence)));
++	DX::ThrowIfFailed(interop->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
+ 	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
+ 	CloseHandle(sharedFenceHandle);
+ 
+@@ -166,7 +207,7 @@ void DX12SwapChain::CreateInterop()
+ 
+ 	// Create interop textures
+ 	if (enbLoaded) {
+-		swapChainBufferProxyENB = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
++		swapChainBufferProxyENB = new WrappedResource(texDesc11, d3d11Device.get(), interop);
+ 	} else {
+ 		swapChainBufferProxy = new Texture2D(texDesc11);
+ 
+@@ -179,8 +220,16 @@ void DX12SwapChain::CreateInterop()
+ 		swapChainBufferProxy->CreateSRV(proxySrvDesc);
+ 	}
+ 
+-	swapChainBufferWrapped[0] = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
+-	swapChainBufferWrapped[1] = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
++	swapChainBufferWrapped[0] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
++	swapChainBufferWrapped[1] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
++
++	if (secondaryGPU) {
++		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
++		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
++			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(), false);
++		if (finalFrameLane < 0)
++			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
++	}
+ }
+ 
+ DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
+@@ -239,17 +288,41 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
+ 	}
+ 
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	const bool crossAdapter = secondaryGPU && bridge->IsActive();
++	if (secondaryGPU && !crossAdapter) {
++		static bool loggedOnce = false;
++		if (!loggedOnce) {
++			REX::CRITICAL("[FG-GPU1] transport is down (see earlier errors); nothing new reaches the screen");
++			loggedOnce = true;
++		}
++	}
++
+ 	// Wait for D3D11 to finish
+ 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+-	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
++	if (crossAdapter) {
++		// Render-GPU copy queue waits for D3D11, copies every lane into the cross-adapter
++		// heap, and our (secondary-GPU) queue waits for that copy.
++		bridge->Transfer(d3d12Fence.get(), fenceValue, frameIndex, commandQueue.get());
++	} else if (!secondaryGPU) {
++		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
++	}
+ 	fenceValue++;
+ 
+ 	// New frame, reset
+ 	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
+ 	DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
+ 
+-	// Transfer frame to swap chain buffer
+-	{
++	if (crossAdapter) {
++		// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
++		// the finished frame into the back buffer.
++		bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
++		bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
++			swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
++	}
++
++	// Transfer frame to swap chain buffer (single-GPU path)
++	if (!secondaryGPU) {
+ 		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
+ 		auto dstResource = swapChainBuffers[frameIndex].get();
+ 
+@@ -370,6 +443,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
+ 	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
+ 
++	// The staging area of this slot has been unpacked; the render GPU may overwrite it.
++	if (crossAdapter)
++		bridge->SignalConsumed(commandQueue.get());
++
+ 	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
+ 	// Uses the other command list slot for tagging, submitted before Present
+ 	if (isXeSSFrame && useFrameGenerationThisFrame) {
+@@ -447,6 +524,41 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 
+ 	DX::ThrowIfFailed(swapChain->Present(SyncInterval, Flags));
+ 
++	// Diagnostics: the swap chain counts every Present, including the frames FSR3 inserts,
++	// so this is the only place that shows whether frame generation actually doubles.
++	{
++		UINT presentCount = 0;
++		if (SUCCEEDED(swapChain->GetLastPresentCount(&presentCount))) {
++			if (lastPresentCount && presentCount > lastPresentCount)
++				statPresentedFrames += presentCount - lastPresentCount;
++			lastPresentCount = presentCount;
++		}
++		++statGameFrames;
++
++		static LARGE_INTEGER frequency = []() {
++			LARGE_INTEGER f;
++			QueryPerformanceFrequency(&f);
++			return f;
++		}();
++
++		LARGE_INTEGER now{};
++		QueryPerformanceCounter(&now);
++		if (!statPresentStart.QuadPart)
++			statPresentStart = now;
++
++		const double elapsedMs = static_cast<double>(now.QuadPart - statPresentStart.QuadPart) * 1000.0 /
++		                         static_cast<double>(frequency.QuadPart);
++		if (elapsedMs >= 10000.0) {
++			const double gameFps = static_cast<double>(statGameFrames) * 1000.0 / elapsedMs;
++			const double presentedFps = static_cast<double>(statPresentedFrames) * 1000.0 / elapsedMs;
++			REX::INFO("[FG-GPU1] presented {:.1f} fps | game {:.1f} fps | generated {:.0f}%", presentedFps, gameFps,
++				presentedFps > 0.0 ? (presentedFps - gameFps) / presentedFps * 100.0 : 0.0);
++			statGameFrames = 0;
++			statPresentedFrames = 0;
++			statPresentStart = now;
++		}
++	}
++
+ 	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
+ 	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
+ 
+@@ -460,6 +572,13 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	// Update the frame index
+ 	frameIndex = swapChain->GetCurrentBackBufferIndex();
+ 
++	// Before the game's D3D11 work writes the next slot (Reset() below clears it): make the
++	// D3D11 context wait, on the GPU, for the render-GPU copy that last read that slot.
++	if (crossAdapter) {
++		bridge->GateD3D11(frameIndex);
++		bridge->LogStats();
++	}
++
+ 	// Clear resources
+ 	upscaling->Reset();
+ 
+diff --git a/plugins/FrameGeneration/src/DX12SwapChain.h b/plugins/FrameGeneration/src/DX12SwapChain.h
+index 692f459..e5040e1 100644
+--- a/plugins/FrameGeneration/src/DX12SwapChain.h
++++ b/plugins/FrameGeneration/src/DX12SwapChain.h
+@@ -91,11 +91,30 @@ public:
+ 	UINT frameIndex = 0;
+ 	UINT64 fenceValue = 0;
+ 
++	// Diagnostics: game frames rendered vs frames actually presented (the game's own plus
++	// FSR3-generated ones), reported every 10 s by Present().
++	UINT lastPresentCount = 0;
++	UINT64 statGameFrames = 0;
++	UINT64 statPresentedFrames = 0;
++	LARGE_INTEGER statPresentStart{};
++
+ 	LARGE_INTEGER qpf;
+ 
+ 	DXGISwapChainProxy* swapChainProxy = nullptr;
+ 
++	// Secondary-GPU mode (bFrameGenOnSecondaryGPU). d3d12Device is then the device on the
++	// display GPU that runs FFX frame generation and owns the swap chain; interopDevice is
++	// on the game's adapter and is the one that opens the D3D11 shared textures/fence.
++	// In single-GPU mode interopDevice is null and GetInteropDevice() returns d3d12Device.
++	winrt::com_ptr<ID3D12Device> interopDevice;
++	bool secondaryGPU = false;
++	int finalFrameLane = -1;
++
++	ID3D12Device* GetInteropDevice() const { return interopDevice ? interopDevice.get() : d3d12Device.get(); }
++
+ 	void CreateD3D12Device(IDXGIAdapter* a_adapter);
++	// Tries the two-device setup; falls back to CreateD3D12Device(a_gameAdapter) on any failure.
++	void CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, HWND a_window);
+ 	void CreateD3D12CommandQueues();
+ 	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC swapChainDesc);
+ 	void CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc);
+diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
+index 3483d96..4ede4e3 100644
+--- a/plugins/FrameGeneration/src/Upscaling.cpp
++++ b/plugins/FrameGeneration/src/Upscaling.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <d3dcompiler.h>
+ 
++#include "CrossAdapterBridge.h"
+ #include "DX12SwapChain.h"
+ #include "DirectXMath.h"
+ 
+@@ -131,6 +132,14 @@ void Upscaling::LoadSettings()
+ 	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
+ 	// MCM stepper is 0-indexed (0=2x, 1=3x, 2=4x) but we store as numFramesToGenerate (1, 2, 3)
+ 	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
++	settings.secondaryGPU = ini.GetBoolValue("Settings", "bFrameGenOnSecondaryGPU", false);
++	settings.secondaryGPUName = ini.GetValue("Settings", "sSecondaryGPUName", "");
++	// bTransportHudLess was the old name of this switch; keep reading it so an existing
++	// settings.ini (or a test build someone edited) is not silently reset to the default.
++	if (ini.KeyExists("Settings", "bSendHudlessFrame"))
++		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bSendHudlessFrame", true);
++	else
++		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bTransportHudLess", true);
+ 
+ 	static bool loggedOnce = false;
+ 	if (!loggedOnce) {
+@@ -138,6 +147,10 @@ void Upscaling::LoadSettings()
+ 		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
+ 		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
+ 		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
++		REX::INFO("[Frame Generation] bFrameGenOnSecondaryGPU: {} sSecondaryGPUName: \"{}\"",
++			settings.secondaryGPU, settings.secondaryGPUName);
++		REX::INFO("[Frame Generation] bSendHudlessFrame: {} (extra UI-free frame; off = less PCIe, HUD smears)",
++			settings.sendHudlessFrame);
+ 		loggedOnce = true;
+ 	}
+ }
+@@ -169,6 +182,7 @@ void Upscaling::CreateFrameGenerationResources()
+ 
+ 	auto rendererData = RE::BSGraphics::GetRendererData();
+ 	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+ 
+ 	for (int index = 0; index < 2; index++) {
+ 		D3D11_TEXTURE2D_DESC texDesc{};
+@@ -234,8 +248,6 @@ void Upscaling::CreateFrameGenerationResources()
+ 		UIColorAlphaShared[index]->CreateRTV(rtvDesc);
+ 		UIColorAlphaShared[index]->CreateUAV(uavDesc);
+ 
+-		auto dx12SwapChain = DX12SwapChain::GetSingleton();
+-
+ 		{
+ 			IDXGIResource1* dxgiResource = nullptr;
+ 			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
+@@ -248,7 +260,7 @@ void Upscaling::CreateFrameGenerationResources()
+ 					nullptr,
+ 					&sharedHandle));
+ 
+-				DX::ThrowIfFailed(dx12SwapChain->d3d12Device->OpenSharedHandle(
++				DX::ThrowIfFailed(dx12SwapChain->GetInteropDevice()->OpenSharedHandle(
+ 					sharedHandle,
+ 					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
+ 
+@@ -268,7 +280,7 @@ void Upscaling::CreateFrameGenerationResources()
+ 					nullptr,
+ 					&sharedHandle));
+ 
+-				DX::ThrowIfFailed(dx12SwapChain->d3d12Device->OpenSharedHandle(
++				DX::ThrowIfFailed(dx12SwapChain->GetInteropDevice()->OpenSharedHandle(
+ 					sharedHandle,
+ 					IID_PPV_ARGS(&depthBufferShared12[index])));
+ 
+@@ -288,7 +300,7 @@ void Upscaling::CreateFrameGenerationResources()
+ 					nullptr,
+ 					&sharedHandle));
+ 
+-				DX::ThrowIfFailed(dx12SwapChain->d3d12Device->OpenSharedHandle(
++				DX::ThrowIfFailed(dx12SwapChain->GetInteropDevice()->OpenSharedHandle(
+ 					sharedHandle,
+ 					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
+ 
+@@ -308,7 +320,7 @@ void Upscaling::CreateFrameGenerationResources()
+ 					nullptr,
+ 					&sharedHandle));
+ 
+-				DX::ThrowIfFailed(dx12SwapChain->d3d12Device->OpenSharedHandle(
++				DX::ThrowIfFailed(dx12SwapChain->GetInteropDevice()->OpenSharedHandle(
+ 					sharedHandle,
+ 					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
+ 
+@@ -317,6 +329,33 @@ void Upscaling::CreateFrameGenerationResources()
+ 		}
+ 	}
+ 
++	// Secondary-GPU mode: the resources above were opened on the render GPU. Register them
++	// with the bridge and hand the frame-generation backends the copies on the secondary GPU
++	// instead (FidelityFX::Present reads the *Shared12 arrays). UIColorAlpha is DLSS-G only.
++	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain) {
++		auto bridge = CrossAdapterBridge::GetSingleton();
++		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2]) {
++			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true);
++			if (lane < 0) {
++				REX::CRITICAL("[FG-GPU1] cannot transport '{}'; frame generation will read stale data", a_name);
++				return;
++			}
++			for (UINT slot = 0; slot < 2; ++slot)
++				a_resources[slot].copy_from(bridge->Mirror(lane, slot));
++		};
++		if (settings.sendHudlessFrame)
++			transport("HUD-less colour", HUDLessBufferShared12);
++		transport("depth", depthBufferShared12);
++		transport("motion vectors", motionVectorBufferShared12);
++	}
++	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !settings.sendHudlessFrame) {
++		// FSR3 treats an empty HUDLessColor as "use the back buffer", so the UI is
++		// interpolated with the scene and smears a little. Saves one full frame across PCIe.
++		for (auto& resource : HUDLessBufferShared12)
++			resource = nullptr;
++		REX::INFO("[FG-GPU1] bSendHudlessFrame=0: the extra UI-free frame is not sent (HUD will smear, ~25% less PCIe)");
++	}
++
+ 	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
+ 	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
+ 	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
+@@ -558,14 +597,16 @@ void Upscaling::PostDisplay()
+ 	if (!setupBuffers)
+ 		CreateFrameGenerationResources();
+ 
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	if (dx12SwapChain->secondaryGPU && !settings.sendHudlessFrame)
++		return;  // nothing reads the HUD-less buffer, so don't spend bandwidth on the copy
++
+ 	auto rendererData = RE::BSGraphics::GetRendererData();
+ 
+ 	auto& swapChain = rendererData->renderTargets[(uint)RenderTarget::kFrameBuffer];
+ 	ID3D11Resource* swapChainResource;
+ 	reinterpret_cast<ID3D11RenderTargetView*>(swapChain.rtView)->GetResource(&swapChainResource);
+ 
+-	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+-
+ 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+ 	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource);
+ 
+diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
+index 838f927..a078580 100644
+--- a/plugins/FrameGeneration/src/Upscaling.h
++++ b/plugins/FrameGeneration/src/Upscaling.h
+@@ -23,6 +23,9 @@ public:
+ 		bool debugLogging = false;
+ 		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
+ 		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
++		bool secondaryGPU = false;       ///< Run FSR3 FG and present on a second GPU (the one driving the monitor)
++		std::string secondaryGPUName;    ///< Optional: substring of the secondary GPU's name, if auto-selection is ambiguous
++		bool sendHudlessFrame = true;    ///< Send the extra UI-free frame (off = less PCIe, HUD smears)
+ 	};
+ 
+ 	Settings settings;
