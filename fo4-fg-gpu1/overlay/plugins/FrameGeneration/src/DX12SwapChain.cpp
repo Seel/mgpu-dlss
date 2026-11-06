@@ -58,7 +58,8 @@ void DX12SwapChain::CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, 
 	if (FAILED(hr))
 		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 
-	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get()))
+	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
+			upscaling->settings.asyncUnpack))
 		return fallBack("cross-adapter bridge initialisation failed");
 
 	secondaryGPU = true;
@@ -81,7 +82,30 @@ void DX12SwapChain::CreateD3D12CommandQueues()
 		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
 		commandLists[i]->Close();
 	}
+	if (secondaryGPU)
+		CrossAdapterBridge::GetSingleton()->SetDisplayQueue(commandQueue.get());
 	REX::INFO("[FG] D3D12 command queues created");
+}
+
+void DX12SwapChain::TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing)
+{
+	auto upscaling = Upscaling::GetSingleton();
+	auto bridge = CrossAdapterBridge::GetSingleton();
+	if (!secondaryGPU || !bridge->IsActive() || !upscaling->settings.earlyTransfer)
+		return;
+	if (!d3d11Context || !d3d11Fence || !d3d12Fence || !bridge->HasLanes(a_timing))
+		return;
+
+	// The D3D11 signal orders the copy after the game's work that produced these lanes.
+	if (FAILED(d3d11Context->Signal(d3d11Fence.get(), ++fenceValue)))
+		return;
+	if (FAILED(bridge->TransferGroup(d3d12Fence.get(), fenceValue, frameIndex, a_timing)))
+		return;
+
+	// bEarlyUnpack: queue the display GPU's read of these lanes now too, so it starts as soon as
+	// they land instead of when Present is called. Present then reads only the finished frame.
+	if (upscaling->settings.earlyUnpack && bridge->IsAsyncUnpack())
+		bridge->UnpackGroup(frameIndex, a_timing);
 }
 
 void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
@@ -299,26 +323,38 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	// Wait for D3D11 to finish
-	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), ++fenceValue));
 	if (crossAdapter) {
-		// Render-GPU copy queue waits for D3D11, copies every lane into the cross-adapter
-		// heap, and our (secondary-GPU) queue waits for that copy.
-		bridge->Transfer(d3d12Fence.get(), fenceValue, frameIndex, commandQueue.get());
+		// Render-GPU copy queue waits for D3D11 and copies every lane into the cross-adapter
+		// heap, lane by lane. Then either our copy queue unpacks each lane as it lands and
+		// the direct queue waits for that (async), or the direct queue waits for the whole
+		// transfer and unpacks itself below (serialised).
+		if (SUCCEEDED(bridge->Transfer(d3d12Fence.get(), fenceValue, frameIndex))) {
+			if (bridge->IsAsyncUnpack())
+				bridge->Unpack(frameIndex, finalFrameLane, swapChainBuffers[frameIndex].get(), commandQueue.get());
+			else
+				bridge->WaitTransfer(commandQueue.get());
+		}
 	} else if (!secondaryGPU) {
 		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	}
-	fenceValue++;
 
 	// New frame, reset
 	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
 	DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
 
 	if (crossAdapter) {
-		// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
-		// the finished frame into the back buffer.
-		bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
-		bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
-			swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
+		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkListBegin);
+		if (!bridge->IsAsyncUnpack()) {
+			// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
+			// the finished frame into the back buffer.
+			bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
+			bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
+				swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
+			// iHalfResDepthMV = 1: full-resolution depth for FSR3 from the half-resolution mirror.
+			bridge->RecordDepthUpsample(commandLists[frameIndex].get(), frameIndex);
+		}
+		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkAfterUnpack);
 	}
 
 	// Transfer frame to swap chain buffer (single-GPU path)
@@ -434,6 +470,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
 	}
 
+	if (crossAdapter)
+		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkListEnd);
+
 	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
 
 	// Bracket GPU work submission with render markers
@@ -443,9 +482,13 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
 	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
 
-	// The staging area of this slot has been unpacked; the render GPU may overwrite it.
-	if (crossAdapter)
-		bridge->SignalConsumed(commandQueue.get());
+	if (crossAdapter) {
+		// Serialised: the staging area of this slot has been unpacked by this list; the
+		// render GPU may overwrite it. (Async: the unpack queue already signalled that.)
+		if (!bridge->IsAsyncUnpack())
+			bridge->SignalConsumed(commandQueue.get());
+		bridge->SignalDisplayListDone(commandQueue.get());
+	}
 
 	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
 	// Uses the other command list slot for tagging, submitted before Present
@@ -522,7 +565,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
 	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
 
+	// The FFX swap chain blocks here until the frame before this one has been presented
+	// (two replacement back buffers). Timed, because while the render thread waits here
+	// the 3090 gets no new work.
+	LARGE_INTEGER presentStart{};
+	QueryPerformanceCounter(&presentStart);
 	DX::ThrowIfFailed(swapChain->Present(SyncInterval, Flags));
+	LARGE_INTEGER presentEnd{};
+	QueryPerformanceCounter(&presentEnd);
 
 	// Diagnostics: the swap chain counts every Present, including the frames FSR3 inserts,
 	// so this is the only place that shows whether frame generation actually doubles.
@@ -568,6 +618,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
 	if (frameLatencyWaitableObject)
 		WaitForSingleObjectEx(frameLatencyWaitableObject, INFINITE, TRUE);
+
+	if (crossAdapter) {
+		LARGE_INTEGER waitEnd{};
+		QueryPerformanceCounter(&waitEnd);
+		static const double qpcToMs = [] {
+			LARGE_INTEGER f;
+			QueryPerformanceFrequency(&f);
+			return 1000.0 / static_cast<double>(f.QuadPart);
+		}();
+		bridge->AddPresentBlock(static_cast<double>(presentEnd.QuadPart - presentStart.QuadPart) * qpcToMs,
+			static_cast<double>(waitEnd.QuadPart - presentEnd.QuadPart) * qpcToMs);
+	}
 
 	// Update the frame index
 	frameIndex = swapChain->GetCurrentBackBufferIndex();

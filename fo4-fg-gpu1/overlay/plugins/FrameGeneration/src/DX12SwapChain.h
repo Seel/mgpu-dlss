@@ -10,6 +10,7 @@
 #include <d3d12.h>
 
 #include "Buffer.h"
+#include "CrossAdapterBridge.h"
 
 class WrappedResource
 {
@@ -128,6 +129,9 @@ public:
 	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
 
 	HRESULT GetBuffer(void** ppSurface);
+	// Frame generation on a second GPU: called from the frame hook at which a group of lanes
+	// becomes final (world pass, HUD-less capture), so their PCIe copy starts before Present.
+	void TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing);
 	HRESULT Present(UINT SyncInterval, UINT Flags);
 	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
 };

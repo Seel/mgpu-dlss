@@ -63,7 +63,7 @@ package complete with 0 warnings, and the resulting DLL exports the three F4SE e
 ## Install
 
 1. In Vortex, install the zip as a mod (or copy its `Data` folder into the game folder).
-2. Settings come from `Data\MCM\Config\FrameGeneration\settings.ini`. The shipped file has `bFrameGenOnSecondaryGPU = 1` and `iFrameGenType = 0`. If `Data\MCM\Settings\FrameGeneration.ini` exists (MCM writes it), it **overrides** the shipped file, so set the same keys there.
+2. Every setting below is also in the Mod Configuration Menu (Frame Generation page); entries marked "(restart)" apply after a game restart, the rest within about a second. Settings come from `Data\MCM\Config\FrameGeneration\settings.ini`. The shipped file has `bFrameGenOnSecondaryGPU = 1` and `iFrameGenType = 0`. If `Data\MCM\Settings\FrameGeneration.ini` exists (MCM writes it), it **overrides** the shipped file, so set the same keys there.
 
 ```ini
 [Settings]
@@ -71,6 +71,10 @@ bFrameGenerationMode = 1
 bFrameGenOnSecondaryGPU = 1
 sSecondaryGPUName =          ; optional, e.g. 9060 - only needed if auto-selection refuses
 bSendHudlessFrame = 1        ; 1 = extra UI-free copy (clean HUD); 0 = ~25% less PCIe, HUD smears
+bAsyncUnpack = 1             ; 1 = 9060 reads on a copy queue, lane by lane (default); 0 = original serial path
+bEarlyTransfer = 1           ; 1 = depth/MVs/HUD-less cross during the frame (default); 0 = all at Present
+bEarlyUnpack = 1             ; 1 = the 9060 reads them as they land, before Present (default); 0 = reads queued at Present
+iHalfResDepthMV = 1          ; 0 = full res; 1 = half-res depth, rebuilt on the 9060 (default); 2 = half-res depth + MVs
 iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
 ```
 
@@ -78,6 +82,45 @@ iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
 of each frame with the HUD removed; FSR3 uses it so the HUD is not interpolated. Off removes that
 copy from the PCIe budget (~25% less traffic at 4K) but the HUD is then interpolated with the scene
 and smears a little during camera movement.
+
+`bAsyncUnpack` changes how the 9060 reads what arrives. On (default) it reads on its own copy
+queue and starts on each buffer (final frame, HUD-less, depth, motion vectors) as soon as that
+buffer has crossed, while the 3090 is still sending the next one; the FSR3 queue only waits for
+the read to finish. Off is the original path: wait for all four, then read them on the FSR3 queue.
+Use it as an A/B switch; both log the same timing lines.
+
+`bEarlyTransfer` changes *when* the buffers cross. On (default) depth and motion vectors start
+crossing as soon as the world pass has finished them, and the HUD-less frame as soon as it has
+been captured; only the finished frame waits for Present. The 3090's copy at Present drops to one
+lane (~2.6 ms at 4K instead of ~10.3 ms), and the 9060 can start reading the earlier lanes while
+the finished frame is still crossing. The copy engine is still serial and shares the PCIe link, so
+the gain is bounded by how early in the frame those hooks run. Off is the pre-optimisation
+behaviour: all four lanes cross at Present.
+
+`bEarlyUnpack` does the same for the 9060's side. With it off, the 9060's reads were only queued
+when Present was called, so lanes that had crossed 3–6 ms earlier sat unread until then. On
+(default), each group's read is queued at the same hook as its copy, so the 9060 reads depth,
+motion vectors and the HUD-less frame while the game is still finishing the frame, and only the
+finished frame is read after Present. Needs `bAsyncUnpack = 1` and `bEarlyTransfer = 1`. It is
+re-read every ~60 frames, so it can be flipped while the game runs for an A/B in one session.
+
+`iHalfResDepthMV` sends depth (and optionally motion vectors) at half resolution. Only the
+generated frames use them; real frames and the HUD-less colour stay full resolution.
+- `1` (default): depth crosses at half resolution (the nearest depth of each 2×2 block) and the
+  9060 rebuilds it to full resolution: bilinear on smooth surfaces, the block's own sample at
+  object edges, so no blended depth appears on silhouettes. FSR3 keeps working at full resolution
+  and still reads every motion vector; only its depth tests are coarser at edges. The rebuild
+  starts as soon as the depth lane lands and runs while the other lanes are still crossing.
+  Saves 23.7 MB/frame (~1.9 ms) at 4K.
+- `2`: motion vectors too (the one of the nearest-depth sample of each block). FSR3 then works
+  at half resolution, as it does behind "Performance" upscaling. Saves 47.5 MB/frame (~3.9 ms).
+  There is no "motion vectors only" option: FSR3 works at the depth resolution, so half-res
+  motion vectors with full-res depth is not a layout it accepts.
+- `0`: both at full resolution, as before.
+
+The 3090 shrinks the buffers in the same pass that already fills the shared buffers, so mode 1
+and 2 add no pass there; mode 1 adds one ~0.1–0.2 ms compute pass on the 9060, off the critical
+path. If anything in the setup fails, the log says so and the plugin uses mode 0.
 
 3. **First test with the fewest moving parts:**
    - Disable ReShade's `AutoHDR.addon64`. An HDR swap chain changes the back-buffer format, and the plugin then refuses to copy (it logs this).
@@ -96,8 +139,8 @@ The log is usually `Documents\My Games\Fallout4\F4SE\AAAFrameGeneration.log`. Al
 [FG-GPU1] adapter[1] "AMD Radeon RX 9060 XT" ... [game window's monitor] [display]
 [FG-GPU1]   output[0] "\\.\DISPLAY1" attached=1 monitor=0x10001
 [FG-GPU1] SELECTED "AMD Radeon RX 9060 XT" (owns the monitor the game window is on)
-[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> secondary GPU
-[FG-GPU1] lane[0] 'final frame' 3840x2160 ...  lane[1] 'HUD-less colour' ...  lane[2] 'depth' ...  lane[3] 'motion vectors' ...
+[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> display GPU copy queue, lane by lane (bAsyncUnpack=1)
+[FG-GPU1] lane[0] 'final frame' 3840x2160 ... timing=present  lane[1] 'depth' ... timing=world  lane[2] 'motion vectors' ... timing=world  lane[3] 'HUD-less colour' ... timing=hudless
 [FG-GPU1] 38.1 game fps | 126.6 MB/frame = 4.70 GB/s | copy on render GPU avg 10.10 ms max 11.67 ms (~12.24 GB/s link) | submit 0.086 ms | max lag 2 | cpu waits 0
 [FG-GPU1] presented 74.8 fps | game 38.1 fps | generated 49%
 ```
@@ -109,6 +152,42 @@ timers, so they appear next to each other. Watch these numbers:
 - **cpu waits:** should stay at or near 0.
 - **presented vs game fps:** `presented` should be close to double `game` (generated ≈ 50%). If `generated` is ~0%, FSR3 accepted the frame but did not insert one — the display GPU is not keeping up.
 - **lane count:** with `bSendHudlessFrame = 0` the extra UI-free copy is skipped: three lanes instead of four, 93.4 MB at 4K or 42.2 MB at 1440p.
+
+Three more lines every 10 s show where a frame's time goes:
+
+```
+[FG-GPU1] display GPU: unpack (copy queue) avg 10.40 ms max 11.2 ms | direct list avg 1.30 ms max 2.0 ms
+[FG-GPU1] timeline ms after Present: 3090 copy 1.2-11.5 | 9060 unpack 4.0-14.1 | 9060 list 14.2-15.5
+[FG-GPU1] render thread blocked: FFX Present avg 6.10 ms max 9.0 ms | latency wait avg 0.00 ms max 0.0 ms | D3D11 gate pending 0/480
+```
+
+(The numbers above are illustrative, not measured.)
+
+- **unpack:** how long the 9060 needs to read the payload. **direct list:** the 9060's FSR3
+  queue work per frame (FSR3's prepare pass; the interpolation itself runs on FFX's own async
+  compute queue and is not in this number).
+- **timeline:** one frame's path on a single clock (both GPUs are calibrated to the CPU's QPC).
+  `3090 copy` starting late means the 3090 was still rendering that frame when the CPU called
+  Present. With `bAsyncUnpack = 1` the 9060 unpack should *start* a few ms after the 3090 copy
+  starts, not after it ends. With `bEarlyTransfer = 1` the `3090 copy` start is negative: the
+  first lanes cross before Present. With `bEarlyUnpack = 1` the `9060 unpack` start is negative
+  too; its end is the finished frame's read. Both copy times sum only the phases that ran
+  (world, HUD-less, Present), not the idle time between them.
+- **render thread blocked:** time the game's render thread spends inside the FFX swap chain's
+  Present. That call returns only when the previous frame has been put on screen, so while it
+  waits the 3090 receives no new work. A large value here means the 3090 is being held back by
+  the transfer → 9060 → present chain, not by its own rendering.
+- **D3D11 gate pending:** how often the 3090's next frame had to queue behind a copy that was
+  still running. Should be ~0.
+
+With `iHalfResDepthMV = 1` one more line appears:
+
+```
+[FG-GPU1] depth rebuild on display GPU avg 0.15 ms max 0.30 ms | done 3.0 ms after Present
+```
+
+`done` should be earlier than the `9060 unpack` end in the timeline; then the rebuild costs the
+chain nothing.
 
 If anything fails during setup, the plugin logs why and falls back to running FG on the 3090. Failures that happen after the swap chain exists are logged as `CRITICAL`.
 
@@ -128,15 +207,21 @@ two slots each):
 | target | lanes | payload | copy |
 |---|---|---|---|
 | 3840×2160 | 4 (all) | 126.6 MB | ~10.5 ms |
+| 3840×2160 | 4, `iHalfResDepthMV = 1` | 102.8 MB | ~8.5 ms (estimate) |
+| 3840×2160 | 4, `iHalfResDepthMV = 2` | 79.1 MB | ~6.6 ms (estimate) |
 | 3840×2160 | 3 (no extra UI frame) | 93.4 MB | ~7.8 ms |
 | 2560×1440 | 4 (all) | 56.3 MB | ~4.7 ms |
 | 2560×1440 | 3 (no extra UI frame) | 42.2 MB | ~3.5 ms |
 
-The copy runs at ~12 GB/s whichever GPU drives it, so those are the practical numbers. For a
-71 fps base (14.1 ms per frame) the display GPU also has to read the payload and run FSR3 inside
-that frame: 4K does not fit (~10 ms read + ~8 ms FG), 1440p does (~5 ms + ~5 ms). That is why
-2560×1440 is the first thing to try for a 71 base / ~142 presented target; dropping the extra
-UI-free frame adds headroom on top.
+The copy runs at ~12 GB/s whichever GPU drives it, so those are the practical numbers. The
+display GPU then reads the same payload back out of system memory (~the same time again).
+
+What limits the frame rate is less each step's duration than the chain they form. The FFX swap
+chain has two back buffers, so its Present for frame N returns only once frame N-1 is on screen.
+Until then the game's render thread, and therefore the 3090, gets no new work. Everything between
+"3090 finished frame N-1" and "frame N-1 presented" (copy, read, FSR3, pacing) is on the critical
+path. That is why `bAsyncUnpack` streams the buffers lane by lane: the 9060's read overlaps the
+3090's copy instead of following it. See SESSION-NOTES.md for the numbers.
 
 ## Known risks / first things to check
 

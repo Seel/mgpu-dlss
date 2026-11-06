@@ -26,9 +26,21 @@ public:
 		bool secondaryGPU = false;       ///< Run FSR3 FG and present on a second GPU (the one driving the monitor)
 		std::string secondaryGPUName;    ///< Optional: substring of the secondary GPU's name, if auto-selection is ambiguous
 		bool sendHudlessFrame = true;    ///< Send the extra UI-free frame (off = less PCIe, HUD smears)
+		bool asyncUnpack = true;         ///< Secondary GPU unpacks on a copy queue, lane by lane (off = on the direct queue)
+		bool earlyTransfer = true;       ///< Copy depth/MVs/HUD-less at their frame hooks, not at Present
+		bool earlyUnpack = true;         ///< ...and queue the display GPU's read of them there too
+		int halfResDepthMV = 1;          ///< 0 full, 1 depth at half res (rebuilt on the display GPU), 2 depth + MVs at half res
 	};
 
 	Settings settings;
+
+	// What CreateFrameGenerationResources set up from settings.halfResDepthMV (0 when not on a
+	// second GPU or when setup failed). Fixed for the session: the buffers and lanes are sized for it.
+	int halfResMode = 0;
+	// Whether CreateFrameGenerationResources registered the HUD-less lane (settings.sendHudlessFrame
+	// at that time). Fixed for the session, so changing the setting in MCM waits for a restart
+	// instead of leaving FSR3 with a lane that is no longer filled.
+	bool hudlessActive = true;
 
 	bool highFPSPhysicsFixLoaded = false;
 
@@ -49,6 +61,8 @@ public:
 	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
 	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
 	ID3D11ComputeShader* generateUIBufferCS = nullptr;
+	ID3D11ComputeShader* halfResPostAlphaCS = nullptr;  // halfResMode: GenerateSharedBuffersCS at half res
+	ID3D11ComputeShader* halfResCopyCS = nullptr;       // halfResMode: the no-reticle copy at half res
 
 	bool setupBuffers = false;
 
@@ -60,6 +74,8 @@ public:
 	void PostPostLoad();
 
 	void CreateFrameGenerationResources();
+	// Decides halfResMode and compiles what it needs; falls back to 0 (logged) on any failure.
+	void SetupHalfResDepthMV(UINT a_width, UINT a_height);
 	void PreAlpha();
 	void PostAlpha();
 	void CopyBuffersToSharedResources();

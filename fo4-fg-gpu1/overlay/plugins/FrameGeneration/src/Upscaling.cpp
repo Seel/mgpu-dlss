@@ -80,7 +80,8 @@ enum class DepthStencilTarget
 	kCount = 13
 };
 
-ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramType, const char* Program = "main")
+ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramType, const char* Program = "main",
+	const D3D_SHADER_MACRO* Defines = nullptr)
 {
 	auto rendererData = RE::BSGraphics::GetRendererData();
 	auto device = reinterpret_cast<ID3D11Device*>(rendererData->device);
@@ -100,7 +101,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
 		REX::ERROR("Failed to compile shader; {} does not exist", str);
 		return nullptr;
 	}
-	if (FAILED(D3DCompileFromFile(FilePath, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, Program, ProgramType, flags, 0, &shaderBlob, &shaderErrors))) {
+	if (FAILED(D3DCompileFromFile(FilePath, Defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, Program, ProgramType, flags, 0, &shaderBlob, &shaderErrors))) {
 		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
 		if (shaderErrors) shaderErrors->Release();
 		if (shaderBlob) shaderBlob->Release();
@@ -140,6 +141,10 @@ void Upscaling::LoadSettings()
 		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bSendHudlessFrame", true);
 	else
 		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bTransportHudLess", true);
+	settings.asyncUnpack = ini.GetBoolValue("Settings", "bAsyncUnpack", true);
+	settings.earlyTransfer = ini.GetBoolValue("Settings", "bEarlyTransfer", true);
+	settings.earlyUnpack = ini.GetBoolValue("Settings", "bEarlyUnpack", true);
+	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iHalfResDepthMV", 1)), 0, 2);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -151,6 +156,15 @@ void Upscaling::LoadSettings()
 			settings.secondaryGPU, settings.secondaryGPUName);
 		REX::INFO("[Frame Generation] bSendHudlessFrame: {} (extra UI-free frame; off = less PCIe, HUD smears)",
 			settings.sendHudlessFrame);
+		REX::INFO("[Frame Generation] bAsyncUnpack: {} (secondary GPU unpacks on a copy queue as each buffer arrives)",
+			settings.asyncUnpack);
+		REX::INFO("[Frame Generation] bEarlyTransfer: {} (depth/MVs/HUD-less cross during the frame, not at Present)",
+			settings.earlyTransfer);
+		REX::INFO("[Frame Generation] bEarlyUnpack: {} (secondary GPU reads depth/MVs/HUD-less as they land, not at Present)",
+			settings.earlyUnpack);
+		REX::INFO("[Frame Generation] iHalfResDepthMV: {} (0=full, 1=half-res depth rebuilt on the display GPU, "
+				  "2=half-res depth and motion vectors)",
+			settings.halfResDepthMV);
 		loggedOnce = true;
 	}
 }
@@ -183,6 +197,14 @@ void Upscaling::CreateFrameGenerationResources()
 	auto rendererData = RE::BSGraphics::GetRendererData();
 	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+
+	D3D11_TEXTURE2D_DESC mainDesc{};
+	reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
+	SetupHalfResDepthMV(mainDesc.Width, mainDesc.Height);
+	// Latched with the lanes below; a later settings reload must not change it mid-session.
+	hudlessActive = settings.sendHudlessFrame;
+	const UINT halfWidth = (mainDesc.Width + 1) / 2;
+	const UINT halfHeight = (mainDesc.Height + 1) / 2;
 
 	for (int index = 0; index < 2; index++) {
 		D3D11_TEXTURE2D_DESC texDesc{};
@@ -218,6 +240,10 @@ void Upscaling::CreateFrameGenerationResources()
 		rtvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
 
+		// FG-GPU1 iHalfResDepthMV: depth crosses PCIe at half resolution (modes 1 and 2).
+		texDesc.Width = halfResMode ? halfWidth : mainDesc.Width;
+		texDesc.Height = halfResMode ? halfHeight : mainDesc.Height;
+
 		depthBufferShared[index] = new Texture2D(texDesc);
 		depthBufferShared[index]->CreateSRV(srvDesc);
 		depthBufferShared[index]->CreateRTV(rtvDesc);
@@ -232,6 +258,10 @@ void Upscaling::CreateFrameGenerationResources()
 		rtvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
 
+		// Motion vectors only at half resolution in mode 2.
+		texDesc.Width = halfResMode == 2 ? halfWidth : mainDesc.Width;
+		texDesc.Height = halfResMode == 2 ? halfHeight : mainDesc.Height;
+
 		motionVectorBufferShared[index] = new Texture2D(texDesc);
 		motionVectorBufferShared[index]->CreateSRV(srvDesc);
 		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
@@ -242,6 +272,8 @@ void Upscaling::CreateFrameGenerationResources()
 		srvDesc.Format = texDesc.Format;
 		rtvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
+		texDesc.Width = mainDesc.Width;
+		texDesc.Height = mainDesc.Height;
 
 		UIColorAlphaShared[index] = new Texture2D(texDesc);
 		UIColorAlphaShared[index]->CreateSRV(srvDesc);
@@ -334,21 +366,38 @@ void Upscaling::CreateFrameGenerationResources()
 	// instead (FidelityFX::Present reads the *Shared12 arrays). UIColorAlpha is DLSS-G only.
 	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain) {
 		auto bridge = CrossAdapterBridge::GetSingleton();
-		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2]) {
-			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true);
+		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2],
+			CrossAdapterBridge::LaneTiming a_timing) {
+			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true, a_timing);
 			if (lane < 0) {
 				REX::CRITICAL("[FG-GPU1] cannot transport '{}'; frame generation will read stale data", a_name);
-				return;
+				return lane;
 			}
 			for (UINT slot = 0; slot < 2; ++slot)
 				a_resources[slot].copy_from(bridge->Mirror(lane, slot));
+			return lane;
 		};
-		if (settings.sendHudlessFrame)
-			transport("HUD-less colour", HUDLessBufferShared12);
-		transport("depth", depthBufferShared12);
-		transport("motion vectors", motionVectorBufferShared12);
+		// Registered in the order the data becomes final: the display GPU starts reading the
+		// world-pass lanes while the 3090 is still finishing the frame. Depth first: in
+		// iHalfResDepthMV = 1 the display GPU rebuilds it while the other lanes still cross.
+		const int depthLane = transport(halfResMode ? "depth (half res)" : "depth", depthBufferShared12,
+			CrossAdapterBridge::LaneTiming::kWorld);
+		if (halfResMode == 1 && depthLane >= 0) {
+			// FSR3 reads the full-resolution depth rebuilt from the half-resolution mirror.
+			bridge->SetDepthUpsampleLane(depthLane);
+			if (bridge->UpsampledDepth(0) && bridge->UpsampledDepth(1)) {
+				for (UINT slot = 0; slot < 2; ++slot)
+					depthBufferShared12[slot].copy_from(bridge->UpsampledDepth(slot));
+			} else {
+				REX::CRITICAL("[FG-GPU1] depth rebuild unavailable; FSR3 gets half-resolution depth at full render size. Set iHalfResDepthMV=0 or 2");
+			}
+		}
+		transport(halfResMode == 2 ? "motion vectors (half res)" : "motion vectors", motionVectorBufferShared12,
+			CrossAdapterBridge::LaneTiming::kWorld);
+		if (hudlessActive)
+			transport("HUD-less colour", HUDLessBufferShared12, CrossAdapterBridge::LaneTiming::kHudless);
 	}
-	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !settings.sendHudlessFrame) {
+	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !hudlessActive) {
 		// FSR3 treats an empty HUDLessColor as "use the back buffer", so the UI is
 		// interpolated with the scene and smears a little. Saves one full frame across PCIe.
 		for (auto& resource : HUDLessBufferShared12)
@@ -361,6 +410,49 @@ void Upscaling::CreateFrameGenerationResources()
 	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
 
 	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
+}
+
+void Upscaling::SetupHalfResDepthMV(UINT a_width, UINT a_height)
+{
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	auto bridge = CrossAdapterBridge::GetSingleton();
+
+	// Only worth it when depth and motion vectors cross PCIe. Read once: the shared buffers and
+	// lanes are sized for it, so a later settings reload cannot change it.
+	halfResMode = (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && bridge->IsActive()) ?
+	                  settings.halfResDepthMV :
+	                  0;
+	if (!halfResMode)
+		return;
+
+	const char* halfMotion = halfResMode == 2 ? "1" : "0";
+	const D3D_SHADER_MACRO postAlpha[] = { { "ALPHA_MASK", "1" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
+	const D3D_SHADER_MACRO copyOnly[] = { { "ALPHA_MASK", "0" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
+	constexpr auto kShader = L"Data\\F4SE\\Plugins\\FrameGeneration\\HalfResDepthMVCS.hlsl";
+	halfResPostAlphaCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", postAlpha);
+	halfResCopyCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", copyOnly);
+
+	bool ready = halfResPostAlphaCS && halfResCopyCS;
+	if (!ready)
+		REX::ERROR("[FG-GPU1] HalfResDepthMVCS.hlsl did not compile; sending depth and motion vectors at full resolution");
+	if (ready && halfResMode == 1)
+		ready = bridge->CreateDepthUpsampler(a_width, a_height, L"Data\\F4SE\\Plugins\\FrameGeneration\\DepthFromHalfResCS.hlsl");
+
+	if (!ready) {
+		if (halfResPostAlphaCS)
+			halfResPostAlphaCS->Release();
+		if (halfResCopyCS)
+			halfResCopyCS->Release();
+		halfResPostAlphaCS = nullptr;
+		halfResCopyCS = nullptr;
+		halfResMode = 0;
+		return;
+	}
+
+	REX::INFO("[FG-GPU1] iHalfResDepthMV={}: depth{} cross at {}x{}{}", halfResMode,
+		halfResMode == 2 ? " and motion vectors" : "", (a_width + 1) / 2, (a_height + 1) / 2,
+		halfResMode == 1 ? "; depth is rebuilt at full resolution on the display GPU" :
+	                       "; FSR3 works at half resolution");
 }
 
 void Upscaling::PreAlpha()
@@ -397,10 +489,13 @@ void Upscaling::PostAlpha()
 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
 
 		{
-			uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
-			uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
+			// iHalfResDepthMV: one thread per 2x2 block, same inputs and outputs.
+			const UINT threadsX = halfResMode ? (dx12SwapChain->swapChainDesc.Width + 1) / 2 : dx12SwapChain->swapChainDesc.Width;
+			const UINT threadsY = halfResMode ? (dx12SwapChain->swapChainDesc.Height + 1) / 2 : dx12SwapChain->swapChainDesc.Height;
+			uint32_t dispatchX = (threadsX + 7) / 8;
+			uint32_t dispatchY = (threadsY + 7) / 8;
 
-			ID3D11ShaderResourceView* views[4] = { 
+			ID3D11ShaderResourceView* views[4] = {
 				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
 				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
 				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
@@ -412,12 +507,12 @@ void Upscaling::PostAlpha()
 			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
 			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
 
-			context->CSSetShader(generateSharedBuffersCS, nullptr, 0);
+			context->CSSetShader(halfResMode ? halfResPostAlphaCS : generateSharedBuffersCS, nullptr, 0);
 
 			context->Dispatch(dispatchX, dispatchY, 1);
 		}
 
-		ID3D11ShaderResourceView* views[3] = { nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[4] = { nullptr, nullptr, nullptr, nullptr };
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
@@ -426,6 +521,9 @@ void Upscaling::PostAlpha()
 		ID3D11ComputeShader* shader = nullptr;
 		context->CSSetShader(shader, nullptr, 0);
 	}
+
+	// Depth and motion vectors are final now: start their PCIe copy instead of waiting for Present.
+	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kWorld);
 }
 
 void Upscaling::CopyBuffersToSharedResources()
@@ -444,8 +542,34 @@ void Upscaling::CopyBuffersToSharedResources()
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 
 	auto& motionVector = rendererData->renderTargets[(uint)RenderTarget::kMotionVectors];
+
+	if (halfResMode) {
+		// iHalfResDepthMV: the shared buffers are smaller than the game's, so one pass shrinks
+		// depth (and, in mode 2, motion vectors) instead of the copies below.
+		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
+		const UINT threadsX = (dx12SwapChain->swapChainDesc.Width + 1) / 2;
+		const UINT threadsY = (dx12SwapChain->swapChainDesc.Height + 1) / 2;
+
+		ID3D11ShaderResourceView* views[4] = { nullptr, nullptr,
+			reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
+			reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
+		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+		ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(),
+			depthBufferShared[dx12SwapChain->frameIndex]->uav.get() };
+		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+		context->CSSetShader(halfResCopyCS, nullptr, 0);
+		context->Dispatch((threadsX + 7) / 8, (threadsY + 7) / 8, 1);
+
+		ID3D11ShaderResourceView* nullViews[4] = { nullptr, nullptr, nullptr, nullptr };
+		context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
+		ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
+		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
+		context->CSSetShader(nullptr, nullptr, 0);
+		return;
+	}
+
 	context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
-		
+
 	{
 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
 
@@ -598,7 +722,7 @@ void Upscaling::PostDisplay()
 		CreateFrameGenerationResources();
 
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
-	if (dx12SwapChain->secondaryGPU && !settings.sendHudlessFrame)
+	if (dx12SwapChain->secondaryGPU && !hudlessActive)
 		return;  // nothing reads the HUD-less buffer, so don't spend bandwidth on the copy
 
 	auto rendererData = RE::BSGraphics::GetRendererData();
@@ -615,6 +739,9 @@ void Upscaling::PostDisplay()
 		REX::INFO("[FG] PostDisplay captured HUDLess (frameIdx={})", dx12SwapChain->frameIndex);
 		loggedOnce = true;
 	}
+
+	// The UI-free frame is final now: start its PCIe copy instead of waiting for Present.
+	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kHudless);
 }
 
 void Upscaling::GenerateUIBuffer()

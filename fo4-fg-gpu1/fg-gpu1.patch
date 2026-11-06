@@ -1,19 +1,324 @@
+diff --git a/package/F4SE/Plugins/FrameGeneration/DepthFromHalfResCS.hlsl b/package/F4SE/Plugins/FrameGeneration/DepthFromHalfResCS.hlsl
+new file mode 100644
+index 0000000..281acb9
+--- /dev/null
++++ b/package/F4SE/Plugins/FrameGeneration/DepthFromHalfResCS.hlsl
+@@ -0,0 +1,51 @@
++// FG-GPU1 (iHalfResDepthMV = 1): runs on the frame-generation GPU. Rebuilds full-resolution
++// depth from the half-resolution depth that crossed PCIe, so FSR3 still works at full
++// resolution and reads every motion vector; only its depth tests see the coarser depth.
++//
++// Smooth surfaces (floors, walls) are interpolated bilinearly. Where the four neighbouring
++// samples differ a lot - an object edge - blending would invent a depth that belongs to neither
++// surface and FSR3 would see a false edge or disocclusion there, so the pixel takes the sample
++// of its own 2x2 block instead (which already holds that block's nearest depth).
++
++Texture2D<float> HalfDepth : register(t0);
++RWTexture2D<float> FullDepth : register(u0);
++
++// FO4 depth runs 0 (near) .. 1 (far) and 1 - depth is close to proportional to 1/distance.
++// Neighbours whose 1/distance differs by more than this fraction count as an edge.
++static const float kEdgeThreshold = 0.05;
++
++[numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID)
++{
++	uint fullWidth, fullHeight, halfWidth, halfHeight;
++	FullDepth.GetDimensions(fullWidth, fullHeight);
++	HalfDepth.GetDimensions(halfWidth, halfHeight);
++	if (DTid.x >= fullWidth || DTid.y >= fullHeight)
++		return;
++
++	const int2 last = int2(halfWidth - 1, halfHeight - 1);
++
++	// Position in half-resolution texels: full pixel 2i sits at i - 0.25, 2i + 1 at i + 0.25.
++	const float2 position = (float2(DTid.xy) + 0.5) * 0.5 - 0.5;
++	const int2 base = int2(floor(position));
++	const float2 weight = position - float2(base);
++
++	const float d00 = HalfDepth[clamp(base, int2(0, 0), last)];
++	const float d10 = HalfDepth[clamp(base + int2(1, 0), int2(0, 0), last)];
++	const float d01 = HalfDepth[clamp(base + int2(0, 1), int2(0, 0), last)];
++	const float d11 = HalfDepth[clamp(base + int2(1, 1), int2(0, 0), last)];
++
++	const float w00 = 1.0 - d00;
++	const float w10 = 1.0 - d10;
++	const float w01 = 1.0 - d01;
++	const float w11 = 1.0 - d11;
++	const float nearest = max(max(w00, w10), max(w01, w11));
++	const float farthest = min(min(w00, w10), min(w01, w11));
++
++	float depth;
++	if (nearest <= farthest * (1.0 + kEdgeThreshold))
++		depth = lerp(lerp(d00, d10, weight.x), lerp(d01, d11, weight.x), weight.y);
++	else
++		depth = HalfDepth[min(DTid.xy / 2, uint2(last))];
++
++	FullDepth[DTid.xy] = depth;
++}
+diff --git a/package/F4SE/Plugins/FrameGeneration/HalfResDepthMVCS.hlsl b/package/F4SE/Plugins/FrameGeneration/HalfResDepthMVCS.hlsl
+new file mode 100644
+index 0000000..9533257
+--- /dev/null
++++ b/package/F4SE/Plugins/FrameGeneration/HalfResDepthMVCS.hlsl
+@@ -0,0 +1,72 @@
++// FG-GPU1 (iHalfResDepthMV = 1 or 2): writes the depth that crosses PCIe at half resolution,
++// and the motion vectors at half (HALF_MV=1) or full (HALF_MV=0) resolution, in the same pass
++// that fills the shared buffers. One thread per 2x2 block of the full-resolution frame, so it
++// reads exactly what the full-resolution shaders read and writes less.
++//
++//   depth          the nearest of the four samples (FO4 depth: 0 = near, 1 = far), so thin
++//                  foreground objects survive, like FSR3's own nearest-depth dilation.
++//   HALF_MV=1      the motion vector of that same nearest sample.
++//   HALF_MV=0      all four motion vectors, unchanged.
++//   ALPHA_MASK=1   the transparent-surface mask of GenerateSharedBuffersCS (the PostAlpha path);
++//   ALPHA_MASK=0   plain copy (the path without a reticle pass), t0/t1 unused.
++
++#ifndef ALPHA_MASK
++#	define ALPHA_MASK 1
++#endif
++#ifndef HALF_MV
++#	define HALF_MV 0
++#endif
++
++Texture2D<float4> InputTexturePreAlpha : register(t0);
++Texture2D<float4> InputTextureAfterAlpha : register(t1);
++Texture2D<float2> InputMotionVectors : register(t2);
++Texture2D<float> InputDepth : register(t3);
++
++RWTexture2D<float2> OutputMotionVectors : register(u0);
++RWTexture2D<float> OutputDepth : register(u1);
++
++[numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID)
++{
++	uint width, height;
++	InputMotionVectors.GetDimensions(width, height);
++	if (DTid.x * 2 >= width || DTid.y * 2 >= height)
++		return;
++
++	// Out-of-range loads return 0, which is the nearest possible depth; clamp instead.
++	const uint2 last = uint2(width - 1, height - 1);
++
++	float nearestDepth = 2.0;
++	float2 nearestMotion = 0.0;
++
++	[unroll] for (uint i = 0; i < 4; ++i)
++	{
++		const uint2 pos = min(DTid.xy * 2 + uint2(i & 1, i >> 1), last);
++
++		float depth = InputDepth[pos];
++		float2 motion = InputMotionVectors[pos];
++
++#if ALPHA_MASK
++		float3 difference = abs(InputTexturePreAlpha[pos].xyz - InputTextureAfterAlpha[pos].xyz);
++		float mask = max(difference.x, max(difference.y, difference.z));
++		mask *= 1000.0;
++		mask = 1.0 - saturate(mask);
++
++		motion = lerp(0.0, motion, mask);
++		depth = lerp(min(depth, 0.1), depth, mask);
++#endif
++
++#if !HALF_MV
++		OutputMotionVectors[pos] = motion;
++#endif
++
++		if (depth < nearestDepth) {
++			nearestDepth = depth;
++			nearestMotion = motion;
++		}
++	}
++
++	OutputDepth[DTid.xy] = nearestDepth;
++#if HALF_MV
++	OutputMotionVectors[DTid.xy] = nearestMotion;
++#endif
++}
+diff --git a/package/MCM/Config/FrameGeneration/config.json b/package/MCM/Config/FrameGeneration/config.json
+index 554ba18..3475eca 100644
+--- a/package/MCM/Config/FrameGeneration/config.json
++++ b/package/MCM/Config/FrameGeneration/config.json
+@@ -22,7 +22,15 @@
+ 			"type": "text"
+ 		},
+ 		{
+-			"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU.",
++			"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU. 'Second GPU' mode always uses FSR3.",
++			"type": "text"
++		},
++		{
++			"text": "",
++			"type": "text"
++		},
++		{
++			"text": "Settings marked (restart) take effect after restarting the game. All others apply within about a second.",
+ 			"type": "text"
+ 		},
+ 		{
+@@ -46,7 +54,7 @@
+ 			"id": "bFrameLimitMode:Settings",
+ 			"text": "Frame Rate Limiter",
+ 			"type": "switcher",
+-			"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Takes effect immediately. (Default: On)",
++			"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Not used when HighFPSPhysicsFix is installed; its own limiter applies instead. Takes effect immediately. (Default: On)",
+ 			"valueOptions": {
+ 				"sourceType": "ModSettingBool"
+ 			}
+@@ -55,16 +63,16 @@
+ 			"id": "bDisableInMenus:Settings",
+ 			"text": "Disable in Menus",
+ 			"type": "switcher",
+-			"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. (Default: On)",
++			"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. Takes effect immediately. (Default: On)",
+ 			"valueOptions": {
+ 				"sourceType": "ModSettingBool"
+ 			}
+ 		},
+ 		{
+ 			"id": "iFrameGenType:Settings",
+-			"text": "Backend",
++			"text": "Backend (restart)",
+ 			"type": "stepper",
+-			"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Changing this requires a game restart. (Default: DLSS-G)",
++			"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Ignored in 'Second GPU' mode, which always uses FSR3. Requires a game restart. (Default: AMD FSR3)",
+ 			"valueOptions": {
+ 				"sourceType": "ModSettingInt",
+ 				"options": [
+@@ -76,9 +84,9 @@
+ 		},
+ 		{
+ 			"id": "iFrameGenFrames:Settings",
+-			"text": "Frame Multiplier (DLSS-G)",
++			"text": "Frame Multiplier, DLSS-G (restart)",
+ 			"type": "stepper",
+-			"help": "How many frames to generate per rendered frame. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires restart. (Default: 2x)",
++			"help": "How many frames to generate per rendered frame. DLSS-G only; FSR3 always generates one. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires a game restart. (Default: 2x)",
+ 			"valueOptions": {
+ 				"sourceType": "ModSettingInt",
+ 				"options": [
+@@ -92,15 +100,99 @@
+ 			"text": "",
+ 			"type": "text"
+ 		},
++		{
++			"text": "SECOND GPU (FG-GPU1)",
++			"type": "section"
++		},
++		{
++			"text": "The game renders on one GPU; FSR3 frame generation and presentation run on the GPU the monitor is plugged into. Every frame's colour, UI-free colour, depth and motion vectors are copied across PCIe.",
++			"type": "text"
++		},
++		{
++			"text": "",
++			"type": "text"
++		},
++		{
++			"id": "bFrameGenOnSecondaryGPU:Settings",
++			"text": "Frame Generation on Second GPU (restart)",
++			"type": "switcher",
++			"help": "Run FSR3 frame generation and present on the GPU that drives the monitor, while the game keeps rendering on its own GPU. Not supported with ENB yet. Requires a game restart. (Default: On in this package)",
++			"valueOptions": {
++				"sourceType": "ModSettingBool"
++			}
++		},
++		{
++			"id": "sSecondaryGPUName:Settings",
++			"text": "Second GPU Name (restart)",
++			"type": "textinput",
++			"help": "Optional: part of the second GPU's name, e.g. 9060. Leave empty to pick the GPU that drives the monitor the game window is on. Only needed if the log says the choice is ambiguous. Requires a game restart. (Default: empty)",
++			"valueOptions": {
++				"sourceType": "ModSettingString"
++			}
++		},
++		{
++			"id": "bSendHudlessFrame:Settings",
++			"text": "Send UI-free Frame (restart)",
++			"type": "switcher",
++			"help": "Send an extra, UI-free copy of every frame. On: generated frames keep a clean HUD. Off: about 25% less PCIe traffic, but the HUD is interpolated with the scene and smears during camera movement. Requires a game restart. (Default: On)",
++			"valueOptions": {
++				"sourceType": "ModSettingBool"
++			}
++		},
++		{
++			"id": "iHalfResDepthMV:Settings",
++			"text": "Half-resolution Depth / Motion (restart)",
++			"type": "stepper",
++			"help": "Send depth (and optionally motion vectors) at half resolution to save PCIe time. Only generated frames use them; real frames stay full resolution. Depth: rebuilt to full resolution on the second GPU, FSR3 keeps every motion vector (about 2 ms saved at 4K). Depth + motion: FSR3 works at half resolution, like behind 'Performance' upscaling (about 4 ms saved). Requires a game restart. (Default: Depth)",
++			"valueOptions": {
++				"sourceType": "ModSettingInt",
++				"options": [
++					"Off (full resolution)",
++					"Depth",
++					"Depth + motion vectors"
++				]
++			}
++		},
++		{
++			"id": "bAsyncUnpack:Settings",
++			"text": "Async Unpack (restart)",
++			"type": "switcher",
++			"help": "On: the second GPU reads what arrives on its own copy queue, starting on each buffer as soon as it has crossed PCIe. Off: the original path, which waits for the whole transfer and reads it on the FSR3 queue (for comparison). Requires a game restart. (Default: On)",
++			"valueOptions": {
++				"sourceType": "ModSettingBool"
++			}
++		},
++		{
++			"id": "bEarlyTransfer:Settings",
++			"text": "Early Transfer",
++			"type": "switcher",
++			"help": "On: depth and motion vectors start crossing PCIe right after the world pass and the UI-free frame right after its capture; only the finished frame waits for Present. Off: everything crosses at Present (for comparison). Takes effect immediately. (Default: On)",
++			"valueOptions": {
++				"sourceType": "ModSettingBool"
++			}
++		},
++		{
++			"id": "bEarlyUnpack:Settings",
++			"text": "Early Unpack",
++			"type": "switcher",
++			"help": "On: the second GPU reads depth, motion vectors and the UI-free frame as soon as they arrive, before Present; afterwards only the finished frame is left to read. Off: all reads start at Present (for comparison). Needs Async Unpack and Early Transfer. Takes effect immediately. (Default: On)",
++			"valueOptions": {
++				"sourceType": "ModSettingBool"
++			}
++		},
++		{
++			"text": "",
++			"type": "text"
++		},
+ 		{
+ 			"text": "DEBUG",
+ 			"type": "section"
+ 		},
+ 		{
+ 			"id": "bEnableDebugLogging:Settings",
+-			"text": "Enable Debug Logging",
++			"text": "Enable Debug Logging (restart)",
+ 			"type": "switcher",
+-			"help": "Enables verbose Streamline logging for troubleshooting. Logs go to F4SE/AAAFrameGeneration.log. Requires game restart. (Default: Off)",
++			"help": "Enables verbose Streamline/XeSS logging for troubleshooting (no effect with FSR3 or in 'Second GPU' mode). Logs go to F4SE/AAAFrameGeneration.log. Requires a game restart. (Default: Off)",
+ 			"valueOptions": {
+ 				"sourceType": "ModSettingBool"
+ 			}
 diff --git a/package/MCM/Config/FrameGeneration/settings.ini b/package/MCM/Config/FrameGeneration/settings.ini
-index fa75993..c0fdb86 100644
+index fa75993..e947f7b 100644
 --- a/package/MCM/Config/FrameGeneration/settings.ini
 +++ b/package/MCM/Config/FrameGeneration/settings.ini
-@@ -13,8 +13,8 @@ bFrameLimitMode = 1
+@@ -8,13 +8,13 @@ bFrameGenerationMode = 1
+ ; Default: true
+ bFrameLimitMode = 1
+ 
+-; Disable frame generation in menus (Pip-Boy, etc.) to avoid interpolation artifacts
++; Disable frame generation in menus (Pip-Boy, etc.) to avoid interpolation artifacts (can be toggled mid-game)
+ ; Default: true
  bDisableInMenus = 1
  
  ; Frame generation backend (requires game restart to change)
 -; Default: 1 (0=FSR3, 1=DLSS-G, 2=XeSS-FG)
 -iFrameGenType = 1
-+; Default: 1 (0=FSR3, 1=DLSS-G, 2=XeSS-FG). Ignored (FSR3) when bFrameGenOnSecondaryGPU = 1.
++; 0=FSR3, 1=DLSS-G, 2=XeSS-FG. Default in this package: 0. Ignored (FSR3) when bFrameGenOnSecondaryGPU = 1.
 +iFrameGenType = 0
  
  ; DLSS-G frame multiplier (requires game restart, RTX 50+ for 3x/4x)
  ; Default: 0 (0=2x, 1=3x MFG, 2=4x MFG)
-@@ -23,3 +23,20 @@ iFrameGenFrames = 0
+@@ -23,3 +23,55 @@ iFrameGenFrames = 0
  ; Enables verbose Streamline logging for troubleshooting. Requires game restart.
  ; Default: false
  bEnableDebugLogging = 0
@@ -34,13 +339,50 @@ index fa75993..c0fdb86 100644
 +;         during camera movement.
 +; Requires restart. Default: true
 +bSendHudlessFrame = 1
++
++; [FG-GPU1] How the frame-generation GPU reads the frames it receives.
++;   On  = on a copy queue, starting on each buffer as soon as it has crossed PCIe, so the
++;         two PCIe trips overlap and the FSR3 queue never waits for the read (recommended).
++;   Off = the original path: wait for the whole transfer, then read it on the FSR3 queue.
++; Requires restart. Default: true
++bAsyncUnpack = 1
++
++; [FG-GPU1] When the frame's inputs cross PCIe.
++;   On  = depth and motion vectors start crossing during the world pass, the HUD-less frame
++;         right after its capture, and only the finished frame waits for Present (recommended).
++;   Off = everything crosses at Present, as before (for A/B).
++; Read every ~60 frames, so it can be toggled while the game runs. Default: true
++bEarlyTransfer = 1
++
++; [FG-GPU1] When the frame-generation GPU READS what has crossed (needs bAsyncUnpack and
++; bEarlyTransfer).
++;   On  = it is given the read of depth, motion vectors and the HUD-less frame as soon as they
++;         are sent, so it reads them while the game is still finishing the frame; after Present
++;         only the finished frame is left to read (recommended).
++;   Off = all reads are queued at Present, as before (for A/B).
++; Read every ~60 frames, so it can be toggled while the game runs. Default: true
++bEarlyUnpack = 1
++
++; [FG-GPU1] Send depth (and optionally motion vectors) at half resolution to save PCIe time.
++; Only the generated frames use them; real frames and the HUD-less colour stay full resolution.
++;   0 = both at full resolution (as before).
++;   1 = depth at half resolution, rebuilt to full resolution on the frame-generation GPU.
++;       FSR3 keeps using every motion vector; only its depth tests are coarser at object
++;       edges. Saves ~24 MB/frame (~2 ms) at 4K (recommended).
++;   2 = depth AND motion vectors at half resolution. FSR3 then works at half resolution, like
++;       FSR3 frame generation behind "Performance" upscaling. Saves ~47 MB/frame (~4 ms) at 4K;
++;       use it if 1 still falls short of your frame cap in CPU-heavy areas.
++; Requires restart. Default: 1
++iHalfResDepthMV = 1
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..8872eca
+index 0000000..7710e6f
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,824 @@
+@@ -0,0 +1,1791 @@
 +#include "CrossAdapterBridge.h"
++
++#include <d3dcompiler.h>
 +
 +#include <algorithm>
 +#include <cctype>
@@ -147,6 +489,18 @@ index 0000000..8872eca
 +	{
 +		return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1000.0 /
 +		       static_cast<double>(a_frequency.QuadPart);
++	}
++
++	const char* TimingName(CrossAdapterBridge::LaneTiming a_timing)
++	{
++		switch (a_timing) {
++		case CrossAdapterBridge::LaneTiming::kWorld:
++			return "world";
++		case CrossAdapterBridge::LaneTiming::kHudless:
++			return "hudless";
++		default:
++			return "present";
++		}
 +	}
 +}
 +
@@ -378,8 +732,132 @@ index 0000000..8872eca
 +	return S_OK;
 +}
 +
++// ---------------------------------------------------------------------------------------
++// GpuTimer
++
++bool CrossAdapterBridge::GpuTimer::Create(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, bool a_copyQueue,
++	UINT a_marks)
++{
++	Reset();
++	if (!a_device || !a_queue || a_marks == 0 || a_marks > kMaxMarks)
++		return false;
++
++	if (a_copyQueue) {
++		D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
++		if (FAILED(a_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))) ||
++			!options3.CopyQueueTimestampQueriesSupported)
++			return false;
++	}
++
++	UINT64 ticksPerSecond = 0;
++	if (FAILED(a_queue->GetTimestampFrequency(&ticksPerSecond)) || !ticksPerSecond)
++		return false;
++
++	D3D12_QUERY_HEAP_DESC heapDesc{};
++	heapDesc.Type = a_copyQueue ? D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP : D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++	heapDesc.Count = kSlots * a_marks;
++
++	D3D12_HEAP_PROPERTIES readbackProps{};
++	readbackProps.Type = D3D12_HEAP_TYPE_READBACK;
++	D3D12_RESOURCE_DESC bufferDesc{};
++	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++	bufferDesc.Width = sizeof(UINT64) * kSlots * a_marks;
++	bufferDesc.Height = 1;
++	bufferDesc.DepthOrArraySize = 1;
++	bufferDesc.MipLevels = 1;
++	bufferDesc.SampleDesc.Count = 1;
++	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++
++	if (FAILED(a_device->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(heap.put()))) ||
++		FAILED(a_device->CreateCommittedResource(&readbackProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
++			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(readback.put())))) {
++		Reset();
++		return false;
++	}
++
++	marks = a_marks;
++	frequency = ticksPerSecond;
++	Calibrate(a_queue);
++	return true;
++}
++
++void CrossAdapterBridge::GpuTimer::Calibrate(ID3D12CommandQueue* a_queue)
++{
++	if (!a_queue || !frequency)
++		return;
++	UINT64 gpu = 0;
++	UINT64 cpu = 0;
++	if (SUCCEEDED(a_queue->GetClockCalibration(&gpu, &cpu))) {
++		calibrationGpu = gpu;
++		calibrationQpc = cpu;
++		calibrated = true;
++	}
++}
++
++void CrossAdapterBridge::GpuTimer::Mark(ID3D12GraphicsCommandList* a_list, UINT a_slot, UINT a_mark)
++{
++	if (!Valid() || !a_list || a_slot >= kSlots || a_mark >= marks)
++		return;
++	a_list->EndQuery(heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * marks + a_mark);
++	written[a_slot] |= 1u << a_mark;
++}
++
++void CrossAdapterBridge::GpuTimer::Resolve(ID3D12GraphicsCommandList* a_list, UINT a_slot)
++{
++	if (!Valid() || !a_list || a_slot >= kSlots)
++		return;
++	a_list->ResolveQueryData(heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * marks, marks, readback.get(),
++		sizeof(UINT64) * a_slot * marks);
++}
++
++bool CrossAdapterBridge::GpuTimer::Read(UINT a_slot, std::array<double, kMaxMarks>& a_qpc, UINT& a_valid)
++{
++	a_valid = 0;
++	if (!Valid() || a_slot >= kSlots || !written[a_slot])
++		return false;
++	const UINT mask = written[a_slot];
++	written[a_slot] = 0;
++
++	const D3D12_RANGE range{ sizeof(UINT64) * a_slot * marks, sizeof(UINT64) * (a_slot * marks + marks) };
++	void* mapped = nullptr;
++	if (FAILED(readback->Map(0, &range, &mapped)))
++		return false;
++	const auto* ticks = reinterpret_cast<const UINT64*>(static_cast<const std::uint8_t*>(mapped) + range.Begin);
++
++	LARGE_INTEGER qpcPerSecond{};
++	QueryPerformanceFrequency(&qpcPerSecond);
++	const double qpcPerTick = static_cast<double>(qpcPerSecond.QuadPart) / static_cast<double>(frequency);
++	for (UINT mark = 0; mark < marks; ++mark) {
++		if (!(mask & (1u << mark)))
++			continue;
++		// Signed: a timestamp may be slightly older than the latest calibration.
++		const auto sinceCalibration = static_cast<std::int64_t>(ticks[mark] - calibrationGpu);
++		a_qpc[mark] = static_cast<double>(calibrationQpc) + static_cast<double>(sinceCalibration) * qpcPerTick;
++	}
++
++	const D3D12_RANGE nothingWritten{ 0, 0 };
++	readback->Unmap(0, &nothingWritten);
++	a_valid = mask;
++	return true;
++}
++
++void CrossAdapterBridge::GpuTimer::Reset() noexcept
++{
++	heap = nullptr;
++	readback = nullptr;
++	marks = 0;
++	frequency = 0;
++	calibrated = false;
++	calibrationGpu = 0;
++	calibrationQpc = 0;
++	written = {};
++}
++
++// ---------------------------------------------------------------------------------------
++// Setup
++
 +bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-+	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11)
++	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack)
 +{
 +	Shutdown();
 +	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
@@ -389,6 +867,7 @@ index 0000000..8872eca
 +	deviceB.copy_from(a_deviceB);
 +	context11.copy_from(a_context11);
 +	active = true;
++	asyncUnpack = a_asyncUnpack;
 +
 +	const auto check = [this](HRESULT a_hr, const char* a_what) {
 +		if (FAILED(a_hr))
@@ -443,43 +922,75 @@ index 0000000..8872eca
 +		return false;
 +	}
 +
-+	// Copy-queue timestamps are optional; the transport works without them.
-+	D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
-+	if (SUCCEEDED(deviceA->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))) &&
-+		options3.CopyQueueTimestampQueriesSupported &&
-+		SUCCEEDED(copyQueueA->GetTimestampFrequency(&timestampFrequency)) && timestampFrequency) {
-+		D3D12_QUERY_HEAP_DESC heapDesc{};
-+		heapDesc.Type = D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP;
-+		heapDesc.Count = kSlots * 2;
-+		D3D12_HEAP_PROPERTIES readbackProps{};
-+		readbackProps.Type = D3D12_HEAP_TYPE_READBACK;
-+		D3D12_RESOURCE_DESC bufferDesc{};
-+		bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-+		bufferDesc.Width = sizeof(UINT64) * kSlots * 2;
-+		bufferDesc.Height = 1;
-+		bufferDesc.DepthOrArraySize = 1;
-+		bufferDesc.MipLevels = 1;
-+		bufferDesc.SampleDesc.Count = 1;
-+		bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-+		if (FAILED(deviceA->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(timestampHeap.put()))) ||
-+			FAILED(deviceA->CreateCommittedResource(&readbackProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-+				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(timestampReadback.put())))) {
-+			timestampHeap = nullptr;
-+			timestampReadback = nullptr;
++	// Async unpack: a copy queue on the display GPU. Anything missing here is not fatal;
++	// the serialised path (unpack on the direct queue) still works.
++	if (asyncUnpack) {
++		const auto fallBack = [this](const char* a_what, HRESULT a_hr) {
++			REX::WARN("[FG-GPU1] {} failed (hr={:#010x}); unpacking on the display GPU's direct queue instead",
++				a_what, static_cast<std::uint32_t>(a_hr));
++			asyncUnpack = false;
++			listB = nullptr;
++			for (auto& allocator : allocatorsB)
++				allocator = nullptr;
++			copyQueueB = nullptr;
++			unpackFenceB = nullptr;
++		};
++		HRESULT hr = deviceB->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(copyQueueB.put()));
++		if (FAILED(hr)) {
++			fallBack("copy queue on the display GPU", hr);
++		} else {
++			copyQueueB->SetName(L"FG-GPU1 unpack (display GPU copy queue)");
++			for (auto& allocator : allocatorsB) {
++				if (SUCCEEDED(hr))
++					hr = deviceB->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(allocator.put()));
++			}
++			if (SUCCEEDED(hr))
++				hr = deviceB->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, allocatorsB[0].get(), nullptr,
++					IID_PPV_ARGS(listB.put()));
++			if (SUCCEEDED(hr))
++				hr = listB->Close();
++			if (SUCCEEDED(hr))
++				hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(unpackFenceB.put()));
++			if (FAILED(hr))
++				fallBack("display GPU copy list/fence", hr);
 +		}
 +	}
-+	if (!timestampHeap)
-+		REX::INFO("[FG-GPU1] copy-queue timestamps unavailable; copy time will not be reported");
++
++	// Timestamps are optional; the transport works without them.
++	if (!timerCopyA.Create(deviceA.get(), copyQueueA.get(), true, 6))
++		REX::INFO("[FG-GPU1] render GPU copy-queue timestamps unavailable; copy time will not be reported");
++	if (asyncUnpack && !timerCopyB.Create(deviceB.get(), copyQueueB.get(), true, 6))
++		REX::INFO("[FG-GPU1] display GPU copy-queue timestamps unavailable; unpack time will not be reported");
 +
 +	QueryPerformanceFrequency(&qpcFrequency);
 +	QueryPerformanceCounter(&statLastLog);
 +
-+	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> secondary GPU");
++	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> {}",
++		asyncUnpack ? "display GPU copy queue, lane by lane (bAsyncUnpack=1)" :
++					  "display GPU direct queue, after the whole transfer (bAsyncUnpack=0)");
 +	return true;
 +}
 +
++void CrossAdapterBridge::SetDisplayQueue(ID3D12CommandQueue* a_queueB)
++{
++	if (!active || !a_queueB)
++		return;
++	displayQueue = a_queueB;
++	displayDoneValue = 0;
++	slotDisplayDone = {};
++	displayDoneFenceB = nullptr;
++	const HRESULT hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(displayDoneFenceB.put()));
++	if (FAILED(hr)) {
++		displayDoneFenceB = nullptr;
++		REX::WARN("[FG-GPU1] display-list fence failed (hr={:#010x}); timings of the display GPU's list are off",
++			static_cast<std::uint32_t>(hr));
++	}
++	if (!timerDisplay.Create(deviceB.get(), a_queueB, false, 5))
++		REX::INFO("[FG-GPU1] display GPU direct-queue timestamps unavailable");
++}
++
 +int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
-+	bool a_createMirror)
++	bool a_createMirror, LaneTiming a_timing)
 +{
 +	if (!active)
 +		return -1;
@@ -487,9 +998,14 @@ index 0000000..8872eca
 +		Fail("AddLane (null source)", E_POINTER);
 +		return -1;
 +	}
++	if (lanes.size() >= kMaxLanes) {
++		Fail("AddLane (too many lanes)", E_INVALIDARG);
++		return -1;
++	}
 +
 +	Lane lane;
 +	lane.name = a_name;
++	lane.timing = a_timing;
 +	lane.sourceA[0].copy_from(a_sourceSlot0);
 +	lane.sourceA[1].copy_from(a_sourceSlot1);
 +	lane.desc = a_sourceSlot0->GetDesc();
@@ -565,10 +1081,10 @@ index 0000000..8872eca
 +	}
 +
 +	bytesPerFrame += lane.bytes;
-+	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total){}",
++	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total) timing={}{}",
 +		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
 +		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
-+		a_createMirror ? "" : " (unpacked into caller's destination)");
++		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)");
 +
 +	lanes.push_back(std::move(lane));
 +	return static_cast<int>(lanes.size() - 1);
@@ -581,79 +1097,85 @@ index 0000000..8872eca
 +	return lanes[static_cast<size_t>(a_lane)].mirrorB[a_slot].get();
 +}
 +
-+HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
-+	ID3D12CommandQueue* a_queueB)
++// ---------------------------------------------------------------------------------------
++// Per frame
++
++HRESULT CrossAdapterBridge::PrepareFrame(UINT a_slot)
 +{
-+	if (!active)
-+		return E_FAIL;
-+	if (a_slot >= kSlots || !a_producerFenceA || !a_queueB) {
-+		Fail("Transfer (bad arguments)", E_INVALIDARG);
-+		return E_INVALIDARG;
++	if (frameStarted) {
++		if (frameSlot == a_slot)
++			return S_OK;
++		REX::WARN("[FG-GPU1] frame slot changed from {} to {} mid-frame; the unfinished frame is dropped",
++			frameSlot, a_slot);
 +	}
 +
-+	LARGE_INTEGER submitStart{};
-+	QueryPerformanceCounter(&submitStart);
-+
-+	// The allocator and timestamp pair of this slot were last used by slotTransfer[a_slot].
++	// The allocator and timestamps of this slot were last used by frame slotTransfer[a_slot].
 +	const UINT64 previous = slotTransfer[a_slot];
 +	if (previous) {
-+		HRESULT hr = WaitCpu(copyDoneFenceA.get(), previous);
++		const HRESULT hr = WaitCpu(copyDoneFenceA.get(), previous);
 +		if (FAILED(hr)) {
 +			Fail("waiting for the previous copy of this slot", hr);
 +			return hr;
 +		}
-+		if (timestampHeap) {
-+			const D3D12_RANGE range{ sizeof(UINT64) * a_slot * 2, sizeof(UINT64) * (a_slot * 2 + 2) };
-+			void* mapped = nullptr;
-+			if (SUCCEEDED(timestampReadback->Map(0, &range, &mapped))) {
-+				const auto* ticks = reinterpret_cast<const UINT64*>(static_cast<const std::uint8_t*>(mapped) + range.Begin);
-+				if (ticks[1] > ticks[0]) {
-+					const double ms = static_cast<double>(ticks[1] - ticks[0]) * 1000.0 /
-+					                  static_cast<double>(timestampFrequency);
-+					statGpuCopyMs += ms;
-+					statGpuCopyMaxMs = (std::max)(statGpuCopyMaxMs, ms);
-+					++statGpuCopySamples;
-+				}
-+				const D3D12_RANGE nothingWritten{ 0, 0 };
-+				timestampReadback->Unmap(0, &nothingWritten);
-+			}
++		CollectTimings(a_slot);
++	}
++
++	const UINT64 frame = ++transferValue;
++	HRESULT hr = allocatorsA[a_slot]->Reset();
++	if (FAILED(hr)) {
++		Fail("resetting the copy allocator", hr);
++		return hr;
++	}
++
++	// The display GPU finished reading this slot's staging area the last time round.
++	if (previous) {
++		hr = copyQueueA->Wait(consumedFenceA.get(), previous);
++		if (FAILED(hr)) {
++			Fail("copy queue Wait (consumed)", hr);
++			return hr;
 +		}
 +	}
 +
-+	const UINT64 value = ++transferValue;
++	currentSlot = a_slot;
++	frameSlot = a_slot;
++	frameStarted = true;
++	slotTransfer[a_slot] = frame;
++	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::SubmitLane(Lane& a_lane, size_t a_laneIndex, UINT a_slot, UINT a_markBase,
++	bool a_firstInPhase, bool a_lastInPhase)
++{
 +	auto* allocator = allocatorsA[a_slot].get();
-+	HRESULT hr = allocator->Reset();
-+	if (SUCCEEDED(hr))
-+		hr = listA->Reset(allocator, nullptr);
++	HRESULT hr = listA->Reset(allocator, nullptr);
 +	if (FAILED(hr)) {
 +		Fail("resetting the copy list", hr);
 +		return hr;
 +	}
 +
-+	if (timestampHeap)
-+		listA->EndQuery(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2);
++	if (a_firstInPhase)
++		timerCopyA.Mark(listA.get(), a_slot, a_markBase);
 +
-+	for (auto& lane : lanes) {
-+		D3D12_TEXTURE_COPY_LOCATION dst{};
-+		dst.pResource = lane.stagingA.get();
-+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-+		dst.PlacedFootprint = lane.footprint;
-+		dst.PlacedFootprint.Offset = lane.slotStride * a_slot;
++	D3D12_TEXTURE_COPY_LOCATION dst{};
++	dst.pResource = a_lane.stagingA.get();
++	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++	dst.PlacedFootprint = a_lane.footprint;
++	dst.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
 +
-+		D3D12_TEXTURE_COPY_LOCATION src{};
-+		src.pResource = lane.sourceA[a_slot].get();
-+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-+		src.SubresourceIndex = 0;
++	D3D12_TEXTURE_COPY_LOCATION src{};
++	src.pResource = a_lane.sourceA[a_slot].get();
++	src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++	src.SubresourceIndex = 0;
 +
-+		// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
-+		// COPY_SOURCE implicitly and they decay back when the list completes.
-+		listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-+	}
++	// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
++	// COPY_SOURCE implicitly and they decay back when the list completes.
++	listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 +
-+	if (timestampHeap) {
-+		listA->EndQuery(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2 + 1);
-+		listA->ResolveQueryData(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2, 2,
-+			timestampReadback.get(), sizeof(UINT64) * a_slot * 2);
++	if (a_lastInPhase) {
++		timerCopyA.Mark(listA.get(), a_slot, a_markBase + 1);
++		// The Present phase is always last in the frame, so it resolves the slot's queries.
++		if (a_markBase == kMarkPresent)
++			timerCopyA.Resolve(listA.get(), a_slot);
 +	}
 +
 +	hr = listA->Close();
@@ -661,39 +1183,412 @@ index 0000000..8872eca
 +		Fail("closing the copy list", hr);
 +		return hr;
 +	}
-+
-+	// The game's D3D11 work for this frame (the producer of every source).
-+	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
-+	// The secondary GPU finished reading this slot's staging area the last time round.
-+	if (SUCCEEDED(hr) && previous)
-+		hr = copyQueueA->Wait(consumedFenceA.get(), previous);
-+	if (FAILED(hr)) {
-+		Fail("copy queue Wait", hr);
-+		return hr;
-+	}
-+
 +	ID3D12CommandList* lists[] = { listA.get() };
 +	copyQueueA->ExecuteCommandLists(1, lists);
 +
++	// Values are allocated in submission order rather than per lane index: the early groups
++	// signal before the Present group, and a shared fence must never go backwards.
++	const UINT64 value = ++nextLaneValue;
 +	hr = copyQueueA->Signal(transferFenceA.get(), value);
-+	if (SUCCEEDED(hr))
-+		hr = copyQueueA->Signal(copyDoneFenceA.get(), value);
-+	if (SUCCEEDED(hr))
-+		hr = a_queueB->Wait(transferFenceB.get(), value);
 +	if (FAILED(hr)) {
-+		Fail("transfer fence Signal/Wait", hr);
++		Fail("transfer fence Signal", hr);
++		return hr;
++	}
++	laneValue[a_laneIndex] = value;
++	laneFrame[a_laneIndex] = transferValue;
++	return S_OK;
++}
++
++bool CrossAdapterBridge::HasLanes(LaneTiming a_timing) const noexcept
++{
++	for (const auto& lane : lanes)
++		if (lane.timing == a_timing)
++			return true;
++	return false;
++}
++
++HRESULT CrossAdapterBridge::TransferGroup(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
++	LaneTiming a_timing)
++{
++	if (!active)
++		return E_FAIL;
++	if (a_slot >= kSlots || !a_producerFenceA) {
++		Fail("TransferGroup (bad arguments)", E_INVALIDARG);
++		return E_INVALIDARG;
++	}
++	if (!HasLanes(a_timing))
++		return S_OK;  // e.g. the HUD-less group with bSendHudlessFrame = 0
++
++	LARGE_INTEGER submitStart{};
++	QueryPerformanceCounter(&submitStart);
++
++	HRESULT hr = PrepareFrame(a_slot);
++	if (FAILED(hr))
++		return hr;
++
++	// The game's D3D11 work that produced these lanes, as of the hook that just ran.
++	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
++	if (FAILED(hr)) {
++		Fail("copy queue Wait (producer)", hr);
 +		return hr;
 +	}
 +
-+	slotTransfer[a_slot] = value;
++	const UINT markBase = a_timing == LaneTiming::kWorld ? kMarkWorld :
++		a_timing == LaneTiming::kHudless                  ? kMarkHudless :
++															kMarkPresent;
++	size_t firstIndex = lanes.size();
++	size_t lastIndex = 0;
++	for (size_t index = 0; index < lanes.size(); ++index) {
++		if (lanes[index].timing != a_timing || laneFrame[index] == transferValue)
++			continue;
++		if (firstIndex == lanes.size())
++			firstIndex = index;
++		lastIndex = index;
++	}
++
++	bool copied = false;
++	for (size_t index = 0; index < lanes.size(); ++index) {
++		if (lanes[index].timing != a_timing || laneFrame[index] == transferValue)
++			continue;
++		hr = SubmitLane(lanes[index], index, a_slot, markBase, index == firstIndex, index == lastIndex);
++		if (FAILED(hr))
++			return hr;
++		copied = true;
++	}
++
++	if (copied) {
++		LARGE_INTEGER submitEnd{};
++		QueryPerformanceCounter(&submitEnd);
++		statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
++	}
++	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot)
++{
++	if (!active)
++		return E_FAIL;
++	if (a_slot >= kSlots || !a_producerFenceA || lanes.empty()) {
++		Fail("Transfer (bad arguments or no lanes)", E_INVALIDARG);
++		return E_INVALIDARG;
++	}
++
++	LARGE_INTEGER submitStart{};
++	QueryPerformanceCounter(&submitStart);
++
++	HRESULT hr = PrepareFrame(a_slot);
++	if (FAILED(hr))
++		return hr;
++
++	// The finished frame is only final now. A frame whose early hooks did not run also copies
++	// its remaining lanes here, so the transport never depends on them having run.
++	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
++	if (FAILED(hr)) {
++		Fail("copy queue Wait (producer)", hr);
++		return hr;
++	}
++
++	// Whatever is left crosses in the Present phase, including early-timing lanes whose hooks
++	// did not run; the last one resolves the slot's copy timestamps.
++	size_t firstIndex = lanes.size();
++	size_t lastIndex = 0;
++	for (size_t index = 0; index < lanes.size(); ++index) {
++		if (laneFrame[index] == transferValue)
++			continue;
++		if (firstIndex == lanes.size())
++			firstIndex = index;
++		lastIndex = index;
++	}
++
++	for (size_t index = 0; index < lanes.size(); ++index) {
++		if (laneFrame[index] == transferValue)
++			continue;
++		hr = SubmitLane(lanes[index], index, a_slot, kMarkPresent, index == firstIndex, index == lastIndex);
++		if (FAILED(hr))
++			return hr;
++	}
++
++	hr = copyQueueA->Signal(copyDoneFenceA.get(), transferValue);
++	if (FAILED(hr)) {
++		Fail("copy-done fence Signal", hr);
++		return hr;
++	}
++
++	if ((statFrames & 63) == 0)
++		CalibrateTimers();
++
++	frameStarted = false;
++	slotPresentQpc[a_slot] = submitStart;
 +
 +	LARGE_INTEGER submitEnd{};
 +	QueryPerformanceCounter(&submitEnd);
 +	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
 +	++statFrames;
 +	const UINT64 consumed = consumedFenceA->GetCompletedValue();
-+	statMaxLag = (std::max)(statMaxLag, value > consumed ? value - consumed : 0);
++	statMaxLag = (std::max)(statMaxLag, transferValue > consumed ? transferValue - consumed : 0);
 +	return S_OK;
++}
++
++bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot,
++	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState)
++{
++	const D3D12_RESOURCE_DESC destDesc = a_dest->GetDesc();
++	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
++	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
++	if (destDesc.Width != a_lane.desc.Width || destDesc.Height != a_lane.desc.Height ||
++		destFootprint.Footprint.RowPitch != a_lane.footprint.Footprint.RowPitch) {
++		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
++		if (!a_lane.mismatchLogged) {
++			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
++				a_lane.name, a_lane.desc.Width, a_lane.desc.Height, static_cast<int>(a_lane.desc.Format), destDesc.Width,
++				destDesc.Height, static_cast<int>(destDesc.Format));
++			a_lane.mismatchLogged = true;
++		}
++		return false;
++	}
++
++	// COMMON (== PRESENT) <-> COPY_DEST is also legal on a copy list.
++	auto barrier = Transition(a_dest, a_destState, D3D12_RESOURCE_STATE_COPY_DEST);
++	a_list->ResourceBarrier(1, &barrier);
++
++	D3D12_TEXTURE_COPY_LOCATION dst{};
++	dst.pResource = a_dest;
++	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++	dst.SubresourceIndex = 0;
++
++	D3D12_TEXTURE_COPY_LOCATION src{};
++	src.pResource = a_lane.stagingB.get();
++	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++	src.PlacedFootprint = a_lane.footprint;
++	src.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
++	// Same width/height; a typeless/UNORM/SRGB difference between the back buffer and the
++	// D3D11 texture is allowed by CopyTextureRegion as long as the formats are copy-compatible.
++	src.PlacedFootprint.Footprint.Format = destDesc.Format;
++
++	a_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++
++	barrier = Transition(a_dest, D3D12_RESOURCE_STATE_COPY_DEST, a_destState);
++	a_list->ResourceBarrier(1, &barrier);
++	return true;
++}
++
++HRESULT CrossAdapterBridge::Unpack(UINT a_slot, int a_backBufferLane, ID3D12Resource* a_backBuffer,
++	ID3D12CommandQueue* a_queueB)
++{
++	if (!active)
++		return E_FAIL;
++	if (!asyncUnpack || !copyQueueB || a_slot >= kSlots || !a_queueB || lanes.empty() ||
++		slotTransfer[a_slot] != transferValue) {
++		Fail("Unpack (bad arguments)", E_INVALIDARG);
++		return E_INVALIDARG;
++	}
++
++	LARGE_INTEGER submitStart{};
++	QueryPerformanceCounter(&submitStart);
++
++	const UINT64 frame = transferValue;
++	HRESULT hr = BeginUnpack(a_slot);
++	if (FAILED(hr))
++		return hr;
++
++	// Whatever the early hooks did not already read, in the order the lanes become available:
++	// the finished frame is registered first (at interop creation) but is the last to cross.
++	std::array<size_t, kMaxLanes> order{};
++	size_t orderCount = 0;
++	for (size_t pass = 0; pass < 2; ++pass) {
++		for (size_t index = 0; index < lanes.size(); ++index) {
++			const bool present = lanes[index].timing == LaneTiming::kPresent;
++			if (present != (pass == 1) || laneUnpackFrame[index] == frame)
++				continue;
++			order[orderCount++] = index;
++		}
++	}
++	hr = SubmitUnpackLanes(a_slot, order.data(), orderCount, kMarkPresent, true, a_backBufferLane, a_backBuffer);
++	if (FAILED(hr))
++		return hr;
++
++	// The staging slot has been read: the render GPU may overwrite it. Then let the direct
++	// queue (FFX prepare, present) start on this frame - after the depth rebuild, which is
++	// queued ahead of that wait so it only waits for the depth lane.
++	hr = copyQueueB->Signal(consumedFenceB.get(), frame);
++	if (SUCCEEDED(hr))
++		hr = copyQueueB->Signal(unpackFenceB.get(), frame);
++	if (SUCCEEDED(hr) && upsampler.Ready())
++		hr = SubmitDepthUpsample(a_slot, frame, a_queueB);
++	if (SUCCEEDED(hr))
++		hr = a_queueB->Wait(unpackFenceB.get(), frame);
++	if (FAILED(hr)) {
++		Fail("unpack fence Signal/Wait", hr);
++		return hr;
++	}
++	unpackStarted = false;
++
++	LARGE_INTEGER submitEnd{};
++	QueryPerformanceCounter(&submitEnd);
++	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
++	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::UnpackGroup(UINT a_slot, LaneTiming a_timing)
++{
++	if (!active || !asyncUnpack || !copyQueueB || a_timing == LaneTiming::kPresent)
++		return S_OK;
++	if (a_slot >= kSlots || slotTransfer[a_slot] != transferValue)
++		return S_OK;  // no frame in progress on this slot; Present reads everything
++
++	const UINT64 frame = transferValue;
++	std::array<size_t, kMaxLanes> order{};
++	size_t orderCount = 0;
++	for (size_t index = 0; index < lanes.size(); ++index) {
++		// Only lanes this frame has already sent and nobody has read yet.
++		if (lanes[index].timing != a_timing || laneFrame[index] != frame || laneUnpackFrame[index] == frame)
++			continue;
++		order[orderCount++] = index;
++	}
++	if (!orderCount)
++		return S_OK;
++
++	LARGE_INTEGER submitStart{};
++	QueryPerformanceCounter(&submitStart);
++
++	HRESULT hr = BeginUnpack(a_slot);
++	if (SUCCEEDED(hr)) {
++		const UINT markBase = a_timing == LaneTiming::kWorld ? kMarkWorld : kMarkHudless;
++		hr = SubmitUnpackLanes(a_slot, order.data(), orderCount, markBase, false, -1, nullptr);
++	}
++
++	LARGE_INTEGER submitEnd{};
++	QueryPerformanceCounter(&submitEnd);
++	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
++	return hr;
++}
++
++HRESULT CrossAdapterBridge::BeginUnpack(UINT a_slot)
++{
++	const UINT64 frame = transferValue;
++	if (unpackStarted) {
++		if (unpackFrame == frame)
++			return S_OK;
++		// A frame's read was started at a hook but its Present never came (the slot changed
++		// mid-frame). Close it, so the next use of its slot does not wait for it forever.
++		HRESULT hr = copyQueueB->Signal(consumedFenceB.get(), unpackFrame);
++		if (SUCCEEDED(hr))
++			hr = copyQueueB->Signal(unpackFenceB.get(), unpackFrame);
++		if (FAILED(hr)) {
++			Fail("closing an unfinished unpack", hr);
++			return hr;
++		}
++		unpackStarted = false;
++	}
++
++	// This slot's allocator was last used by the unpack of frame slotUnpack[a_slot].
++	if (slotUnpack[a_slot]) {
++		const HRESULT hr = WaitCpu(unpackFenceB.get(), slotUnpack[a_slot]);
++		if (FAILED(hr)) {
++			Fail("waiting for the previous unpack of this slot", hr);
++			return hr;
++		}
++	}
++	HRESULT hr = allocatorsB[a_slot]->Reset();
++	if (FAILED(hr)) {
++		Fail("resetting the unpack allocator", hr);
++		return hr;
++	}
++
++	// The frame that last used this slot may still read its mirrors on the direct queue
++	// (FFX's prepare pass) or FFX's interpolation queue (HUD-less colour). Both are done
++	// by now from the CPU's side: FFX's Present for the previous frame waited for that
++	// frame's interpolation before this frame's hooks could run. This keeps it explicit.
++	if (displayDoneFenceB && slotDisplayDone[a_slot]) {
++		hr = copyQueueB->Wait(displayDoneFenceB.get(), slotDisplayDone[a_slot]);
++		if (FAILED(hr)) {
++			Fail("unpack queue Wait (display list)", hr);
++			return hr;
++		}
++	}
++
++	// From here on the slot's allocator belongs to this frame.
++	slotUnpack[a_slot] = frame;
++	unpackStarted = true;
++	unpackFrame = frame;
++	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order, size_t a_count, UINT a_markBase,
++	bool a_resolve, int a_backBufferLane, ID3D12Resource* a_backBuffer)
++{
++	auto* allocator = allocatorsB[a_slot].get();
++	for (size_t position = 0; position < a_count; ++position) {
++		const size_t index = a_order[position];
++		auto& lane = lanes[index];
++		ID3D12Resource* dest = lane.mirrorB[a_slot].get();
++		if (!dest && static_cast<int>(index) == a_backBufferLane)
++			dest = a_backBuffer;
++
++		if (laneFrame[index] != unpackFrame) {
++			Fail("Unpack (a lane was not transferred for this frame)", E_FAIL);
++			return E_FAIL;
++		}
++
++		HRESULT hr = listB->Reset(allocator, nullptr);
++		if (FAILED(hr)) {
++			Fail("resetting the unpack list", hr);
++			return hr;
++		}
++		if (position == 0)
++			timerCopyB.Mark(listB.get(), a_slot, a_markBase);
++
++		// Mirrors are COMMON between uses; the back buffer is PRESENT, which is the same state.
++		if (dest)
++			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON);
++
++		if (position + 1 == a_count) {
++			timerCopyB.Mark(listB.get(), a_slot, a_markBase + 1);
++			// The Present phase is always the frame's last, so it resolves the slot's queries.
++			if (a_resolve)
++				timerCopyB.Resolve(listB.get(), a_slot);
++		}
++
++		hr = listB->Close();
++		if (FAILED(hr)) {
++			Fail("closing the unpack list", hr);
++			return hr;
++		}
++
++		// Start on this lane as soon as it has crossed, while the next one is still in flight.
++		hr = copyQueueB->Wait(transferFenceB.get(), laneValue[index]);
++		if (FAILED(hr)) {
++			Fail("unpack queue Wait (transfer)", hr);
++			return hr;
++		}
++		ID3D12CommandList* lists[] = { listB.get() };
++		copyQueueB->ExecuteCommandLists(1, lists);
++		laneUnpackFrame[index] = unpackFrame;
++
++		// iHalfResDepthMV = 1: the depth rebuild may start now, while the other lanes cross.
++		if (upsampler.Ready() && static_cast<int>(index) == upsampler.lane) {
++			hr = copyQueueB->Signal(upsampler.sourceReadyFence.get(), unpackFrame);
++			if (FAILED(hr)) {
++				Fail("depth-ready fence Signal", hr);
++				return hr;
++			}
++		}
++	}
++	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::WaitTransfer(ID3D12CommandQueue* a_queueB)
++{
++	if (!active)
++		return E_FAIL;
++	if (!a_queueB || lanes.empty()) {
++		Fail("WaitTransfer (bad arguments)", E_INVALIDARG);
++		return E_INVALIDARG;
++	}
++	const HRESULT hr = a_queueB->Wait(transferFenceB.get(), nextLaneValue);
++	if (FAILED(hr))
++		Fail("transfer fence Wait", hr);
++	return hr;
 +}
 +
 +void CrossAdapterBridge::RecordUnpack(ID3D12GraphicsCommandList* a_listB, UINT a_slot)
@@ -739,45 +1634,7 @@ index 0000000..8872eca
 +	if (!active || !a_listB || !a_destB || a_slot >= kSlots || a_lane < 0 ||
 +		static_cast<size_t>(a_lane) >= lanes.size())
 +		return;
-+	auto& lane = lanes[static_cast<size_t>(a_lane)];
-+
-+	const D3D12_RESOURCE_DESC destDesc = a_destB->GetDesc();
-+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
-+	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
-+	if (destDesc.Width != lane.desc.Width || destDesc.Height != lane.desc.Height ||
-+		destFootprint.Footprint.RowPitch != lane.footprint.Footprint.RowPitch) {
-+		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
-+		static bool logged = false;
-+		if (!logged) {
-+			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
-+				lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format), destDesc.Width,
-+				destDesc.Height, static_cast<int>(destDesc.Format));
-+			logged = true;
-+		}
-+		return;
-+	}
-+
-+	auto barrier = Transition(a_destB, a_destState, D3D12_RESOURCE_STATE_COPY_DEST);
-+	a_listB->ResourceBarrier(1, &barrier);
-+
-+	D3D12_TEXTURE_COPY_LOCATION dst{};
-+	dst.pResource = a_destB;
-+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-+	dst.SubresourceIndex = 0;
-+
-+	D3D12_TEXTURE_COPY_LOCATION src{};
-+	src.pResource = lane.stagingB.get();
-+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-+	src.PlacedFootprint = lane.footprint;
-+	src.PlacedFootprint.Offset = lane.slotStride * a_slot;
-+	// Same width/height; a typeless/UNORM/SRGB difference between the back buffer and the
-+	// D3D11 texture is allowed by CopyTextureRegion as long as the formats are copy-compatible.
-+	src.PlacedFootprint.Footprint.Format = destDesc.Format;
-+
-+	a_listB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-+
-+	barrier = Transition(a_destB, D3D12_RESOURCE_STATE_COPY_DEST, a_destState);
-+	a_listB->ResourceBarrier(1, &barrier);
++	RecordLaneCopy(a_listB, lanes[static_cast<size_t>(a_lane)], a_slot, a_destB, a_destState);
 +}
 +
 +HRESULT CrossAdapterBridge::SignalConsumed(ID3D12CommandQueue* a_queueB)
@@ -790,14 +1647,394 @@ index 0000000..8872eca
 +	return hr;
 +}
 +
++// ---------------------------------------------------------------------------------------
++// Half-resolution depth (iHalfResDepthMV = 1)
++
++bool CrossAdapterBridge::CreateDepthUpsampler(UINT a_width, UINT a_height, const wchar_t* a_shaderPath)
++{
++	ResetUpsampler();
++	if (!active || !a_width || !a_height || !a_shaderPath)
++		return false;
++
++	const auto failed = [this](const char* a_what, HRESULT a_hr) {
++		REX::ERROR("[FG-GPU1] depth rebuild on the display GPU: {} failed (hr={:#010x}); sending depth at full resolution",
++			a_what, static_cast<std::uint32_t>(a_hr));
++		ResetUpsampler();
++		return false;
++	};
++
++	// The allocator of a slot is reused once that slot's previous direct list is done.
++	if (asyncUnpack && !displayDoneFenceB)
++		return failed("the display GPU's direct-queue fence (SetDisplayQueue)", E_FAIL);
++
++	winrt::com_ptr<ID3DBlob> shader;
++	winrt::com_ptr<ID3DBlob> shaderErrors;
++	HRESULT hr = D3DCompileFromFile(a_shaderPath, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
++		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), shaderErrors.put());
++	if (FAILED(hr)) {
++		if (shaderErrors)
++			REX::ERROR("[FG-GPU1] {}", static_cast<const char*>(shaderErrors->GetBufferPointer()));
++		return failed("compiling DepthFromHalfResCS.hlsl", hr);
++	}
++
++	// t0 = half-resolution depth, u0 = full-resolution depth, one table per slot.
++	D3D12_DESCRIPTOR_RANGE ranges[2]{};
++	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++	ranges[0].NumDescriptors = 1;
++	ranges[0].OffsetInDescriptorsFromTableStart = 0;
++	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++	ranges[1].NumDescriptors = 1;
++	ranges[1].OffsetInDescriptorsFromTableStart = 1;
++
++	D3D12_ROOT_PARAMETER parameter{};
++	parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++	parameter.DescriptorTable.NumDescriptorRanges = 2;
++	parameter.DescriptorTable.pDescriptorRanges = ranges;
++	parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++
++	D3D12_ROOT_SIGNATURE_DESC rootDesc{};
++	rootDesc.NumParameters = 1;
++	rootDesc.pParameters = &parameter;
++
++	winrt::com_ptr<ID3DBlob> serialized;
++	winrt::com_ptr<ID3DBlob> rootErrors;
++	hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, serialized.put(), rootErrors.put());
++	if (FAILED(hr))
++		return failed("D3D12SerializeRootSignature", hr);
++	hr = deviceB->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
++		IID_PPV_ARGS(upsampler.rootSignature.put()));
++	if (FAILED(hr))
++		return failed("CreateRootSignature", hr);
++
++	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
++	pipelineDesc.pRootSignature = upsampler.rootSignature.get();
++	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
++	hr = deviceB->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(upsampler.pipeline.put()));
++	if (FAILED(hr))
++		return failed("CreateComputePipelineState", hr);
++
++	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
++	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++	heapDesc.NumDescriptors = kSlots * 2;
++	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++	hr = deviceB->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(upsampler.descriptors.put()));
++	if (FAILED(hr))
++		return failed("CreateDescriptorHeap", hr);
++	upsampler.descriptorSize = deviceB->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++
++	D3D12_RESOURCE_DESC targetDesc{};
++	targetDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++	targetDesc.Width = a_width;
++	targetDesc.Height = a_height;
++	targetDesc.DepthOrArraySize = 1;
++	targetDesc.MipLevels = 1;
++	targetDesc.Format = DXGI_FORMAT_R32_FLOAT;
++	targetDesc.SampleDesc.Count = 1;
++	targetDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	targetDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++	D3D12_HEAP_PROPERTIES defaultHeap{};
++	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
++
++	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
++	uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
++	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++
++	for (UINT slot = 0; slot < kSlots; ++slot) {
++		// COMMON between uses, like the mirrors: FFX's read promotes it implicitly.
++		hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &targetDesc,
++			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(upsampler.target[slot].put()));
++		if (FAILED(hr))
++			return failed("CreateCommittedResource(full-resolution depth)", hr);
++		D3D12_CPU_DESCRIPTOR_HANDLE handle = upsampler.descriptors->GetCPUDescriptorHandleForHeapStart();
++		handle.ptr += static_cast<SIZE_T>(slot * 2 + 1) * upsampler.descriptorSize;
++		deviceB->CreateUnorderedAccessView(upsampler.target[slot].get(), nullptr, &uavDesc, handle);
++
++		hr = deviceB->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(upsampler.allocators[slot].put()));
++		if (FAILED(hr))
++			return failed("CreateCommandAllocator", hr);
++	}
++	hr = deviceB->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, upsampler.allocators[0].get(), nullptr,
++		IID_PPV_ARGS(upsampler.list.put()));
++	if (SUCCEEDED(hr))
++		hr = upsampler.list->Close();
++	if (FAILED(hr))
++		return failed("CreateCommandList", hr);
++	hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(upsampler.sourceReadyFence.put()));
++	if (FAILED(hr))
++		return failed("CreateFence", hr);
++
++	upsampler.width = a_width;
++	upsampler.height = a_height;
++	return true;
++}
++
++void CrossAdapterBridge::SetDepthUpsampleLane(int a_lane)
++{
++	if (!active || !upsampler.pipeline || a_lane < 0 || static_cast<size_t>(a_lane) >= lanes.size())
++		return;
++	auto& lane = lanes[static_cast<size_t>(a_lane)];
++
++	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
++	srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
++	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++	srvDesc.Texture2D.MipLevels = 1;
++	for (UINT slot = 0; slot < kSlots; ++slot) {
++		if (!lane.mirrorB[slot]) {
++			REX::ERROR("[FG-GPU1] depth lane has no mirror on the display GPU; depth rebuild disabled");
++			return;
++		}
++		D3D12_CPU_DESCRIPTOR_HANDLE handle = upsampler.descriptors->GetCPUDescriptorHandleForHeapStart();
++		handle.ptr += static_cast<SIZE_T>(slot * 2) * upsampler.descriptorSize;
++		deviceB->CreateShaderResourceView(lane.mirrorB[slot].get(), &srvDesc, handle);
++	}
++	upsampler.lane = a_lane;
++	REX::INFO("[FG-GPU1] depth crosses at {}x{} and is rebuilt at {}x{} on the display GPU ({})", lane.desc.Width,
++		lane.desc.Height, upsampler.width, upsampler.height,
++		asyncUnpack ? "as soon as it lands, while the other lanes still cross" : "on the frame's direct list");
++}
++
++ID3D12Resource* CrossAdapterBridge::UpsampledDepth(UINT a_slot) const noexcept
++{
++	if (!upsampler.Ready() || a_slot >= kSlots)
++		return nullptr;
++	return upsampler.target[a_slot].get();
++}
++
++void CrossAdapterBridge::RecordUpsampleCommands(ID3D12GraphicsCommandList* a_list, UINT a_slot)
++{
++	ID3D12Resource* source = lanes[static_cast<size_t>(upsampler.lane)].mirrorB[a_slot].get();
++	ID3D12Resource* target = upsampler.target[a_slot].get();
++
++	timerDisplay.Mark(a_list, a_slot, kMarkUpsampleBegin);
++
++	// Explicit both ways, so the states are right whether or not the list also unpacked.
++	const D3D12_RESOURCE_BARRIER before[2] = {
++		Transition(source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++		Transition(target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++	};
++	a_list->ResourceBarrier(2, before);
++
++	ID3D12DescriptorHeap* heaps[] = { upsampler.descriptors.get() };
++	a_list->SetDescriptorHeaps(1, heaps);
++	a_list->SetComputeRootSignature(upsampler.rootSignature.get());
++	a_list->SetPipelineState(upsampler.pipeline.get());
++	D3D12_GPU_DESCRIPTOR_HANDLE table = upsampler.descriptors->GetGPUDescriptorHandleForHeapStart();
++	table.ptr += static_cast<UINT64>(a_slot * 2) * upsampler.descriptorSize;
++	a_list->SetComputeRootDescriptorTable(0, table);
++	a_list->Dispatch((upsampler.width + 7) / 8, (upsampler.height + 7) / 8, 1);
++
++	const D3D12_RESOURCE_BARRIER after[2] = {
++		Transition(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++		Transition(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
++	};
++	a_list->ResourceBarrier(2, after);
++
++	timerDisplay.Mark(a_list, a_slot, kMarkUpsampleEnd);
++}
++
++void CrossAdapterBridge::RecordDepthUpsample(ID3D12GraphicsCommandList* a_listB, UINT a_slot)
++{
++	if (!active || asyncUnpack || !a_listB || a_slot >= kSlots || !upsampler.Ready())
++		return;
++	RecordUpsampleCommands(a_listB, a_slot);
++}
++
++HRESULT CrossAdapterBridge::SubmitDepthUpsample(UINT a_slot, UINT64 a_frame, ID3D12CommandQueue* a_queueB)
++{
++	// This slot's allocator was last used ahead of the slot's previous direct list on the same
++	// queue; FFX's Present has normally waited for that frame already, so this does not block.
++	if (slotDisplayDone[a_slot]) {
++		const HRESULT hr = WaitCpu(displayDoneFenceB.get(), slotDisplayDone[a_slot]);
++		if (FAILED(hr)) {
++			Fail("waiting for the previous depth rebuild of this slot", hr);
++			return hr;
++		}
++	}
++
++	auto* allocator = upsampler.allocators[a_slot].get();
++	HRESULT hr = allocator->Reset();
++	if (SUCCEEDED(hr))
++		hr = upsampler.list->Reset(allocator, nullptr);
++	if (FAILED(hr)) {
++		Fail("resetting the depth-rebuild list", hr);
++		return hr;
++	}
++	RecordUpsampleCommands(upsampler.list.get(), a_slot);
++	hr = upsampler.list->Close();
++	if (FAILED(hr)) {
++		Fail("closing the depth-rebuild list", hr);
++		return hr;
++	}
++
++	// Only the depth lane: the rebuild overlaps the motion vectors, HUD-less and final frame
++	// still crossing, and the frame's own list waits for all of them right after this.
++	hr = a_queueB->Wait(upsampler.sourceReadyFence.get(), a_frame);
++	if (FAILED(hr)) {
++		Fail("depth-rebuild Wait", hr);
++		return hr;
++	}
++	ID3D12CommandList* lists[] = { upsampler.list.get() };
++	a_queueB->ExecuteCommandLists(1, lists);
++	return S_OK;
++}
++
++void CrossAdapterBridge::ResetUpsampler() noexcept
++{
++	upsampler = DepthUpsampler{};
++}
++
++void CrossAdapterBridge::MarkDisplayList(ID3D12GraphicsCommandList* a_listB, UINT a_slot, UINT a_mark)
++{
++	if (!active)
++		return;
++	timerDisplay.Mark(a_listB, a_slot, a_mark);
++	if (a_mark == kMarkListEnd)
++		timerDisplay.Resolve(a_listB, a_slot);
++}
++
++HRESULT CrossAdapterBridge::SignalDisplayListDone(ID3D12CommandQueue* a_queueB)
++{
++	if (!active || !a_queueB || !displayDoneFenceB)
++		return S_OK;
++	const HRESULT hr = a_queueB->Signal(displayDoneFenceB.get(), ++displayDoneValue);
++	if (FAILED(hr)) {
++		Fail("display-list fence Signal", hr);
++		return hr;
++	}
++	slotDisplayDone[currentSlot] = displayDoneValue;
++	return S_OK;
++}
++
++void CrossAdapterBridge::AddPresentBlock(double a_presentMs, double a_latencyWaitMs)
++{
++	if (!active)
++		return;
++	statPresentBlock.Add(a_presentMs);
++	statLatencyWait.Add(a_latencyWaitMs);
++}
++
 +HRESULT CrossAdapterBridge::GateD3D11(UINT a_nextSlot)
 +{
 +	if (!active || a_nextSlot >= kSlots || !slotTransfer[a_nextSlot])
 +		return S_OK;
++	++statGateCalls;
++	// Still copying when the wait is queued. The D3D11 GPU timeline is usually behind the CPU,
++	// so this does not prove a stall, but if it is high the 3090 is waiting on PCIe.
++	if (copyDoneFenceA->GetCompletedValue() < slotTransfer[a_nextSlot])
++		++statGatePending;
 +	const HRESULT hr = context11->Wait(copyDoneFence11.get(), slotTransfer[a_nextSlot]);
 +	if (FAILED(hr))
 +		Fail("D3D11 Wait on the copy-done fence", hr);
 +	return hr;
++}
++
++// ---------------------------------------------------------------------------------------
++// Statistics
++
++void CrossAdapterBridge::CalibrateTimers()
++{
++	timerCopyA.Calibrate(copyQueueA.get());
++	if (copyQueueB)
++		timerCopyB.Calibrate(copyQueueB.get());
++	if (displayQueue)
++		timerDisplay.Calibrate(displayQueue);
++}
++
++void CrossAdapterBridge::CollectTimings(UINT a_slot)
++{
++	if (a_slot >= kSlots || !slotTransfer[a_slot] || !qpcFrequency.QuadPart)
++		return;
++
++	const double toMs = 1000.0 / static_cast<double>(qpcFrequency.QuadPart);
++	const double presentQpc = static_cast<double>(slotPresentQpc[a_slot].QuadPart);
++	const auto sincePresent = [&](double a_qpc) { return (a_qpc - presentQpc) * toMs; };
++
++	std::array<double, GpuTimer::kMaxMarks> copyA{};
++	std::array<double, GpuTimer::kMaxMarks> copyB{};
++	std::array<double, GpuTimer::kMaxMarks> display{};
++	UINT validA = 0;
++	UINT validB = 0;
++	UINT validDisplay = 0;
++
++	// The caller already waited for this slot's copy. The other two are checked, never waited
++	// for: if they are still running the sample is dropped (and the slot is re-armed).
++	timerCopyA.Read(a_slot, copyA, validA);
++	if (!asyncUnpack || (unpackFenceB && unpackFenceB->GetCompletedValue() >= slotUnpack[a_slot]))
++		timerCopyB.Read(a_slot, copyB, validB);
++	else
++		timerCopyB.written[a_slot] = 0;
++	if (displayDoneFenceB && displayDoneFenceB->GetCompletedValue() >= slotDisplayDone[a_slot])
++		timerDisplay.Read(a_slot, display, validDisplay);
++	else
++		timerDisplay.written[a_slot] = 0;
++
++	constexpr UINT kListBeginEnd = (1u << kMarkListBegin) | (1u << kMarkListEnd);
++	constexpr UINT kListUnpack = (1u << kMarkListBegin) | (1u << kMarkAfterUnpack);
++
++	// Both copy queues mark phases kMarkWorld, kMarkHudless, kMarkPresent, two marks each.
++	// Only phases that ran count, so the rendering between them is not reported as copy time;
++	// start/end are the first phase's start and the last phase's end.
++	const auto sumPhases = [](const std::array<double, GpuTimer::kMaxMarks>& a_marks, UINT a_valid, double& a_busy,
++							   double& a_start, double& a_end) {
++		bool any = false;
++		a_busy = 0.0;
++		for (UINT phase = 0; phase < 3; ++phase) {
++			const UINT bitStart = 1u << (phase * 2);
++			const UINT bitEnd = 1u << (phase * 2 + 1);
++			if (!(a_valid & bitStart) || !(a_valid & bitEnd))
++				continue;
++			a_busy += a_marks[phase * 2 + 1] - a_marks[phase * 2];
++			if (!any)
++				a_start = a_marks[phase * 2];
++			a_end = a_marks[phase * 2 + 1];
++			any = true;
++		}
++		return any;
++	};
++
++	double busy = 0.0;
++	double start = 0.0;
++	double end = 0.0;
++	if (sumPhases(copyA, validA, busy, start, end)) {
++		statCopyA.Add(busy * toMs);
++		if (timerCopyA.calibrated) {
++			statCopyAStart.Add(sincePresent(start));
++			statCopyAEnd.Add(sincePresent(end));
++		}
++	}
++
++	if (asyncUnpack) {
++		if (sumPhases(copyB, validB, busy, start, end)) {
++			statUnpack.Add(busy * toMs);
++			if (timerCopyB.calibrated) {
++				statUnpackStart.Add(sincePresent(start));
++				statUnpackEnd.Add(sincePresent(end));
++			}
++		}
++	} else if ((validDisplay & kListUnpack) == kListUnpack) {
++		// Serialised: the list starts once the transfer has landed and unpacks first.
++		statUnpack.Add((display[kMarkAfterUnpack] - display[kMarkListBegin]) * toMs);
++		if (timerDisplay.calibrated) {
++			statUnpackStart.Add(sincePresent(display[kMarkListBegin]));
++			statUnpackEnd.Add(sincePresent(display[kMarkAfterUnpack]));
++		}
++	}
++
++	if ((validDisplay & kListBeginEnd) == kListBeginEnd) {
++		statDisplayList.Add((display[kMarkListEnd] - display[kMarkListBegin]) * toMs);
++		if (timerDisplay.calibrated) {
++			statListStart.Add(sincePresent(display[kMarkListBegin]));
++			statListEnd.Add(sincePresent(display[kMarkListEnd]));
++		}
++	}
++
++	constexpr UINT kUpsample = (1u << kMarkUpsampleBegin) | (1u << kMarkUpsampleEnd);
++	if ((validDisplay & kUpsample) == kUpsample) {
++		statUpsample.Add((display[kMarkUpsampleEnd] - display[kMarkUpsampleBegin]) * toMs);
++		if (timerDisplay.calibrated)
++			statUpsampleEnd.Add(sincePresent(display[kMarkUpsampleEnd]));
++	}
 +}
 +
 +void CrossAdapterBridge::LogStats()
@@ -812,11 +2049,11 @@ index 0000000..8872eca
 +
 +	const double fps = static_cast<double>(statFrames) * 1000.0 / elapsedMs;
 +	const double mbPerFrame = static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0);
-+	if (statGpuCopySamples) {
-+		const double avgCopy = statGpuCopyMs / static_cast<double>(statGpuCopySamples);
++	if (statCopyA.count) {
++		const double avgCopy = statCopyA.Mean();
 +		REX::INFO("[FG-GPU1] {:.1f} game fps | {:.1f} MB/frame = {:.2f} GB/s | copy on render GPU avg {:.2f} ms max {:.2f} ms "
 +				  "(~{:.2f} GB/s link) | submit {:.3f} ms | max lag {} | cpu waits {}",
-+			fps, mbPerFrame, mbPerFrame * fps / 1024.0, avgCopy, statGpuCopyMaxMs,
++			fps, mbPerFrame, mbPerFrame * fps / 1024.0, avgCopy, statCopyA.max,
 +			avgCopy > 0.0 ? mbPerFrame / 1024.0 / (avgCopy / 1000.0) : 0.0,
 +			statCpuSubmitMs / static_cast<double>(statFrames), statMaxLag, statCpuWaits);
 +	} else {
@@ -825,31 +2062,101 @@ index 0000000..8872eca
 +			statCpuWaits);
 +	}
 +
++	// Display GPU: how long the read takes and how busy the direct queue is.
++	REX::INFO("[FG-GPU1] display GPU: unpack ({}) avg {:.2f} ms max {:.2f} ms | direct list avg {:.2f} ms max {:.2f} ms",
++		asyncUnpack ? "copy queue" : "direct queue", statUnpack.Mean(), statUnpack.max, statDisplayList.Mean(),
++		statDisplayList.max);
++
++	// One frame's path, in ms after the CPU entered Present for it (both GPUs on the CPU clock).
++	if (statCopyAStart.count && statListEnd.count) {
++		REX::INFO("[FG-GPU1] timeline ms after Present: 3090 copy {:.1f}-{:.1f} | 9060 unpack {:.1f}-{:.1f} | "
++				  "9060 list {:.1f}-{:.1f}",
++			statCopyAStart.Mean(), statCopyAEnd.Mean(), statUnpackStart.Mean(), statUnpackEnd.Mean(),
++			statListStart.Mean(), statListEnd.Mean());
++	}
++
++	// iHalfResDepthMV = 1: compare "done" with the unpack end above; earlier means it is hidden.
++	if (statUpsample.count) {
++		REX::INFO("[FG-GPU1] depth rebuild on display GPU avg {:.2f} ms max {:.2f} ms | done {:.1f} ms after Present",
++			statUpsample.Mean(), statUpsample.max, statUpsampleEnd.Mean());
++	}
++
++	// Back-pressure on the render thread: while it sits here, the 3090 gets no new work.
++	REX::INFO("[FG-GPU1] render thread blocked: FFX Present avg {:.2f} ms max {:.2f} ms | latency wait avg {:.2f} ms "
++			  "max {:.2f} ms | D3D11 gate pending {}/{}",
++		statPresentBlock.Mean(), statPresentBlock.max, statLatencyWait.Mean(), statLatencyWait.max, statGatePending,
++		statGateCalls);
++
 +	statFrames = 0;
-+	statGpuCopyMs = 0.0;
-+	statGpuCopySamples = 0;
-+	statGpuCopyMaxMs = 0.0;
++	statCopyA = {};
++	statUnpack = {};
++	statDisplayList = {};
++	statCopyAStart = {};
++	statCopyAEnd = {};
++	statUnpackStart = {};
++	statUnpackEnd = {};
++	statListStart = {};
++	statListEnd = {};
++	statUpsample = {};
++	statUpsampleEnd = {};
++	statPresentBlock = {};
++	statLatencyWait = {};
 +	statCpuSubmitMs = 0.0;
 +	statMaxLag = 0;
 +	statCpuWaits = 0;
++	statGatePending = 0;
++	statGateCalls = 0;
 +	statLastLog = now;
 +}
 +
 +void CrossAdapterBridge::Shutdown() noexcept
 +{
-+	if (copyQueueA && copyDoneFenceA && fenceEvent && transferValue)
-+		WaitCpu(copyDoneFenceA.get(), transferValue);
++	if (fenceEvent) {
++		if (copyQueueA && copyDoneFenceA && transferValue)
++			WaitCpu(copyDoneFenceA.get(), transferValue);
++		// A read started at a hook whose Present never came: signal it, or the wait below times out.
++		if (unpackStarted && copyQueueB && unpackFenceB)
++			copyQueueB->Signal(unpackFenceB.get(), unpackFrame);
++		const UINT64 lastUnpack = (std::max)(slotUnpack[0], slotUnpack[1]);
++		if (copyQueueB && unpackFenceB && lastUnpack)
++			WaitCpu(unpackFenceB.get(), lastUnpack);
++		if (displayDoneFenceB && displayDoneValue)
++			WaitCpu(displayDoneFenceB.get(), displayDoneValue);
++	}
 +	active = false;
++	asyncUnpack = true;
++	ResetUpsampler();
 +	lanes.clear();
 +	bytesPerFrame = 0;
++	currentSlot = 0;
 +	transferValue = 0;
 +	slotTransfer = {};
-+	timestampHeap = nullptr;
-+	timestampReadback = nullptr;
++	slotPresentQpc = {};
++	frameStarted = false;
++	frameSlot = 0;
++	nextLaneValue = 0;
++	laneValue = {};
++	laneFrame = {};
++	slotUnpack = {};
++	unpackStarted = false;
++	unpackFrame = 0;
++	laneUnpackFrame = {};
++	slotDisplayDone = {};
++	displayDoneValue = 0;
++	timerCopyA.Reset();
++	timerCopyB.Reset();
++	timerDisplay.Reset();
 +	listA = nullptr;
 +	for (auto& allocator : allocatorsA)
 +		allocator = nullptr;
 +	copyQueueA = nullptr;
++	listB = nullptr;
++	for (auto& allocator : allocatorsB)
++		allocator = nullptr;
++	copyQueueB = nullptr;
++	unpackFenceB = nullptr;
++	displayQueue = nullptr;
++	displayDoneFenceB = nullptr;
 +	transferFenceA = nullptr;
 +	transferFenceB = nullptr;
 +	consumedFenceA = nullptr;
@@ -866,10 +2173,10 @@ index 0000000..8872eca
 +}
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
 new file mode 100644
-index 0000000..5b4c9e5
+index 0000000..b357a49
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,397 @@
 +#pragma once
 +
 +// CrossAdapterBridge - frame generation on a second GPU.
@@ -885,10 +2192,22 @@ index 0000000..5b4c9e5
 +// and this class moves every input from A to B once per game frame:
 +//
 +//   D3D11 Signal(producer) -> A copy queue: Wait(producer), Wait(consumed[slot]),
-+//   CopyTextureRegion texture -> row-major buffer placed in a
-+//   D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER heap, Signal(transfer) + Signal(copyDone)
-+//   -> B direct queue: Wait(transfer), buffer -> texture (mirror or back buffer),
-+//   ... FFX ..., Signal(consumed)
++//   then per lane: CopyTextureRegion texture -> row-major buffer placed in a
++//   D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER heap, Signal(transfer = frame*kMaxLanes+lane);
++//   finally Signal(copyDone).
++//
++//   Async unpack (bAsyncUnpack=1, default): B copy queue, per lane:
++//   Wait(transfer of that lane), buffer -> texture (mirror or back buffer). A lane is
++//   unpacked as soon as it has crossed, so the two PCIe trips overlap instead of adding
++//   up, and B's direct queue never carries the 100+ MB read. Then Signal(consumed) +
++//   Signal(unpack); B direct queue Wait(unpack) before the FFX work of the frame.
++//   With bEarlyUnpack the reads of the early groups (depth/MVs, HUD-less) are submitted at
++//   their hooks, right after their copies, so B reads them before Present is even called.
++//
++//   Serialised unpack (bAsyncUnpack=0, the original path): B direct queue
++//   Wait(transfer of the last lane), unpack on the frame's direct list, FFX,
++//   Signal(consumed).
++//
 +//   D3D11 context: Wait(copyDone of the previous transfer) before the game
 +//   writes the slot again, so the render GPU never waits on PCIe for the
 +//   frame it is working on.
@@ -909,7 +2228,27 @@ index 0000000..5b4c9e5
 +class CrossAdapterBridge
 +{
 +public:
-+	static constexpr UINT kSlots = 2;  // AAAFrameGeneration double-buffers every input by frameIndex
++	// When a lane's source texture becomes final within the frame. The bridge starts the
++	// cross-PCIe copy at the hook that marks it instead of waiting for Present:
++	//   kWorld    depth and motion vectors, final after the world pass (PostAlpha)
++	//   kHudless  the UI-free frame, final after the HUD-less capture (PostDisplay)
++	//   kPresent  the finished frame, final only at Present
++	enum class LaneTiming : std::uint8_t { kWorld = 0, kHudless = 1, kPresent = 2 };
++
++	static constexpr UINT kSlots = 2;     // AAAFrameGeneration double-buffers every input by frameIndex
++	static constexpr UINT kMaxLanes = 8;  // per-lane transfer fence values are allocated in submission order
++
++	// Timestamp marks on B's direct list (MarkDisplayList).
++	static constexpr UINT kMarkListBegin = 0;
++	static constexpr UINT kMarkAfterUnpack = 1;  // after the serialised unpack; unused in async mode
++	static constexpr UINT kMarkListEnd = 2;      // also resolves the slot's queries
++	static constexpr UINT kMarkUpsampleBegin = 3;  // depth rebuild (iHalfResDepthMV = 1); runs before the
++	static constexpr UINT kMarkUpsampleEnd = 4;    // frame's list on the same queue, so its Resolve covers it
++
++	// Copy-timer marks on the render GPU's copy queue: two per phase, in frame order.
++	static constexpr UINT kMarkWorld = 0;
++	static constexpr UINT kMarkHudless = 2;
++	static constexpr UINT kMarkPresent = 4;
 +
 +	static CrossAdapterBridge* GetSingleton()
 +	{
@@ -935,26 +2274,56 @@ index 0000000..5b4c9e5
 +
 +	// a_deviceA: on the game's adapter. a_deviceB: on the secondary adapter.
 +	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).
++	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
 +	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-+		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11);
++		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack);
++
++	// Once B's direct queue (the FFX game queue) exists. Enables its timestamps and the
++	// fence that tells the unpack when the previous frame's direct-queue work is done.
++	void SetDisplayQueue(ID3D12CommandQueue* a_queueB);
 +
 +	[[nodiscard]] bool IsActive() const noexcept { return active; }
++	[[nodiscard]] bool IsAsyncUnpack() const noexcept { return asyncUnpack; }
 +
 +	// Registers one double-buffered input. a_sourcesA[slot] are single-subresource
 +	// textures on device A. With a_createMirror, same-sized textures are created on
-+	// device B and returned by Mirror(); without it, the caller unpacks the lane into
-+	// its own destination with RecordUnpackTo (used for the back buffer).
-+	// Returns the lane index, or -1 (logged; the bridge is deactivated).
++	// device B and returned by Mirror(); without it, the caller names a destination
++	// (the back buffer) per frame. Returns the lane index, or -1 (logged; the bridge
++	// is deactivated).
 +	int AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
-+		bool a_createMirror);
++		bool a_createMirror, LaneTiming a_timing = LaneTiming::kPresent);
 +
 +	[[nodiscard]] ID3D12Resource* Mirror(int a_lane, UINT a_slot) const noexcept;
 +
 +	// Once per game frame, after the D3D11 context signalled a_producerFenceA
-+	// (the fence object opened on device A) to a_producerValue. Records and
-+	// submits the A-side copies for a_slot and makes a_queueB wait for them.
-+	HRESULT Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
-+		ID3D12CommandQueue* a_queueB);
++	// (the fence object opened on device A) to a_producerValue. Finishes the frame's
++	// transfer: copies every lane the early hooks did not, signals copy-done (the D3D11
++	// gate and the next reuse of the slot wait for it) and updates the statistics.
++	HRESULT Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot);
++
++	// Called from the frame hook at which this lane group's sources become final (depth and
++	// motion vectors after the world pass, HUD-less after its capture). The first call of a
++	// frame also starts it (slot waits, allocator reset). No-op with no lanes of that timing.
++	HRESULT TransferGroup(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
++		LaneTiming a_timing);
++
++	[[nodiscard]] bool HasLanes(LaneTiming a_timing) const noexcept;
++
++	// --- Async path (IsAsyncUnpack) ---------------------------------------------------
++	// After Transfer: B's copy queue unpacks every lane of a_slot as soon as it lands
++	// (mirrors, and a_backBuffer for a_backBufferLane), releases the staging slot to A,
++	// and a_queueB waits for the unpack. Call before executing the frame's direct list.
++	HRESULT Unpack(UINT a_slot, int a_backBufferLane, ID3D12Resource* a_backBuffer, ID3D12CommandQueue* a_queueB);
++
++	// Early unpack (bEarlyUnpack): right after TransferGroup at a frame hook, B's copy queue is
++	// given the read of that group's lanes too, so it starts as soon as they land instead of
++	// at Present. Unpack then reads only what is left (the finished frame). No-op for kPresent,
++	// on the serialised path, or when no lane of that timing was sent this frame.
++	HRESULT UnpackGroup(UINT a_slot, LaneTiming a_timing);
++
++	// --- Serialised path (!IsAsyncUnpack) ---------------------------------------------
++	// a_queueB waits for the whole transfer of this frame.
++	HRESULT WaitTransfer(ID3D12CommandQueue* a_queueB);
 +
 +	// On B's command list for this frame: staging -> mirror for every mirrored lane.
 +	void RecordUnpack(ID3D12GraphicsCommandList* a_listB, UINT a_slot);
@@ -967,6 +2336,34 @@ index 0000000..5b4c9e5
 +	// After B executed the list that unpacked this frame.
 +	HRESULT SignalConsumed(ID3D12CommandQueue* a_queueB);
 +
++	// --- Half-resolution depth (iHalfResDepthMV = 1) ------------------------------------
++	// Depth crosses PCIe at half resolution and B rebuilds it at a_width x a_height (R32_FLOAT)
++	// with the compute shader in a_shaderPath, so FSR3 keeps working at full resolution.
++	// Call after SetDisplayQueue and before the depth lane is added. False (logged) leaves
++	// nothing behind; the caller then sends depth at full resolution.
++	bool CreateDepthUpsampler(UINT a_width, UINT a_height, const wchar_t* a_shaderPath);
++
++	// The half-resolution depth lane; its mirrors become the rebuild's source.
++	void SetDepthUpsampleLane(int a_lane);
++
++	// The rebuilt full-resolution depth FSR3 reads for a_slot; null when not rebuilding.
++	[[nodiscard]] ID3D12Resource* UpsampledDepth(UINT a_slot) const noexcept;
++
++	// Serialised path: on the frame's direct list, after RecordUnpack. (Async path: Unpack
++	// submits it on its own as soon as the depth lane has landed, while the rest still crosses.)
++	void RecordDepthUpsample(ID3D12GraphicsCommandList* a_listB, UINT a_slot);
++
++	// --- Both paths -------------------------------------------------------------------
++	// Timestamp on the frame's direct list on B (kMarkListBegin / kMarkAfterUnpack / kMarkListEnd).
++	void MarkDisplayList(ID3D12GraphicsCommandList* a_listB, UINT a_slot, UINT a_mark);
++
++	// After the frame's direct list was executed on a_queueB.
++	HRESULT SignalDisplayListDone(ID3D12CommandQueue* a_queueB);
++
++	// CPU time the render thread spent blocked in the FFX swap chain's Present and in
++	// the frame-latency wait after it. Both are back-pressure from the display GPU.
++	void AddPresentBlock(double a_presentMs, double a_latencyWaitMs);
++
 +	// After Present, before the game's D3D11 work for the next frame is recorded:
 +	// the D3D11 context waits (on the GPU) for the transfer that last read
 +	// a_nextSlot, which the next frame is about to overwrite. With strict
@@ -974,7 +2371,7 @@ index 0000000..5b4c9e5
 +	// not wait for the copy of the frame it just finished.
 +	HRESULT GateD3D11(UINT a_nextSlot);
 +
-+	// Every ~10 s: payload size, copy time, queue lag.
++	// Every ~10 s: payload size, copy time, queue lag, per-frame timeline.
 +	void LogStats();
 +
 +	void Shutdown() noexcept;
@@ -983,6 +2380,7 @@ index 0000000..5b4c9e5
 +	struct Lane
 +	{
 +		std::string name;
++		LaneTiming timing = LaneTiming::kPresent;
 +		D3D12_RESOURCE_DESC desc{};
 +		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};  // Offset relative to the slot base
 +		UINT64 slotStride = 0;
@@ -993,6 +2391,67 @@ index 0000000..5b4c9e5
 +		winrt::com_ptr<ID3D12Resource> stagingA;
 +		winrt::com_ptr<ID3D12Resource> stagingB;
 +		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> mirrorB;
++		bool mismatchLogged = false;
++	};
++
++	// GPU timestamps for one queue, kSlots x marks, converted to QPC ticks through
++	// GetClockCalibration so the two GPUs and the CPU share one timeline.
++	struct GpuTimer
++	{
++		static constexpr UINT kMaxMarks = 6;
++
++		winrt::com_ptr<ID3D12QueryHeap> heap;
++		winrt::com_ptr<ID3D12Resource> readback;
++		UINT marks = 0;
++		UINT64 frequency = 0;
++		bool calibrated = false;
++		UINT64 calibrationGpu = 0;
++		UINT64 calibrationQpc = 0;
++		std::array<UINT, kSlots> written{};  // bit per mark recorded since the slot was last read
++
++		bool Create(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, bool a_copyQueue, UINT a_marks);
++		void Calibrate(ID3D12CommandQueue* a_queue);
++		void Mark(ID3D12GraphicsCommandList* a_list, UINT a_slot, UINT a_mark);
++		void Resolve(ID3D12GraphicsCommandList* a_list, UINT a_slot);
++		// QPC ticks of every mark of a_slot; a_valid has a bit per mark that was written.
++		// Clears the slot. False when nothing was recorded or the readback failed.
++		bool Read(UINT a_slot, std::array<double, kMaxMarks>& a_qpc, UINT& a_valid);
++		[[nodiscard]] bool Valid() const noexcept { return heap && readback && frequency; }
++		void Reset() noexcept;
++	};
++
++	// iHalfResDepthMV = 1: B's compute pass from the half-resolution depth mirror to a
++	// full-resolution depth texture per slot.
++	struct DepthUpsampler
++	{
++		winrt::com_ptr<ID3D12RootSignature> rootSignature;
++		winrt::com_ptr<ID3D12PipelineState> pipeline;
++		winrt::com_ptr<ID3D12DescriptorHeap> descriptors;  // per slot: SRV (half-res mirror), UAV (target)
++		UINT descriptorSize = 0;
++		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> target;
++		// Async path: its own direct list, submitted ahead of the frame's list.
++		std::array<winrt::com_ptr<ID3D12CommandAllocator>, kSlots> allocators;
++		winrt::com_ptr<ID3D12GraphicsCommandList> list;
++		winrt::com_ptr<ID3D12Fence> sourceReadyFence;  // B copy queue: the depth lane of frame N has landed
++		int lane = -1;
++		UINT width = 0;
++		UINT height = 0;
++
++		[[nodiscard]] bool Ready() const noexcept { return pipeline && lane >= 0; }
++	};
++
++	struct Average
++	{
++		double sum = 0.0;
++		double max = 0.0;
++		UINT64 count = 0;
++		void Add(double a_value)
++		{
++			max = (count == 0 || a_value > max) ? a_value : max;
++			sum += a_value;
++			++count;
++		}
++		[[nodiscard]] double Mean() const { return count ? sum / static_cast<double>(count) : 0.0; }
 +	};
 +
 +	HRESULT CreateSharedFencePair(UINT64 a_initial, winrt::com_ptr<ID3D12Fence>& a_onA,
@@ -1002,7 +2461,42 @@ index 0000000..5b4c9e5
 +	HRESULT WaitCpu(ID3D12Fence* a_fence, UINT64 a_value);
 +	void Fail(const char* a_where, HRESULT a_hr);
 +
++	// Records staging(slot) -> a_dest with a_destState <-> COPY_DEST barriers.
++	// False (logged once per lane) when a_dest does not match the lane's size/pitch.
++	bool RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot, ID3D12Resource* a_dest,
++		D3D12_RESOURCE_STATES a_destState);
++
++	// Reads the timestamps the previous use of a_slot left behind (never blocks).
++	void CollectTimings(UINT a_slot);
++	void CalibrateTimers();
++
++	// First transfer of a frame: waits for the slot's previous copy, resets the slot's
++	// allocator and queues the consumed wait. Later phases of the same frame reuse it.
++	HRESULT PrepareFrame(UINT a_slot);
++
++	// One lane: texture -> staging on the copy queue, then its own transfer-fence value.
++	// a_markBase is kMarkWorld/kMarkHudless/kMarkPresent; the first and last lane of a phase
++	// bracket its timestamps, so the rendering between the phases is not counted as copy time.
++	HRESULT SubmitLane(Lane& a_lane, size_t a_laneIndex, UINT a_slot, UINT a_markBase, bool a_firstInPhase,
++		bool a_lastInPhase);
++
++	// First read of a frame on B's copy queue (at a hook or at Present): waits for the slot's
++	// previous unpack, resets its allocator, queues the wait for the slot's previous direct list.
++	// Closes a read that an earlier frame started but never finished.
++	HRESULT BeginUnpack(UINT a_slot);
++	// One read list per lane on B's copy queue, each waiting for its own transfer value.
++	// a_markBase is kMarkWorld/kMarkHudless/kMarkPresent; a_resolve on the frame's last call.
++	HRESULT SubmitUnpackLanes(UINT a_slot, const size_t* a_order, size_t a_count, UINT a_markBase, bool a_resolve,
++		int a_backBufferLane, ID3D12Resource* a_backBuffer);
++
++	// Depth rebuild: barriers + dispatch on a_list (timestamps included).
++	void RecordUpsampleCommands(ID3D12GraphicsCommandList* a_list, UINT a_slot);
++	// Async path: B's direct queue waits for the depth lane only, then runs the rebuild.
++	HRESULT SubmitDepthUpsample(UINT a_slot, UINT64 a_frame, ID3D12CommandQueue* a_queueB);
++	void ResetUpsampler() noexcept;
++
 +	bool active = false;
++	bool asyncUnpack = true;
 +
 +	winrt::com_ptr<ID3D12Device> deviceA;
 +	winrt::com_ptr<ID3D12Device> deviceB;
@@ -1012,7 +2506,23 @@ index 0000000..5b4c9e5
 +	std::array<winrt::com_ptr<ID3D12CommandAllocator>, kSlots> allocatorsA;
 +	winrt::com_ptr<ID3D12GraphicsCommandList> listA;
 +
-+	// A signals, B waits. Cross-adapter.
++	// Async unpack on the display GPU.
++	winrt::com_ptr<ID3D12CommandQueue> copyQueueB;
++	std::array<winrt::com_ptr<ID3D12CommandAllocator>, kSlots> allocatorsB;
++	winrt::com_ptr<ID3D12GraphicsCommandList> listB;
++	winrt::com_ptr<ID3D12Fence> unpackFenceB;  // B copy queue signals, B direct queue waits
++	std::array<UINT64, kSlots> slotUnpack{};   // frame whose unpack last used each slot's allocator
++	bool unpackStarted = false;                // a frame's read has been submitted in part (BeginUnpack)
++	UINT64 unpackFrame = 0;                    // ...for this frame
++	std::array<UINT64, kMaxLanes> laneUnpackFrame{};  // frame whose read of each lane was last submitted
++
++	// B's direct queue (FFX game queue). Not owned.
++	ID3D12CommandQueue* displayQueue = nullptr;
++	winrt::com_ptr<ID3D12Fence> displayDoneFenceB;  // B direct queue signals after each frame's list
++	UINT64 displayDoneValue = 0;
++	std::array<UINT64, kSlots> slotDisplayDone{};
++
++	// A signals, B waits. Cross-adapter. Per-lane values (see LaneValue).
 +	winrt::com_ptr<ID3D12Fence> transferFenceA;
 +	winrt::com_ptr<ID3D12Fence> transferFenceB;
 +	// B signals, A waits. Cross-adapter.
@@ -1024,25 +2534,43 @@ index 0000000..5b4c9e5
 +
 +	HANDLE fenceEvent = nullptr;
 +
-+	UINT64 transferValue = 0;                        // value of the latest Transfer
-+	std::array<UINT64, kSlots> slotTransfer{};       // transfer value that last used each slot
++	UINT currentSlot = 0;                                // slot of the latest Transfer
++	UINT64 transferValue = 0;                            // frame number of the latest Transfer
++	std::array<UINT64, kSlots> slotTransfer{};           // frame that last used each slot
++	std::array<LARGE_INTEGER, kSlots> slotPresentQpc{};  // CPU time Transfer was called for that frame
++
++	// Early transfer: the frame is started by the first hook that has data ready.
++	bool frameStarted = false;                          // a frame hook ran before Present
++	UINT frameSlot = 0;                                 // slot of the frame being assembled
++	UINT64 nextLaneValue = 0;                           // next per-lane transfer fence value
++	std::array<UINT64, kMaxLanes> laneValue{};          // value signalled for each lane this frame
++	std::array<UINT64, kMaxLanes> laneFrame{};          // frame that last copied each lane
 +
 +	std::vector<Lane> lanes;
 +	UINT64 bytesPerFrame = 0;
 +
-+	// Copy-queue GPU timestamps, when the driver supports them.
-+	winrt::com_ptr<ID3D12QueryHeap> timestampHeap;
-+	winrt::com_ptr<ID3D12Resource> timestampReadback;
-+	UINT64 timestampFrequency = 0;
++	DepthUpsampler upsampler;
++
++	GpuTimer timerCopyA;    // render GPU copy queue: first lane start, last lane end
++	GpuTimer timerCopyB;    // display GPU copy queue (async unpack): two marks per phase, like timerCopyA
++	GpuTimer timerDisplay;  // display GPU direct queue: list begin, after unpack, list end
 +
 +	// Statistics since the last LogStats.
 +	UINT64 statFrames = 0;
-+	double statGpuCopyMs = 0.0;
-+	UINT64 statGpuCopySamples = 0;
-+	double statGpuCopyMaxMs = 0.0;
++	Average statCopyA;        // ms, render GPU copy (all lanes)
++	Average statUnpack;       // ms, display GPU unpack (copy queue, or the serialised part of the direct list)
++	Average statDisplayList;  // ms, display GPU direct list
++	// Timeline in ms after the CPU entered Present for that frame (both GPUs calibrated to QPC).
++	Average statCopyAStart, statCopyAEnd, statUnpackStart, statUnpackEnd, statListStart, statListEnd;
++	Average statUpsample;      // ms, depth rebuild on the display GPU (iHalfResDepthMV = 1)
++	Average statUpsampleEnd;   // ms after Present at which it finished
++	Average statPresentBlock;  // ms the render thread sat in the FFX swap chain's Present
++	Average statLatencyWait;   // ms in the frame-latency wait after it
 +	double statCpuSubmitMs = 0.0;
 +	UINT64 statMaxLag = 0;
 +	UINT64 statCpuWaits = 0;
++	UINT64 statGatePending = 0;  // GateD3D11 found the copy it queues a wait for still running
++	UINT64 statGateCalls = 0;
 +	LARGE_INTEGER statLastLog{};
 +	LARGE_INTEGER qpcFrequency{};
 +};
@@ -1141,7 +2669,7 @@ index 81be80f..5f5de78 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..e535f21 100644
+index e10d528..80c0a23 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
 @@ -3,6 +3,7 @@
@@ -1152,7 +2680,7 @@ index e10d528..e535f21 100644
  #include "FidelityFX.h"
  #include "Streamline.h"
  #include "UICompositor.h"
-@@ -29,6 +30,42 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
+@@ -29,6 +30,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
  	REX::INFO("[FG] D3D12 device created");
  }
  
@@ -1184,7 +2712,8 @@ index e10d528..e535f21 100644
 +	if (FAILED(hr))
 +		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 +
-+	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get()))
++	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
++			upscaling->settings.asyncUnpack))
 +		return fallBack("cross-adapter bridge initialisation failed");
 +
 +	secondaryGPU = true;
@@ -1195,7 +2724,40 @@ index e10d528..e535f21 100644
  void DX12SwapChain::CreateD3D12CommandQueues()
  {
  	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-@@ -145,9 +182,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -44,9 +82,32 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+ 		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
+ 		commandLists[i]->Close();
+ 	}
++	if (secondaryGPU)
++		CrossAdapterBridge::GetSingleton()->SetDisplayQueue(commandQueue.get());
+ 	REX::INFO("[FG] D3D12 command queues created");
+ }
+ 
++void DX12SwapChain::TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing)
++{
++	auto upscaling = Upscaling::GetSingleton();
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	if (!secondaryGPU || !bridge->IsActive() || !upscaling->settings.earlyTransfer)
++		return;
++	if (!d3d11Context || !d3d11Fence || !d3d12Fence || !bridge->HasLanes(a_timing))
++		return;
++
++	// The D3D11 signal orders the copy after the game's work that produced these lanes.
++	if (FAILED(d3d11Context->Signal(d3d11Fence.get(), ++fenceValue)))
++		return;
++	if (FAILED(bridge->TransferGroup(d3d12Fence.get(), fenceValue, frameIndex, a_timing)))
++		return;
++
++	// bEarlyUnpack: queue the display GPU's read of these lanes now too, so it starts as soon as
++	// they land instead of when Present is called. Present then reads only the finished frame.
++	if (upscaling->settings.earlyUnpack && bridge->IsAsyncUnpack())
++		bridge->UnpackGroup(frameIndex, a_timing);
++}
++
+ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
+ {
+ 	swapChainDesc = {};
+@@ -145,9 +206,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -1211,7 +2773,7 @@ index e10d528..e535f21 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +207,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +231,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -1220,7 +2782,7 @@ index e10d528..e535f21 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +220,16 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +244,16 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -1239,7 +2801,7 @@ index e10d528..e535f21 100644
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -239,17 +288,41 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +312,53 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -1254,16 +2816,24 @@ index e10d528..e535f21 100644
 +	}
 +
  	// Wait for D3D11 to finish
- 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+-	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 -	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+-	fenceValue++;
++	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), ++fenceValue));
 +	if (crossAdapter) {
-+		// Render-GPU copy queue waits for D3D11, copies every lane into the cross-adapter
-+		// heap, and our (secondary-GPU) queue waits for that copy.
-+		bridge->Transfer(d3d12Fence.get(), fenceValue, frameIndex, commandQueue.get());
++		// Render-GPU copy queue waits for D3D11 and copies every lane into the cross-adapter
++		// heap, lane by lane. Then either our copy queue unpacks each lane as it lands and
++		// the direct queue waits for that (async), or the direct queue waits for the whole
++		// transfer and unpacks itself below (serialised).
++		if (SUCCEEDED(bridge->Transfer(d3d12Fence.get(), fenceValue, frameIndex))) {
++			if (bridge->IsAsyncUnpack())
++				bridge->Unpack(frameIndex, finalFrameLane, swapChainBuffers[frameIndex].get(), commandQueue.get());
++			else
++				bridge->WaitTransfer(commandQueue.get());
++		}
 +	} else if (!secondaryGPU) {
 +		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 +	}
- 	fenceValue++;
  
  	// New frame, reset
  	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
@@ -1272,11 +2842,17 @@ index e10d528..e535f21 100644
 -	// Transfer frame to swap chain buffer
 -	{
 +	if (crossAdapter) {
-+		// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
-+		// the finished frame into the back buffer.
-+		bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
-+		bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
-+			swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
++		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkListBegin);
++		if (!bridge->IsAsyncUnpack()) {
++			// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
++			// the finished frame into the back buffer.
++			bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
++			bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
++				swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
++			// iHalfResDepthMV = 1: full-resolution depth for FSR3 from the half-resolution mirror.
++			bridge->RecordDepthUpsample(commandLists[frameIndex].get(), frameIndex);
++		}
++		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkAfterUnpack);
 +	}
 +
 +	// Transfer frame to swap chain buffer (single-GPU path)
@@ -1284,21 +2860,44 @@ index e10d528..e535f21 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -370,6 +443,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -361,6 +470,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
+ 	}
+ 
++	if (crossAdapter)
++		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkListEnd);
++
+ 	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
+ 
+ 	// Bracket GPU work submission with render markers
+@@ -370,6 +482,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
-+	// The staging area of this slot has been unpacked; the render GPU may overwrite it.
-+	if (crossAdapter)
-+		bridge->SignalConsumed(commandQueue.get());
++	if (crossAdapter) {
++		// Serialised: the staging area of this slot has been unpacked by this list; the
++		// render GPU may overwrite it. (Async: the unpack queue already signalled that.)
++		if (!bridge->IsAsyncUnpack())
++			bridge->SignalConsumed(commandQueue.get());
++		bridge->SignalDisplayListDone(commandQueue.get());
++	}
 +
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -447,6 +524,41 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +565,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
+ 	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
++	// The FFX swap chain blocks here until the frame before this one has been presented
++	// (two replacement back buffers). Timed, because while the render thread waits here
++	// the 3090 gets no new work.
++	LARGE_INTEGER presentStart{};
++	QueryPerformanceCounter(&presentStart);
  	DX::ThrowIfFailed(swapChain->Present(SyncInterval, Flags));
- 
++	LARGE_INTEGER presentEnd{};
++	QueryPerformanceCounter(&presentEnd);
++
 +	// Diagnostics: the swap chain counts every Present, including the frames FSR3 inserts,
 +	// so this is the only place that shows whether frame generation actually doubles.
 +	{
@@ -1333,11 +2932,25 @@ index e10d528..e535f21 100644
 +			statPresentStart = now;
 +		}
 +	}
-+
+ 
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
+@@ -457,9 +619,28 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	if (frameLatencyWaitableObject)
+ 		WaitForSingleObjectEx(frameLatencyWaitableObject, INFINITE, TRUE);
  
-@@ -460,6 +572,13 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
++	if (crossAdapter) {
++		LARGE_INTEGER waitEnd{};
++		QueryPerformanceCounter(&waitEnd);
++		static const double qpcToMs = [] {
++			LARGE_INTEGER f;
++			QueryPerformanceFrequency(&f);
++			return 1000.0 / static_cast<double>(f.QuadPart);
++		}();
++		bridge->AddPresentBlock(static_cast<double>(presentEnd.QuadPart - presentStart.QuadPart) * qpcToMs,
++			static_cast<double>(waitEnd.QuadPart - presentEnd.QuadPart) * qpcToMs);
++	}
++
  	// Update the frame index
  	frameIndex = swapChain->GetCurrentBackBufferIndex();
  
@@ -1352,10 +2965,18 @@ index e10d528..e535f21 100644
  	upscaling->Reset();
  
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.h b/plugins/FrameGeneration/src/DX12SwapChain.h
-index 692f459..e5040e1 100644
+index 692f459..15205cf 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.h
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.h
-@@ -91,11 +91,30 @@ public:
+@@ -10,6 +10,7 @@
+ #include <d3d12.h>
+ 
+ #include "Buffer.h"
++#include "CrossAdapterBridge.h"
+ 
+ class WrappedResource
+ {
+@@ -91,11 +92,30 @@ public:
  	UINT frameIndex = 0;
  	UINT64 fenceValue = 0;
  
@@ -1386,8 +3007,59 @@ index 692f459..e5040e1 100644
  	void CreateD3D12CommandQueues();
  	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC swapChainDesc);
  	void CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc);
+@@ -109,6 +129,9 @@ public:
+ 	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
+ 
+ 	HRESULT GetBuffer(void** ppSurface);
++	// Frame generation on a second GPU: called from the frame hook at which a group of lanes
++	// becomes final (world pass, HUD-less capture), so their PCIe copy starts before Present.
++	void TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing);
+ 	HRESULT Present(UINT SyncInterval, UINT Flags);
+ 	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
+ };
+diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
+index 9fa46df..feeb677 100644
+--- a/plugins/FrameGeneration/src/FidelityFX.cpp
++++ b/plugins/FrameGeneration/src/FidelityFX.cpp
+@@ -126,18 +126,31 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+ 
+ 		auto screenSize = float2(float(gameViewport->screenWidth), float(gameViewport->screenHeight));
+ 		auto renderSize = float2(screenSize.x * renderTargetManager->dynamicWidthRatio, screenSize.y * renderTargetManager->dynamicHeightRatio);
++		uint renderWidth = static_cast<uint>(renderSize.x);
++		uint renderHeight = static_cast<uint>(renderSize.y);
++		float jitterScale = 1.0f;
++
++		// FG-GPU1 iHalfResDepthMV = 2: depth and motion vectors crossed PCIe at half resolution,
++		// so FSR3 works at half the render size. The motion vectors are in UV units (scale ==
++		// render size), so their scale follows the render size; the jitter is in render pixels.
++		if (upscaling->halfResMode == 2) {
++			renderWidth = (renderWidth + 1) / 2;
++			renderHeight = (renderHeight + 1) / 2;
++			renderSize = float2(static_cast<float>(renderWidth), static_cast<float>(renderHeight));
++			jitterScale = 0.5f;
++		}
+ 
+ 		dispatchParameters.motionVectorScale.x = renderSize.x;
+ 		dispatchParameters.motionVectorScale.y = renderSize.y;
+-		dispatchParameters.renderSize.width = static_cast<uint>(renderSize.x);
+-		dispatchParameters.renderSize.height = static_cast<uint>(renderSize.y);
+-		
++		dispatchParameters.renderSize.width = renderWidth;
++		dispatchParameters.renderSize.height = renderHeight;
++
+ 		float2 jitter;
+ 		jitter.x = -gameViewport->offsetX * screenSize.x / 2.0f;
+ 		jitter.y = gameViewport->offsetY * screenSize.y / 2.0f;
+ 
+-		dispatchParameters.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio;
+-		dispatchParameters.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio;
++		dispatchParameters.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale;
++		dispatchParameters.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale;
+ 
+ 		dispatchParameters.frameTimeDelta = deltaTime * 1000.f;
+ 
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..4ede4e3 100644
+index 3483d96..1fdc7c5 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
 @@ -2,6 +2,7 @@
@@ -1398,7 +3070,26 @@ index 3483d96..4ede4e3 100644
  #include "DX12SwapChain.h"
  #include "DirectXMath.h"
  
-@@ -131,6 +132,14 @@ void Upscaling::LoadSettings()
+@@ -79,7 +80,8 @@ enum class DepthStencilTarget
+ 	kCount = 13
+ };
+ 
+-ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramType, const char* Program = "main")
++ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramType, const char* Program = "main",
++	const D3D_SHADER_MACRO* Defines = nullptr)
+ {
+ 	auto rendererData = RE::BSGraphics::GetRendererData();
+ 	auto device = reinterpret_cast<ID3D11Device*>(rendererData->device);
+@@ -99,7 +101,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
+ 		REX::ERROR("Failed to compile shader; {} does not exist", str);
+ 		return nullptr;
+ 	}
+-	if (FAILED(D3DCompileFromFile(FilePath, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, Program, ProgramType, flags, 0, &shaderBlob, &shaderErrors))) {
++	if (FAILED(D3DCompileFromFile(FilePath, Defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, Program, ProgramType, flags, 0, &shaderBlob, &shaderErrors))) {
+ 		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
+ 		if (shaderErrors) shaderErrors->Release();
+ 		if (shaderBlob) shaderBlob->Release();
+@@ -131,6 +133,18 @@ void Upscaling::LoadSettings()
  	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
  	// MCM stepper is 0-indexed (0=2x, 1=3x, 2=4x) but we store as numFramesToGenerate (1, 2, 3)
  	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
@@ -1410,10 +3101,14 @@ index 3483d96..4ede4e3 100644
 +		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bSendHudlessFrame", true);
 +	else
 +		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bTransportHudLess", true);
++	settings.asyncUnpack = ini.GetBoolValue("Settings", "bAsyncUnpack", true);
++	settings.earlyTransfer = ini.GetBoolValue("Settings", "bEarlyTransfer", true);
++	settings.earlyUnpack = ini.GetBoolValue("Settings", "bEarlyUnpack", true);
++	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iHalfResDepthMV", 1)), 0, 2);
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +147,10 @@ void Upscaling::LoadSettings()
+@@ -138,6 +152,19 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -1421,18 +3116,65 @@ index 3483d96..4ede4e3 100644
 +			settings.secondaryGPU, settings.secondaryGPUName);
 +		REX::INFO("[Frame Generation] bSendHudlessFrame: {} (extra UI-free frame; off = less PCIe, HUD smears)",
 +			settings.sendHudlessFrame);
++		REX::INFO("[Frame Generation] bAsyncUnpack: {} (secondary GPU unpacks on a copy queue as each buffer arrives)",
++			settings.asyncUnpack);
++		REX::INFO("[Frame Generation] bEarlyTransfer: {} (depth/MVs/HUD-less cross during the frame, not at Present)",
++			settings.earlyTransfer);
++		REX::INFO("[Frame Generation] bEarlyUnpack: {} (secondary GPU reads depth/MVs/HUD-less as they land, not at Present)",
++			settings.earlyUnpack);
++		REX::INFO("[Frame Generation] iHalfResDepthMV: {} (0=full, 1=half-res depth rebuilt on the display GPU, "
++				  "2=half-res depth and motion vectors)",
++			settings.halfResDepthMV);
  		loggedOnce = true;
  	}
  }
-@@ -169,6 +182,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,6 +196,15 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
 +	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++
++	D3D11_TEXTURE2D_DESC mainDesc{};
++	reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
++	SetupHalfResDepthMV(mainDesc.Width, mainDesc.Height);
++	// Latched with the lanes below; a later settings reload must not change it mid-session.
++	hudlessActive = settings.sendHudlessFrame;
++	const UINT halfWidth = (mainDesc.Width + 1) / 2;
++	const UINT halfHeight = (mainDesc.Height + 1) / 2;
  
  	for (int index = 0; index < 2; index++) {
  		D3D11_TEXTURE2D_DESC texDesc{};
-@@ -234,8 +248,6 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -204,6 +240,10 @@ void Upscaling::CreateFrameGenerationResources()
+ 		rtvDesc.Format = texDesc.Format;
+ 		uavDesc.Format = texDesc.Format;
+ 
++		// FG-GPU1 iHalfResDepthMV: depth crosses PCIe at half resolution (modes 1 and 2).
++		texDesc.Width = halfResMode ? halfWidth : mainDesc.Width;
++		texDesc.Height = halfResMode ? halfHeight : mainDesc.Height;
++
+ 		depthBufferShared[index] = new Texture2D(texDesc);
+ 		depthBufferShared[index]->CreateSRV(srvDesc);
+ 		depthBufferShared[index]->CreateRTV(rtvDesc);
+@@ -218,6 +258,10 @@ void Upscaling::CreateFrameGenerationResources()
+ 		rtvDesc.Format = texDesc.Format;
+ 		uavDesc.Format = texDesc.Format;
+ 
++		// Motion vectors only at half resolution in mode 2.
++		texDesc.Width = halfResMode == 2 ? halfWidth : mainDesc.Width;
++		texDesc.Height = halfResMode == 2 ? halfHeight : mainDesc.Height;
++
+ 		motionVectorBufferShared[index] = new Texture2D(texDesc);
+ 		motionVectorBufferShared[index]->CreateSRV(srvDesc);
+ 		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
+@@ -228,14 +272,14 @@ void Upscaling::CreateFrameGenerationResources()
+ 		srvDesc.Format = texDesc.Format;
+ 		rtvDesc.Format = texDesc.Format;
+ 		uavDesc.Format = texDesc.Format;
++		texDesc.Width = mainDesc.Width;
++		texDesc.Height = mainDesc.Height;
+ 
+ 		UIColorAlphaShared[index] = new Texture2D(texDesc);
+ 		UIColorAlphaShared[index]->CreateSRV(srvDesc);
  		UIColorAlphaShared[index]->CreateRTV(rtvDesc);
  		UIColorAlphaShared[index]->CreateUAV(uavDesc);
  
@@ -1441,7 +3183,7 @@ index 3483d96..4ede4e3 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +260,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +292,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -1450,7 +3192,7 @@ index 3483d96..4ede4e3 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +280,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +312,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -1459,7 +3201,7 @@ index 3483d96..4ede4e3 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +300,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +332,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -1468,7 +3210,7 @@ index 3483d96..4ede4e3 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +320,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +352,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -1477,7 +3219,7 @@ index 3483d96..4ede4e3 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,6 +329,33 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,6 +361,50 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
@@ -1486,21 +3228,38 @@ index 3483d96..4ede4e3 100644
 +	// instead (FidelityFX::Present reads the *Shared12 arrays). UIColorAlpha is DLSS-G only.
 +	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain) {
 +		auto bridge = CrossAdapterBridge::GetSingleton();
-+		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2]) {
-+			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true);
++		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2],
++			CrossAdapterBridge::LaneTiming a_timing) {
++			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true, a_timing);
 +			if (lane < 0) {
 +				REX::CRITICAL("[FG-GPU1] cannot transport '{}'; frame generation will read stale data", a_name);
-+				return;
++				return lane;
 +			}
 +			for (UINT slot = 0; slot < 2; ++slot)
 +				a_resources[slot].copy_from(bridge->Mirror(lane, slot));
++			return lane;
 +		};
-+		if (settings.sendHudlessFrame)
-+			transport("HUD-less colour", HUDLessBufferShared12);
-+		transport("depth", depthBufferShared12);
-+		transport("motion vectors", motionVectorBufferShared12);
++		// Registered in the order the data becomes final: the display GPU starts reading the
++		// world-pass lanes while the 3090 is still finishing the frame. Depth first: in
++		// iHalfResDepthMV = 1 the display GPU rebuilds it while the other lanes still cross.
++		const int depthLane = transport(halfResMode ? "depth (half res)" : "depth", depthBufferShared12,
++			CrossAdapterBridge::LaneTiming::kWorld);
++		if (halfResMode == 1 && depthLane >= 0) {
++			// FSR3 reads the full-resolution depth rebuilt from the half-resolution mirror.
++			bridge->SetDepthUpsampleLane(depthLane);
++			if (bridge->UpsampledDepth(0) && bridge->UpsampledDepth(1)) {
++				for (UINT slot = 0; slot < 2; ++slot)
++					depthBufferShared12[slot].copy_from(bridge->UpsampledDepth(slot));
++			} else {
++				REX::CRITICAL("[FG-GPU1] depth rebuild unavailable; FSR3 gets half-resolution depth at full render size. Set iHalfResDepthMV=0 or 2");
++			}
++		}
++		transport(halfResMode == 2 ? "motion vectors (half res)" : "motion vectors", motionVectorBufferShared12,
++			CrossAdapterBridge::LaneTiming::kWorld);
++		if (hudlessActive)
++			transport("HUD-less colour", HUDLessBufferShared12, CrossAdapterBridge::LaneTiming::kHudless);
 +	}
-+	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !settings.sendHudlessFrame) {
++	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !hudlessActive) {
 +		// FSR3 treats an empty HUDLessColor as "use the back buffer", so the UI is
 +		// interpolated with the scene and smears a little. Saves one full frame across PCIe.
 +		for (auto& resource : HUDLessBufferShared12)
@@ -1511,12 +3270,140 @@ index 3483d96..4ede4e3 100644
  	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
  	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
  	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
-@@ -558,14 +597,16 @@ void Upscaling::PostDisplay()
+@@ -324,6 +412,49 @@ void Upscaling::CreateFrameGenerationResources()
+ 	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
+ }
+ 
++void Upscaling::SetupHalfResDepthMV(UINT a_width, UINT a_height)
++{
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	auto bridge = CrossAdapterBridge::GetSingleton();
++
++	// Only worth it when depth and motion vectors cross PCIe. Read once: the shared buffers and
++	// lanes are sized for it, so a later settings reload cannot change it.
++	halfResMode = (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && bridge->IsActive()) ?
++	                  settings.halfResDepthMV :
++	                  0;
++	if (!halfResMode)
++		return;
++
++	const char* halfMotion = halfResMode == 2 ? "1" : "0";
++	const D3D_SHADER_MACRO postAlpha[] = { { "ALPHA_MASK", "1" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
++	const D3D_SHADER_MACRO copyOnly[] = { { "ALPHA_MASK", "0" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
++	constexpr auto kShader = L"Data\\F4SE\\Plugins\\FrameGeneration\\HalfResDepthMVCS.hlsl";
++	halfResPostAlphaCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", postAlpha);
++	halfResCopyCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", copyOnly);
++
++	bool ready = halfResPostAlphaCS && halfResCopyCS;
++	if (!ready)
++		REX::ERROR("[FG-GPU1] HalfResDepthMVCS.hlsl did not compile; sending depth and motion vectors at full resolution");
++	if (ready && halfResMode == 1)
++		ready = bridge->CreateDepthUpsampler(a_width, a_height, L"Data\\F4SE\\Plugins\\FrameGeneration\\DepthFromHalfResCS.hlsl");
++
++	if (!ready) {
++		if (halfResPostAlphaCS)
++			halfResPostAlphaCS->Release();
++		if (halfResCopyCS)
++			halfResCopyCS->Release();
++		halfResPostAlphaCS = nullptr;
++		halfResCopyCS = nullptr;
++		halfResMode = 0;
++		return;
++	}
++
++	REX::INFO("[FG-GPU1] iHalfResDepthMV={}: depth{} cross at {}x{}{}", halfResMode,
++		halfResMode == 2 ? " and motion vectors" : "", (a_width + 1) / 2, (a_height + 1) / 2,
++		halfResMode == 1 ? "; depth is rebuilt at full resolution on the display GPU" :
++	                       "; FSR3 works at half resolution");
++}
++
+ void Upscaling::PreAlpha()
+ {
+ 	auto rendererData = RE::BSGraphics::GetRendererData();
+@@ -358,10 +489,13 @@ void Upscaling::PostAlpha()
+ 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
+ 
+ 		{
+-			uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
+-			uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
++			// iHalfResDepthMV: one thread per 2x2 block, same inputs and outputs.
++			const UINT threadsX = halfResMode ? (dx12SwapChain->swapChainDesc.Width + 1) / 2 : dx12SwapChain->swapChainDesc.Width;
++			const UINT threadsY = halfResMode ? (dx12SwapChain->swapChainDesc.Height + 1) / 2 : dx12SwapChain->swapChainDesc.Height;
++			uint32_t dispatchX = (threadsX + 7) / 8;
++			uint32_t dispatchY = (threadsY + 7) / 8;
+ 
+-			ID3D11ShaderResourceView* views[4] = { 
++			ID3D11ShaderResourceView* views[4] = {
+ 				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
+ 				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
+ 				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
+@@ -373,12 +507,12 @@ void Upscaling::PostAlpha()
+ 			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
+ 			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+ 
+-			context->CSSetShader(generateSharedBuffersCS, nullptr, 0);
++			context->CSSetShader(halfResMode ? halfResPostAlphaCS : generateSharedBuffersCS, nullptr, 0);
+ 
+ 			context->Dispatch(dispatchX, dispatchY, 1);
+ 		}
+ 
+-		ID3D11ShaderResourceView* views[3] = { nullptr, nullptr, nullptr };
++		ID3D11ShaderResourceView* views[4] = { nullptr, nullptr, nullptr, nullptr };
+ 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+ 
+ 		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
+@@ -387,6 +521,9 @@ void Upscaling::PostAlpha()
+ 		ID3D11ComputeShader* shader = nullptr;
+ 		context->CSSetShader(shader, nullptr, 0);
+ 	}
++
++	// Depth and motion vectors are final now: start their PCIe copy instead of waiting for Present.
++	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kWorld);
+ }
+ 
+ void Upscaling::CopyBuffersToSharedResources()
+@@ -405,8 +542,34 @@ void Upscaling::CopyBuffersToSharedResources()
+ 	context->OMSetRenderTargets(0, nullptr, nullptr);
+ 
+ 	auto& motionVector = rendererData->renderTargets[(uint)RenderTarget::kMotionVectors];
++
++	if (halfResMode) {
++		// iHalfResDepthMV: the shared buffers are smaller than the game's, so one pass shrinks
++		// depth (and, in mode 2, motion vectors) instead of the copies below.
++		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
++		const UINT threadsX = (dx12SwapChain->swapChainDesc.Width + 1) / 2;
++		const UINT threadsY = (dx12SwapChain->swapChainDesc.Height + 1) / 2;
++
++		ID3D11ShaderResourceView* views[4] = { nullptr, nullptr,
++			reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
++			reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
++		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
++		ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(),
++			depthBufferShared[dx12SwapChain->frameIndex]->uav.get() };
++		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
++		context->CSSetShader(halfResCopyCS, nullptr, 0);
++		context->Dispatch((threadsX + 7) / 8, (threadsY + 7) / 8, 1);
++
++		ID3D11ShaderResourceView* nullViews[4] = { nullptr, nullptr, nullptr, nullptr };
++		context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
++		ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
++		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
++		context->CSSetShader(nullptr, nullptr, 0);
++		return;
++	}
++
+ 	context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
+-		
++
+ 	{
+ 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
+ 
+@@ -558,14 +721,16 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
 +	auto dx12SwapChain = DX12SwapChain::GetSingleton();
-+	if (dx12SwapChain->secondaryGPU && !settings.sendHudlessFrame)
++	if (dx12SwapChain->secondaryGPU && !hudlessActive)
 +		return;  // nothing reads the HUD-less buffer, so don't spend bandwidth on the copy
 +
  	auto rendererData = RE::BSGraphics::GetRendererData();
@@ -1530,17 +3417,61 @@ index 3483d96..4ede4e3 100644
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource);
  
+@@ -574,6 +739,9 @@ void Upscaling::PostDisplay()
+ 		REX::INFO("[FG] PostDisplay captured HUDLess (frameIdx={})", dx12SwapChain->frameIndex);
+ 		loggedOnce = true;
+ 	}
++
++	// The UI-free frame is final now: start its PCIe copy instead of waiting for Present.
++	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kHudless);
+ }
+ 
+ void Upscaling::GenerateUIBuffer()
 diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
-index 838f927..a078580 100644
+index 838f927..1e78966 100644
 --- a/plugins/FrameGeneration/src/Upscaling.h
 +++ b/plugins/FrameGeneration/src/Upscaling.h
-@@ -23,6 +23,9 @@ public:
+@@ -23,10 +23,25 @@ public:
  		bool debugLogging = false;
  		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
  		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
 +		bool secondaryGPU = false;       ///< Run FSR3 FG and present on a second GPU (the one driving the monitor)
 +		std::string secondaryGPUName;    ///< Optional: substring of the secondary GPU's name, if auto-selection is ambiguous
 +		bool sendHudlessFrame = true;    ///< Send the extra UI-free frame (off = less PCIe, HUD smears)
++		bool asyncUnpack = true;         ///< Secondary GPU unpacks on a copy queue, lane by lane (off = on the direct queue)
++		bool earlyTransfer = true;       ///< Copy depth/MVs/HUD-less at their frame hooks, not at Present
++		bool earlyUnpack = true;         ///< ...and queue the display GPU's read of them there too
++		int halfResDepthMV = 1;          ///< 0 full, 1 depth at half res (rebuilt on the display GPU), 2 depth + MVs at half res
  	};
  
  	Settings settings;
+ 
++	// What CreateFrameGenerationResources set up from settings.halfResDepthMV (0 when not on a
++	// second GPU or when setup failed). Fixed for the session: the buffers and lanes are sized for it.
++	int halfResMode = 0;
++	// Whether CreateFrameGenerationResources registered the HUD-less lane (settings.sendHudlessFrame
++	// at that time). Fixed for the session, so changing the setting in MCM waits for a restart
++	// instead of leaving FSR3 with a lane that is no longer filled.
++	bool hudlessActive = true;
++
+ 	bool highFPSPhysicsFixLoaded = false;
+ 
+ 	FrameGenType activeFrameGenType = FrameGenType::kFSR3;
+@@ -46,6 +61,8 @@ public:
+ 	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
+ 	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
+ 	ID3D11ComputeShader* generateUIBufferCS = nullptr;
++	ID3D11ComputeShader* halfResPostAlphaCS = nullptr;  // halfResMode: GenerateSharedBuffersCS at half res
++	ID3D11ComputeShader* halfResCopyCS = nullptr;       // halfResMode: the no-reticle copy at half res
+ 
+ 	bool setupBuffers = false;
+ 
+@@ -57,6 +74,8 @@ public:
+ 	void PostPostLoad();
+ 
+ 	void CreateFrameGenerationResources();
++	// Decides halfResMode and compiles what it needs; falls back to 0 (logged) on any failure.
++	void SetupHalfResDepthMV(UINT a_width, UINT a_height);
+ 	void PreAlpha();
+ 	void PostAlpha();
+ 	void CopyBuffersToSharedResources();

@@ -1,0 +1,201 @@
+{
+	"modName": "FrameGeneration",
+	"displayName": "Frame Generation",
+	"minMcmVersion": 2,
+	"pluginRequirements": [],
+	"content": [
+		{
+			"text": "<font size='30'><p align='center'>FRAME GENERATION</p></font>",
+			"html": true,
+			"type": "text"
+		},
+		{
+			"text": "ABOUT",
+			"type": "section"
+		},
+		{
+			"text": "Frame generation inserts interpolated frames between rendered frames, effectively doubling your frame rate.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU. 'Second GPU' mode always uses FSR3.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "Settings marked (restart) take effect after restarting the game. All others apply within about a second.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "SETTINGS",
+			"type": "section"
+		},
+		{
+			"id": "bFrameGenerationMode:Settings",
+			"text": "Enable Frame Generation",
+			"type": "switcher",
+			"help": "Toggle frame generation on or off. Takes effect immediately. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "bFrameLimitMode:Settings",
+			"text": "Frame Rate Limiter",
+			"type": "switcher",
+			"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Not used when HighFPSPhysicsFix is installed; its own limiter applies instead. Takes effect immediately. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "bDisableInMenus:Settings",
+			"text": "Disable in Menus",
+			"type": "switcher",
+			"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. Takes effect immediately. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "iFrameGenType:Settings",
+			"text": "Backend (restart)",
+			"type": "stepper",
+			"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Ignored in 'Second GPU' mode, which always uses FSR3. Requires a game restart. (Default: AMD FSR3)",
+			"valueOptions": {
+				"sourceType": "ModSettingInt",
+				"options": [
+					"AMD FSR3",
+					"NVIDIA DLSS-G",
+					"Intel XeSS-FG"
+				]
+			}
+		},
+		{
+			"id": "iFrameGenFrames:Settings",
+			"text": "Frame Multiplier, DLSS-G (restart)",
+			"type": "stepper",
+			"help": "How many frames to generate per rendered frame. DLSS-G only; FSR3 always generates one. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires a game restart. (Default: 2x)",
+			"valueOptions": {
+				"sourceType": "ModSettingInt",
+				"options": [
+					"2x (1 generated)",
+					"3x (2 generated)",
+					"4x (3 generated)"
+				]
+			}
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "SECOND GPU (FG-GPU1)",
+			"type": "section"
+		},
+		{
+			"text": "The game renders on one GPU; FSR3 frame generation and presentation run on the GPU the monitor is plugged into. Every frame's colour, UI-free colour, depth and motion vectors are copied across PCIe.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"id": "bFrameGenOnSecondaryGPU:Settings",
+			"text": "Frame Generation on Second GPU (restart)",
+			"type": "switcher",
+			"help": "Run FSR3 frame generation and present on the GPU that drives the monitor, while the game keeps rendering on its own GPU. Not supported with ENB yet. Requires a game restart. (Default: On in this package)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "sSecondaryGPUName:Settings",
+			"text": "Second GPU Name (restart)",
+			"type": "textinput",
+			"help": "Optional: part of the second GPU's name, e.g. 9060. Leave empty to pick the GPU that drives the monitor the game window is on. Only needed if the log says the choice is ambiguous. Requires a game restart. (Default: empty)",
+			"valueOptions": {
+				"sourceType": "ModSettingString"
+			}
+		},
+		{
+			"id": "bSendHudlessFrame:Settings",
+			"text": "Send UI-free Frame (restart)",
+			"type": "switcher",
+			"help": "Send an extra, UI-free copy of every frame. On: generated frames keep a clean HUD. Off: about 25% less PCIe traffic, but the HUD is interpolated with the scene and smears during camera movement. Requires a game restart. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "iHalfResDepthMV:Settings",
+			"text": "Half-resolution Depth / Motion (restart)",
+			"type": "stepper",
+			"help": "Send depth (and optionally motion vectors) at half resolution to save PCIe time. Only generated frames use them; real frames stay full resolution. Depth: rebuilt to full resolution on the second GPU, FSR3 keeps every motion vector (about 2 ms saved at 4K). Depth + motion: FSR3 works at half resolution, like behind 'Performance' upscaling (about 4 ms saved). Requires a game restart. (Default: Depth)",
+			"valueOptions": {
+				"sourceType": "ModSettingInt",
+				"options": [
+					"Off (full resolution)",
+					"Depth",
+					"Depth + motion vectors"
+				]
+			}
+		},
+		{
+			"id": "bAsyncUnpack:Settings",
+			"text": "Async Unpack (restart)",
+			"type": "switcher",
+			"help": "On: the second GPU reads what arrives on its own copy queue, starting on each buffer as soon as it has crossed PCIe. Off: the original path, which waits for the whole transfer and reads it on the FSR3 queue (for comparison). Requires a game restart. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "bEarlyTransfer:Settings",
+			"text": "Early Transfer",
+			"type": "switcher",
+			"help": "On: depth and motion vectors start crossing PCIe right after the world pass and the UI-free frame right after its capture; only the finished frame waits for Present. Off: everything crosses at Present (for comparison). Takes effect immediately. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"id": "bEarlyUnpack:Settings",
+			"text": "Early Unpack",
+			"type": "switcher",
+			"help": "On: the second GPU reads depth, motion vectors and the UI-free frame as soon as they arrive, before Present; afterwards only the finished frame is left to read. Off: all reads start at Present (for comparison). Needs Async Unpack and Early Transfer. Takes effect immediately. (Default: On)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "DEBUG",
+			"type": "section"
+		},
+		{
+			"id": "bEnableDebugLogging:Settings",
+			"text": "Enable Debug Logging (restart)",
+			"type": "switcher",
+			"help": "Enables verbose Streamline/XeSS logging for troubleshooting (no effect with FSR3 or in 'Second GPU' mode). Logs go to F4SE/AAAFrameGeneration.log. Requires a game restart. (Default: Off)",
+			"valueOptions": {
+				"sourceType": "ModSettingBool"
+			}
+		}
+	]
+}

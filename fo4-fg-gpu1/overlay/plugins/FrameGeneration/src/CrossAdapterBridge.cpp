@@ -1,5 +1,7 @@
 #include "CrossAdapterBridge.h"
 
+#include <d3dcompiler.h>
+
 #include <algorithm>
 #include <cctype>
 
@@ -105,6 +107,18 @@ namespace
 	{
 		return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1000.0 /
 		       static_cast<double>(a_frequency.QuadPart);
+	}
+
+	const char* TimingName(CrossAdapterBridge::LaneTiming a_timing)
+	{
+		switch (a_timing) {
+		case CrossAdapterBridge::LaneTiming::kWorld:
+			return "world";
+		case CrossAdapterBridge::LaneTiming::kHudless:
+			return "hudless";
+		default:
+			return "present";
+		}
 	}
 }
 
@@ -336,8 +350,132 @@ HRESULT CrossAdapterBridge::WaitCpu(ID3D12Fence* a_fence, UINT64 a_value)
 	return S_OK;
 }
 
+// ---------------------------------------------------------------------------------------
+// GpuTimer
+
+bool CrossAdapterBridge::GpuTimer::Create(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, bool a_copyQueue,
+	UINT a_marks)
+{
+	Reset();
+	if (!a_device || !a_queue || a_marks == 0 || a_marks > kMaxMarks)
+		return false;
+
+	if (a_copyQueue) {
+		D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
+		if (FAILED(a_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))) ||
+			!options3.CopyQueueTimestampQueriesSupported)
+			return false;
+	}
+
+	UINT64 ticksPerSecond = 0;
+	if (FAILED(a_queue->GetTimestampFrequency(&ticksPerSecond)) || !ticksPerSecond)
+		return false;
+
+	D3D12_QUERY_HEAP_DESC heapDesc{};
+	heapDesc.Type = a_copyQueue ? D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP : D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+	heapDesc.Count = kSlots * a_marks;
+
+	D3D12_HEAP_PROPERTIES readbackProps{};
+	readbackProps.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bufferDesc{};
+	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufferDesc.Width = sizeof(UINT64) * kSlots * a_marks;
+	bufferDesc.Height = 1;
+	bufferDesc.DepthOrArraySize = 1;
+	bufferDesc.MipLevels = 1;
+	bufferDesc.SampleDesc.Count = 1;
+	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	if (FAILED(a_device->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(heap.put()))) ||
+		FAILED(a_device->CreateCommittedResource(&readbackProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(readback.put())))) {
+		Reset();
+		return false;
+	}
+
+	marks = a_marks;
+	frequency = ticksPerSecond;
+	Calibrate(a_queue);
+	return true;
+}
+
+void CrossAdapterBridge::GpuTimer::Calibrate(ID3D12CommandQueue* a_queue)
+{
+	if (!a_queue || !frequency)
+		return;
+	UINT64 gpu = 0;
+	UINT64 cpu = 0;
+	if (SUCCEEDED(a_queue->GetClockCalibration(&gpu, &cpu))) {
+		calibrationGpu = gpu;
+		calibrationQpc = cpu;
+		calibrated = true;
+	}
+}
+
+void CrossAdapterBridge::GpuTimer::Mark(ID3D12GraphicsCommandList* a_list, UINT a_slot, UINT a_mark)
+{
+	if (!Valid() || !a_list || a_slot >= kSlots || a_mark >= marks)
+		return;
+	a_list->EndQuery(heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * marks + a_mark);
+	written[a_slot] |= 1u << a_mark;
+}
+
+void CrossAdapterBridge::GpuTimer::Resolve(ID3D12GraphicsCommandList* a_list, UINT a_slot)
+{
+	if (!Valid() || !a_list || a_slot >= kSlots)
+		return;
+	a_list->ResolveQueryData(heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * marks, marks, readback.get(),
+		sizeof(UINT64) * a_slot * marks);
+}
+
+bool CrossAdapterBridge::GpuTimer::Read(UINT a_slot, std::array<double, kMaxMarks>& a_qpc, UINT& a_valid)
+{
+	a_valid = 0;
+	if (!Valid() || a_slot >= kSlots || !written[a_slot])
+		return false;
+	const UINT mask = written[a_slot];
+	written[a_slot] = 0;
+
+	const D3D12_RANGE range{ sizeof(UINT64) * a_slot * marks, sizeof(UINT64) * (a_slot * marks + marks) };
+	void* mapped = nullptr;
+	if (FAILED(readback->Map(0, &range, &mapped)))
+		return false;
+	const auto* ticks = reinterpret_cast<const UINT64*>(static_cast<const std::uint8_t*>(mapped) + range.Begin);
+
+	LARGE_INTEGER qpcPerSecond{};
+	QueryPerformanceFrequency(&qpcPerSecond);
+	const double qpcPerTick = static_cast<double>(qpcPerSecond.QuadPart) / static_cast<double>(frequency);
+	for (UINT mark = 0; mark < marks; ++mark) {
+		if (!(mask & (1u << mark)))
+			continue;
+		// Signed: a timestamp may be slightly older than the latest calibration.
+		const auto sinceCalibration = static_cast<std::int64_t>(ticks[mark] - calibrationGpu);
+		a_qpc[mark] = static_cast<double>(calibrationQpc) + static_cast<double>(sinceCalibration) * qpcPerTick;
+	}
+
+	const D3D12_RANGE nothingWritten{ 0, 0 };
+	readback->Unmap(0, &nothingWritten);
+	a_valid = mask;
+	return true;
+}
+
+void CrossAdapterBridge::GpuTimer::Reset() noexcept
+{
+	heap = nullptr;
+	readback = nullptr;
+	marks = 0;
+	frequency = 0;
+	calibrated = false;
+	calibrationGpu = 0;
+	calibrationQpc = 0;
+	written = {};
+}
+
+// ---------------------------------------------------------------------------------------
+// Setup
+
 bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11)
+	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack)
 {
 	Shutdown();
 	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
@@ -347,6 +485,7 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 	deviceB.copy_from(a_deviceB);
 	context11.copy_from(a_context11);
 	active = true;
+	asyncUnpack = a_asyncUnpack;
 
 	const auto check = [this](HRESULT a_hr, const char* a_what) {
 		if (FAILED(a_hr))
@@ -401,43 +540,75 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 		return false;
 	}
 
-	// Copy-queue timestamps are optional; the transport works without them.
-	D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
-	if (SUCCEEDED(deviceA->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))) &&
-		options3.CopyQueueTimestampQueriesSupported &&
-		SUCCEEDED(copyQueueA->GetTimestampFrequency(&timestampFrequency)) && timestampFrequency) {
-		D3D12_QUERY_HEAP_DESC heapDesc{};
-		heapDesc.Type = D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP;
-		heapDesc.Count = kSlots * 2;
-		D3D12_HEAP_PROPERTIES readbackProps{};
-		readbackProps.Type = D3D12_HEAP_TYPE_READBACK;
-		D3D12_RESOURCE_DESC bufferDesc{};
-		bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		bufferDesc.Width = sizeof(UINT64) * kSlots * 2;
-		bufferDesc.Height = 1;
-		bufferDesc.DepthOrArraySize = 1;
-		bufferDesc.MipLevels = 1;
-		bufferDesc.SampleDesc.Count = 1;
-		bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		if (FAILED(deviceA->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(timestampHeap.put()))) ||
-			FAILED(deviceA->CreateCommittedResource(&readbackProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(timestampReadback.put())))) {
-			timestampHeap = nullptr;
-			timestampReadback = nullptr;
+	// Async unpack: a copy queue on the display GPU. Anything missing here is not fatal;
+	// the serialised path (unpack on the direct queue) still works.
+	if (asyncUnpack) {
+		const auto fallBack = [this](const char* a_what, HRESULT a_hr) {
+			REX::WARN("[FG-GPU1] {} failed (hr={:#010x}); unpacking on the display GPU's direct queue instead",
+				a_what, static_cast<std::uint32_t>(a_hr));
+			asyncUnpack = false;
+			listB = nullptr;
+			for (auto& allocator : allocatorsB)
+				allocator = nullptr;
+			copyQueueB = nullptr;
+			unpackFenceB = nullptr;
+		};
+		HRESULT hr = deviceB->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(copyQueueB.put()));
+		if (FAILED(hr)) {
+			fallBack("copy queue on the display GPU", hr);
+		} else {
+			copyQueueB->SetName(L"FG-GPU1 unpack (display GPU copy queue)");
+			for (auto& allocator : allocatorsB) {
+				if (SUCCEEDED(hr))
+					hr = deviceB->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(allocator.put()));
+			}
+			if (SUCCEEDED(hr))
+				hr = deviceB->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, allocatorsB[0].get(), nullptr,
+					IID_PPV_ARGS(listB.put()));
+			if (SUCCEEDED(hr))
+				hr = listB->Close();
+			if (SUCCEEDED(hr))
+				hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(unpackFenceB.put()));
+			if (FAILED(hr))
+				fallBack("display GPU copy list/fence", hr);
 		}
 	}
-	if (!timestampHeap)
-		REX::INFO("[FG-GPU1] copy-queue timestamps unavailable; copy time will not be reported");
+
+	// Timestamps are optional; the transport works without them.
+	if (!timerCopyA.Create(deviceA.get(), copyQueueA.get(), true, 6))
+		REX::INFO("[FG-GPU1] render GPU copy-queue timestamps unavailable; copy time will not be reported");
+	if (asyncUnpack && !timerCopyB.Create(deviceB.get(), copyQueueB.get(), true, 6))
+		REX::INFO("[FG-GPU1] display GPU copy-queue timestamps unavailable; unpack time will not be reported");
 
 	QueryPerformanceFrequency(&qpcFrequency);
 	QueryPerformanceCounter(&statLastLog);
 
-	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> secondary GPU");
+	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> {}",
+		asyncUnpack ? "display GPU copy queue, lane by lane (bAsyncUnpack=1)" :
+					  "display GPU direct queue, after the whole transfer (bAsyncUnpack=0)");
 	return true;
 }
 
+void CrossAdapterBridge::SetDisplayQueue(ID3D12CommandQueue* a_queueB)
+{
+	if (!active || !a_queueB)
+		return;
+	displayQueue = a_queueB;
+	displayDoneValue = 0;
+	slotDisplayDone = {};
+	displayDoneFenceB = nullptr;
+	const HRESULT hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(displayDoneFenceB.put()));
+	if (FAILED(hr)) {
+		displayDoneFenceB = nullptr;
+		REX::WARN("[FG-GPU1] display-list fence failed (hr={:#010x}); timings of the display GPU's list are off",
+			static_cast<std::uint32_t>(hr));
+	}
+	if (!timerDisplay.Create(deviceB.get(), a_queueB, false, 5))
+		REX::INFO("[FG-GPU1] display GPU direct-queue timestamps unavailable");
+}
+
 int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
-	bool a_createMirror)
+	bool a_createMirror, LaneTiming a_timing)
 {
 	if (!active)
 		return -1;
@@ -445,9 +616,14 @@ int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot
 		Fail("AddLane (null source)", E_POINTER);
 		return -1;
 	}
+	if (lanes.size() >= kMaxLanes) {
+		Fail("AddLane (too many lanes)", E_INVALIDARG);
+		return -1;
+	}
 
 	Lane lane;
 	lane.name = a_name;
+	lane.timing = a_timing;
 	lane.sourceA[0].copy_from(a_sourceSlot0);
 	lane.sourceA[1].copy_from(a_sourceSlot1);
 	lane.desc = a_sourceSlot0->GetDesc();
@@ -523,10 +699,10 @@ int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot
 	}
 
 	bytesPerFrame += lane.bytes;
-	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total){}",
+	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total) timing={}{}",
 		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
 		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
-		a_createMirror ? "" : " (unpacked into caller's destination)");
+		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)");
 
 	lanes.push_back(std::move(lane));
 	return static_cast<int>(lanes.size() - 1);
@@ -539,79 +715,85 @@ ID3D12Resource* CrossAdapterBridge::Mirror(int a_lane, UINT a_slot) const noexce
 	return lanes[static_cast<size_t>(a_lane)].mirrorB[a_slot].get();
 }
 
-HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
-	ID3D12CommandQueue* a_queueB)
+// ---------------------------------------------------------------------------------------
+// Per frame
+
+HRESULT CrossAdapterBridge::PrepareFrame(UINT a_slot)
 {
-	if (!active)
-		return E_FAIL;
-	if (a_slot >= kSlots || !a_producerFenceA || !a_queueB) {
-		Fail("Transfer (bad arguments)", E_INVALIDARG);
-		return E_INVALIDARG;
+	if (frameStarted) {
+		if (frameSlot == a_slot)
+			return S_OK;
+		REX::WARN("[FG-GPU1] frame slot changed from {} to {} mid-frame; the unfinished frame is dropped",
+			frameSlot, a_slot);
 	}
 
-	LARGE_INTEGER submitStart{};
-	QueryPerformanceCounter(&submitStart);
-
-	// The allocator and timestamp pair of this slot were last used by slotTransfer[a_slot].
+	// The allocator and timestamps of this slot were last used by frame slotTransfer[a_slot].
 	const UINT64 previous = slotTransfer[a_slot];
 	if (previous) {
-		HRESULT hr = WaitCpu(copyDoneFenceA.get(), previous);
+		const HRESULT hr = WaitCpu(copyDoneFenceA.get(), previous);
 		if (FAILED(hr)) {
 			Fail("waiting for the previous copy of this slot", hr);
 			return hr;
 		}
-		if (timestampHeap) {
-			const D3D12_RANGE range{ sizeof(UINT64) * a_slot * 2, sizeof(UINT64) * (a_slot * 2 + 2) };
-			void* mapped = nullptr;
-			if (SUCCEEDED(timestampReadback->Map(0, &range, &mapped))) {
-				const auto* ticks = reinterpret_cast<const UINT64*>(static_cast<const std::uint8_t*>(mapped) + range.Begin);
-				if (ticks[1] > ticks[0]) {
-					const double ms = static_cast<double>(ticks[1] - ticks[0]) * 1000.0 /
-					                  static_cast<double>(timestampFrequency);
-					statGpuCopyMs += ms;
-					statGpuCopyMaxMs = (std::max)(statGpuCopyMaxMs, ms);
-					++statGpuCopySamples;
-				}
-				const D3D12_RANGE nothingWritten{ 0, 0 };
-				timestampReadback->Unmap(0, &nothingWritten);
-			}
+		CollectTimings(a_slot);
+	}
+
+	const UINT64 frame = ++transferValue;
+	HRESULT hr = allocatorsA[a_slot]->Reset();
+	if (FAILED(hr)) {
+		Fail("resetting the copy allocator", hr);
+		return hr;
+	}
+
+	// The display GPU finished reading this slot's staging area the last time round.
+	if (previous) {
+		hr = copyQueueA->Wait(consumedFenceA.get(), previous);
+		if (FAILED(hr)) {
+			Fail("copy queue Wait (consumed)", hr);
+			return hr;
 		}
 	}
 
-	const UINT64 value = ++transferValue;
+	currentSlot = a_slot;
+	frameSlot = a_slot;
+	frameStarted = true;
+	slotTransfer[a_slot] = frame;
+	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::SubmitLane(Lane& a_lane, size_t a_laneIndex, UINT a_slot, UINT a_markBase,
+	bool a_firstInPhase, bool a_lastInPhase)
+{
 	auto* allocator = allocatorsA[a_slot].get();
-	HRESULT hr = allocator->Reset();
-	if (SUCCEEDED(hr))
-		hr = listA->Reset(allocator, nullptr);
+	HRESULT hr = listA->Reset(allocator, nullptr);
 	if (FAILED(hr)) {
 		Fail("resetting the copy list", hr);
 		return hr;
 	}
 
-	if (timestampHeap)
-		listA->EndQuery(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2);
+	if (a_firstInPhase)
+		timerCopyA.Mark(listA.get(), a_slot, a_markBase);
 
-	for (auto& lane : lanes) {
-		D3D12_TEXTURE_COPY_LOCATION dst{};
-		dst.pResource = lane.stagingA.get();
-		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-		dst.PlacedFootprint = lane.footprint;
-		dst.PlacedFootprint.Offset = lane.slotStride * a_slot;
+	D3D12_TEXTURE_COPY_LOCATION dst{};
+	dst.pResource = a_lane.stagingA.get();
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dst.PlacedFootprint = a_lane.footprint;
+	dst.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
 
-		D3D12_TEXTURE_COPY_LOCATION src{};
-		src.pResource = lane.sourceA[a_slot].get();
-		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-		src.SubresourceIndex = 0;
+	D3D12_TEXTURE_COPY_LOCATION src{};
+	src.pResource = a_lane.sourceA[a_slot].get();
+	src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src.SubresourceIndex = 0;
 
-		// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
-		// COPY_SOURCE implicitly and they decay back when the list completes.
-		listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-	}
+	// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
+	// COPY_SOURCE implicitly and they decay back when the list completes.
+	listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-	if (timestampHeap) {
-		listA->EndQuery(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2 + 1);
-		listA->ResolveQueryData(timestampHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * 2, 2,
-			timestampReadback.get(), sizeof(UINT64) * a_slot * 2);
+	if (a_lastInPhase) {
+		timerCopyA.Mark(listA.get(), a_slot, a_markBase + 1);
+		// The Present phase is always last in the frame, so it resolves the slot's queries.
+		if (a_markBase == kMarkPresent)
+			timerCopyA.Resolve(listA.get(), a_slot);
 	}
 
 	hr = listA->Close();
@@ -619,39 +801,412 @@ HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_pro
 		Fail("closing the copy list", hr);
 		return hr;
 	}
-
-	// The game's D3D11 work for this frame (the producer of every source).
-	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
-	// The secondary GPU finished reading this slot's staging area the last time round.
-	if (SUCCEEDED(hr) && previous)
-		hr = copyQueueA->Wait(consumedFenceA.get(), previous);
-	if (FAILED(hr)) {
-		Fail("copy queue Wait", hr);
-		return hr;
-	}
-
 	ID3D12CommandList* lists[] = { listA.get() };
 	copyQueueA->ExecuteCommandLists(1, lists);
 
+	// Values are allocated in submission order rather than per lane index: the early groups
+	// signal before the Present group, and a shared fence must never go backwards.
+	const UINT64 value = ++nextLaneValue;
 	hr = copyQueueA->Signal(transferFenceA.get(), value);
-	if (SUCCEEDED(hr))
-		hr = copyQueueA->Signal(copyDoneFenceA.get(), value);
-	if (SUCCEEDED(hr))
-		hr = a_queueB->Wait(transferFenceB.get(), value);
 	if (FAILED(hr)) {
-		Fail("transfer fence Signal/Wait", hr);
+		Fail("transfer fence Signal", hr);
+		return hr;
+	}
+	laneValue[a_laneIndex] = value;
+	laneFrame[a_laneIndex] = transferValue;
+	return S_OK;
+}
+
+bool CrossAdapterBridge::HasLanes(LaneTiming a_timing) const noexcept
+{
+	for (const auto& lane : lanes)
+		if (lane.timing == a_timing)
+			return true;
+	return false;
+}
+
+HRESULT CrossAdapterBridge::TransferGroup(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot,
+	LaneTiming a_timing)
+{
+	if (!active)
+		return E_FAIL;
+	if (a_slot >= kSlots || !a_producerFenceA) {
+		Fail("TransferGroup (bad arguments)", E_INVALIDARG);
+		return E_INVALIDARG;
+	}
+	if (!HasLanes(a_timing))
+		return S_OK;  // e.g. the HUD-less group with bSendHudlessFrame = 0
+
+	LARGE_INTEGER submitStart{};
+	QueryPerformanceCounter(&submitStart);
+
+	HRESULT hr = PrepareFrame(a_slot);
+	if (FAILED(hr))
+		return hr;
+
+	// The game's D3D11 work that produced these lanes, as of the hook that just ran.
+	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
+	if (FAILED(hr)) {
+		Fail("copy queue Wait (producer)", hr);
 		return hr;
 	}
 
-	slotTransfer[a_slot] = value;
+	const UINT markBase = a_timing == LaneTiming::kWorld ? kMarkWorld :
+		a_timing == LaneTiming::kHudless                  ? kMarkHudless :
+															kMarkPresent;
+	size_t firstIndex = lanes.size();
+	size_t lastIndex = 0;
+	for (size_t index = 0; index < lanes.size(); ++index) {
+		if (lanes[index].timing != a_timing || laneFrame[index] == transferValue)
+			continue;
+		if (firstIndex == lanes.size())
+			firstIndex = index;
+		lastIndex = index;
+	}
+
+	bool copied = false;
+	for (size_t index = 0; index < lanes.size(); ++index) {
+		if (lanes[index].timing != a_timing || laneFrame[index] == transferValue)
+			continue;
+		hr = SubmitLane(lanes[index], index, a_slot, markBase, index == firstIndex, index == lastIndex);
+		if (FAILED(hr))
+			return hr;
+		copied = true;
+	}
+
+	if (copied) {
+		LARGE_INTEGER submitEnd{};
+		QueryPerformanceCounter(&submitEnd);
+		statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
+	}
+	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_producerValue, UINT a_slot)
+{
+	if (!active)
+		return E_FAIL;
+	if (a_slot >= kSlots || !a_producerFenceA || lanes.empty()) {
+		Fail("Transfer (bad arguments or no lanes)", E_INVALIDARG);
+		return E_INVALIDARG;
+	}
+
+	LARGE_INTEGER submitStart{};
+	QueryPerformanceCounter(&submitStart);
+
+	HRESULT hr = PrepareFrame(a_slot);
+	if (FAILED(hr))
+		return hr;
+
+	// The finished frame is only final now. A frame whose early hooks did not run also copies
+	// its remaining lanes here, so the transport never depends on them having run.
+	hr = copyQueueA->Wait(a_producerFenceA, a_producerValue);
+	if (FAILED(hr)) {
+		Fail("copy queue Wait (producer)", hr);
+		return hr;
+	}
+
+	// Whatever is left crosses in the Present phase, including early-timing lanes whose hooks
+	// did not run; the last one resolves the slot's copy timestamps.
+	size_t firstIndex = lanes.size();
+	size_t lastIndex = 0;
+	for (size_t index = 0; index < lanes.size(); ++index) {
+		if (laneFrame[index] == transferValue)
+			continue;
+		if (firstIndex == lanes.size())
+			firstIndex = index;
+		lastIndex = index;
+	}
+
+	for (size_t index = 0; index < lanes.size(); ++index) {
+		if (laneFrame[index] == transferValue)
+			continue;
+		hr = SubmitLane(lanes[index], index, a_slot, kMarkPresent, index == firstIndex, index == lastIndex);
+		if (FAILED(hr))
+			return hr;
+	}
+
+	hr = copyQueueA->Signal(copyDoneFenceA.get(), transferValue);
+	if (FAILED(hr)) {
+		Fail("copy-done fence Signal", hr);
+		return hr;
+	}
+
+	if ((statFrames & 63) == 0)
+		CalibrateTimers();
+
+	frameStarted = false;
+	slotPresentQpc[a_slot] = submitStart;
 
 	LARGE_INTEGER submitEnd{};
 	QueryPerformanceCounter(&submitEnd);
 	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
 	++statFrames;
 	const UINT64 consumed = consumedFenceA->GetCompletedValue();
-	statMaxLag = (std::max)(statMaxLag, value > consumed ? value - consumed : 0);
+	statMaxLag = (std::max)(statMaxLag, transferValue > consumed ? transferValue - consumed : 0);
 	return S_OK;
+}
+
+bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot,
+	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState)
+{
+	const D3D12_RESOURCE_DESC destDesc = a_dest->GetDesc();
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
+	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
+	if (destDesc.Width != a_lane.desc.Width || destDesc.Height != a_lane.desc.Height ||
+		destFootprint.Footprint.RowPitch != a_lane.footprint.Footprint.RowPitch) {
+		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
+		if (!a_lane.mismatchLogged) {
+			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
+				a_lane.name, a_lane.desc.Width, a_lane.desc.Height, static_cast<int>(a_lane.desc.Format), destDesc.Width,
+				destDesc.Height, static_cast<int>(destDesc.Format));
+			a_lane.mismatchLogged = true;
+		}
+		return false;
+	}
+
+	// COMMON (== PRESENT) <-> COPY_DEST is also legal on a copy list.
+	auto barrier = Transition(a_dest, a_destState, D3D12_RESOURCE_STATE_COPY_DEST);
+	a_list->ResourceBarrier(1, &barrier);
+
+	D3D12_TEXTURE_COPY_LOCATION dst{};
+	dst.pResource = a_dest;
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION src{};
+	src.pResource = a_lane.stagingB.get();
+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	src.PlacedFootprint = a_lane.footprint;
+	src.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
+	// Same width/height; a typeless/UNORM/SRGB difference between the back buffer and the
+	// D3D11 texture is allowed by CopyTextureRegion as long as the formats are copy-compatible.
+	src.PlacedFootprint.Footprint.Format = destDesc.Format;
+
+	a_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	barrier = Transition(a_dest, D3D12_RESOURCE_STATE_COPY_DEST, a_destState);
+	a_list->ResourceBarrier(1, &barrier);
+	return true;
+}
+
+HRESULT CrossAdapterBridge::Unpack(UINT a_slot, int a_backBufferLane, ID3D12Resource* a_backBuffer,
+	ID3D12CommandQueue* a_queueB)
+{
+	if (!active)
+		return E_FAIL;
+	if (!asyncUnpack || !copyQueueB || a_slot >= kSlots || !a_queueB || lanes.empty() ||
+		slotTransfer[a_slot] != transferValue) {
+		Fail("Unpack (bad arguments)", E_INVALIDARG);
+		return E_INVALIDARG;
+	}
+
+	LARGE_INTEGER submitStart{};
+	QueryPerformanceCounter(&submitStart);
+
+	const UINT64 frame = transferValue;
+	HRESULT hr = BeginUnpack(a_slot);
+	if (FAILED(hr))
+		return hr;
+
+	// Whatever the early hooks did not already read, in the order the lanes become available:
+	// the finished frame is registered first (at interop creation) but is the last to cross.
+	std::array<size_t, kMaxLanes> order{};
+	size_t orderCount = 0;
+	for (size_t pass = 0; pass < 2; ++pass) {
+		for (size_t index = 0; index < lanes.size(); ++index) {
+			const bool present = lanes[index].timing == LaneTiming::kPresent;
+			if (present != (pass == 1) || laneUnpackFrame[index] == frame)
+				continue;
+			order[orderCount++] = index;
+		}
+	}
+	hr = SubmitUnpackLanes(a_slot, order.data(), orderCount, kMarkPresent, true, a_backBufferLane, a_backBuffer);
+	if (FAILED(hr))
+		return hr;
+
+	// The staging slot has been read: the render GPU may overwrite it. Then let the direct
+	// queue (FFX prepare, present) start on this frame - after the depth rebuild, which is
+	// queued ahead of that wait so it only waits for the depth lane.
+	hr = copyQueueB->Signal(consumedFenceB.get(), frame);
+	if (SUCCEEDED(hr))
+		hr = copyQueueB->Signal(unpackFenceB.get(), frame);
+	if (SUCCEEDED(hr) && upsampler.Ready())
+		hr = SubmitDepthUpsample(a_slot, frame, a_queueB);
+	if (SUCCEEDED(hr))
+		hr = a_queueB->Wait(unpackFenceB.get(), frame);
+	if (FAILED(hr)) {
+		Fail("unpack fence Signal/Wait", hr);
+		return hr;
+	}
+	unpackStarted = false;
+
+	LARGE_INTEGER submitEnd{};
+	QueryPerformanceCounter(&submitEnd);
+	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
+	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::UnpackGroup(UINT a_slot, LaneTiming a_timing)
+{
+	if (!active || !asyncUnpack || !copyQueueB || a_timing == LaneTiming::kPresent)
+		return S_OK;
+	if (a_slot >= kSlots || slotTransfer[a_slot] != transferValue)
+		return S_OK;  // no frame in progress on this slot; Present reads everything
+
+	const UINT64 frame = transferValue;
+	std::array<size_t, kMaxLanes> order{};
+	size_t orderCount = 0;
+	for (size_t index = 0; index < lanes.size(); ++index) {
+		// Only lanes this frame has already sent and nobody has read yet.
+		if (lanes[index].timing != a_timing || laneFrame[index] != frame || laneUnpackFrame[index] == frame)
+			continue;
+		order[orderCount++] = index;
+	}
+	if (!orderCount)
+		return S_OK;
+
+	LARGE_INTEGER submitStart{};
+	QueryPerformanceCounter(&submitStart);
+
+	HRESULT hr = BeginUnpack(a_slot);
+	if (SUCCEEDED(hr)) {
+		const UINT markBase = a_timing == LaneTiming::kWorld ? kMarkWorld : kMarkHudless;
+		hr = SubmitUnpackLanes(a_slot, order.data(), orderCount, markBase, false, -1, nullptr);
+	}
+
+	LARGE_INTEGER submitEnd{};
+	QueryPerformanceCounter(&submitEnd);
+	statCpuSubmitMs += QpcMs(submitStart, submitEnd, qpcFrequency);
+	return hr;
+}
+
+HRESULT CrossAdapterBridge::BeginUnpack(UINT a_slot)
+{
+	const UINT64 frame = transferValue;
+	if (unpackStarted) {
+		if (unpackFrame == frame)
+			return S_OK;
+		// A frame's read was started at a hook but its Present never came (the slot changed
+		// mid-frame). Close it, so the next use of its slot does not wait for it forever.
+		HRESULT hr = copyQueueB->Signal(consumedFenceB.get(), unpackFrame);
+		if (SUCCEEDED(hr))
+			hr = copyQueueB->Signal(unpackFenceB.get(), unpackFrame);
+		if (FAILED(hr)) {
+			Fail("closing an unfinished unpack", hr);
+			return hr;
+		}
+		unpackStarted = false;
+	}
+
+	// This slot's allocator was last used by the unpack of frame slotUnpack[a_slot].
+	if (slotUnpack[a_slot]) {
+		const HRESULT hr = WaitCpu(unpackFenceB.get(), slotUnpack[a_slot]);
+		if (FAILED(hr)) {
+			Fail("waiting for the previous unpack of this slot", hr);
+			return hr;
+		}
+	}
+	HRESULT hr = allocatorsB[a_slot]->Reset();
+	if (FAILED(hr)) {
+		Fail("resetting the unpack allocator", hr);
+		return hr;
+	}
+
+	// The frame that last used this slot may still read its mirrors on the direct queue
+	// (FFX's prepare pass) or FFX's interpolation queue (HUD-less colour). Both are done
+	// by now from the CPU's side: FFX's Present for the previous frame waited for that
+	// frame's interpolation before this frame's hooks could run. This keeps it explicit.
+	if (displayDoneFenceB && slotDisplayDone[a_slot]) {
+		hr = copyQueueB->Wait(displayDoneFenceB.get(), slotDisplayDone[a_slot]);
+		if (FAILED(hr)) {
+			Fail("unpack queue Wait (display list)", hr);
+			return hr;
+		}
+	}
+
+	// From here on the slot's allocator belongs to this frame.
+	slotUnpack[a_slot] = frame;
+	unpackStarted = true;
+	unpackFrame = frame;
+	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order, size_t a_count, UINT a_markBase,
+	bool a_resolve, int a_backBufferLane, ID3D12Resource* a_backBuffer)
+{
+	auto* allocator = allocatorsB[a_slot].get();
+	for (size_t position = 0; position < a_count; ++position) {
+		const size_t index = a_order[position];
+		auto& lane = lanes[index];
+		ID3D12Resource* dest = lane.mirrorB[a_slot].get();
+		if (!dest && static_cast<int>(index) == a_backBufferLane)
+			dest = a_backBuffer;
+
+		if (laneFrame[index] != unpackFrame) {
+			Fail("Unpack (a lane was not transferred for this frame)", E_FAIL);
+			return E_FAIL;
+		}
+
+		HRESULT hr = listB->Reset(allocator, nullptr);
+		if (FAILED(hr)) {
+			Fail("resetting the unpack list", hr);
+			return hr;
+		}
+		if (position == 0)
+			timerCopyB.Mark(listB.get(), a_slot, a_markBase);
+
+		// Mirrors are COMMON between uses; the back buffer is PRESENT, which is the same state.
+		if (dest)
+			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON);
+
+		if (position + 1 == a_count) {
+			timerCopyB.Mark(listB.get(), a_slot, a_markBase + 1);
+			// The Present phase is always the frame's last, so it resolves the slot's queries.
+			if (a_resolve)
+				timerCopyB.Resolve(listB.get(), a_slot);
+		}
+
+		hr = listB->Close();
+		if (FAILED(hr)) {
+			Fail("closing the unpack list", hr);
+			return hr;
+		}
+
+		// Start on this lane as soon as it has crossed, while the next one is still in flight.
+		hr = copyQueueB->Wait(transferFenceB.get(), laneValue[index]);
+		if (FAILED(hr)) {
+			Fail("unpack queue Wait (transfer)", hr);
+			return hr;
+		}
+		ID3D12CommandList* lists[] = { listB.get() };
+		copyQueueB->ExecuteCommandLists(1, lists);
+		laneUnpackFrame[index] = unpackFrame;
+
+		// iHalfResDepthMV = 1: the depth rebuild may start now, while the other lanes cross.
+		if (upsampler.Ready() && static_cast<int>(index) == upsampler.lane) {
+			hr = copyQueueB->Signal(upsampler.sourceReadyFence.get(), unpackFrame);
+			if (FAILED(hr)) {
+				Fail("depth-ready fence Signal", hr);
+				return hr;
+			}
+		}
+	}
+	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::WaitTransfer(ID3D12CommandQueue* a_queueB)
+{
+	if (!active)
+		return E_FAIL;
+	if (!a_queueB || lanes.empty()) {
+		Fail("WaitTransfer (bad arguments)", E_INVALIDARG);
+		return E_INVALIDARG;
+	}
+	const HRESULT hr = a_queueB->Wait(transferFenceB.get(), nextLaneValue);
+	if (FAILED(hr))
+		Fail("transfer fence Wait", hr);
+	return hr;
 }
 
 void CrossAdapterBridge::RecordUnpack(ID3D12GraphicsCommandList* a_listB, UINT a_slot)
@@ -697,45 +1252,7 @@ void CrossAdapterBridge::RecordUnpackTo(ID3D12GraphicsCommandList* a_listB, int 
 	if (!active || !a_listB || !a_destB || a_slot >= kSlots || a_lane < 0 ||
 		static_cast<size_t>(a_lane) >= lanes.size())
 		return;
-	auto& lane = lanes[static_cast<size_t>(a_lane)];
-
-	const D3D12_RESOURCE_DESC destDesc = a_destB->GetDesc();
-	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
-	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
-	if (destDesc.Width != lane.desc.Width || destDesc.Height != lane.desc.Height ||
-		destFootprint.Footprint.RowPitch != lane.footprint.Footprint.RowPitch) {
-		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
-		static bool logged = false;
-		if (!logged) {
-			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
-				lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format), destDesc.Width,
-				destDesc.Height, static_cast<int>(destDesc.Format));
-			logged = true;
-		}
-		return;
-	}
-
-	auto barrier = Transition(a_destB, a_destState, D3D12_RESOURCE_STATE_COPY_DEST);
-	a_listB->ResourceBarrier(1, &barrier);
-
-	D3D12_TEXTURE_COPY_LOCATION dst{};
-	dst.pResource = a_destB;
-	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	dst.SubresourceIndex = 0;
-
-	D3D12_TEXTURE_COPY_LOCATION src{};
-	src.pResource = lane.stagingB.get();
-	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-	src.PlacedFootprint = lane.footprint;
-	src.PlacedFootprint.Offset = lane.slotStride * a_slot;
-	// Same width/height; a typeless/UNORM/SRGB difference between the back buffer and the
-	// D3D11 texture is allowed by CopyTextureRegion as long as the formats are copy-compatible.
-	src.PlacedFootprint.Footprint.Format = destDesc.Format;
-
-	a_listB->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-	barrier = Transition(a_destB, D3D12_RESOURCE_STATE_COPY_DEST, a_destState);
-	a_listB->ResourceBarrier(1, &barrier);
+	RecordLaneCopy(a_listB, lanes[static_cast<size_t>(a_lane)], a_slot, a_destB, a_destState);
 }
 
 HRESULT CrossAdapterBridge::SignalConsumed(ID3D12CommandQueue* a_queueB)
@@ -748,14 +1265,394 @@ HRESULT CrossAdapterBridge::SignalConsumed(ID3D12CommandQueue* a_queueB)
 	return hr;
 }
 
+// ---------------------------------------------------------------------------------------
+// Half-resolution depth (iHalfResDepthMV = 1)
+
+bool CrossAdapterBridge::CreateDepthUpsampler(UINT a_width, UINT a_height, const wchar_t* a_shaderPath)
+{
+	ResetUpsampler();
+	if (!active || !a_width || !a_height || !a_shaderPath)
+		return false;
+
+	const auto failed = [this](const char* a_what, HRESULT a_hr) {
+		REX::ERROR("[FG-GPU1] depth rebuild on the display GPU: {} failed (hr={:#010x}); sending depth at full resolution",
+			a_what, static_cast<std::uint32_t>(a_hr));
+		ResetUpsampler();
+		return false;
+	};
+
+	// The allocator of a slot is reused once that slot's previous direct list is done.
+	if (asyncUnpack && !displayDoneFenceB)
+		return failed("the display GPU's direct-queue fence (SetDisplayQueue)", E_FAIL);
+
+	winrt::com_ptr<ID3DBlob> shader;
+	winrt::com_ptr<ID3DBlob> shaderErrors;
+	HRESULT hr = D3DCompileFromFile(a_shaderPath, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
+		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), shaderErrors.put());
+	if (FAILED(hr)) {
+		if (shaderErrors)
+			REX::ERROR("[FG-GPU1] {}", static_cast<const char*>(shaderErrors->GetBufferPointer()));
+		return failed("compiling DepthFromHalfResCS.hlsl", hr);
+	}
+
+	// t0 = half-resolution depth, u0 = full-resolution depth, one table per slot.
+	D3D12_DESCRIPTOR_RANGE ranges[2]{};
+	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	ranges[0].NumDescriptors = 1;
+	ranges[0].OffsetInDescriptorsFromTableStart = 0;
+	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+	ranges[1].NumDescriptors = 1;
+	ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+	D3D12_ROOT_PARAMETER parameter{};
+	parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	parameter.DescriptorTable.NumDescriptorRanges = 2;
+	parameter.DescriptorTable.pDescriptorRanges = ranges;
+	parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+	rootDesc.NumParameters = 1;
+	rootDesc.pParameters = &parameter;
+
+	winrt::com_ptr<ID3DBlob> serialized;
+	winrt::com_ptr<ID3DBlob> rootErrors;
+	hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, serialized.put(), rootErrors.put());
+	if (FAILED(hr))
+		return failed("D3D12SerializeRootSignature", hr);
+	hr = deviceB->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+		IID_PPV_ARGS(upsampler.rootSignature.put()));
+	if (FAILED(hr))
+		return failed("CreateRootSignature", hr);
+
+	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
+	pipelineDesc.pRootSignature = upsampler.rootSignature.get();
+	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+	hr = deviceB->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(upsampler.pipeline.put()));
+	if (FAILED(hr))
+		return failed("CreateComputePipelineState", hr);
+
+	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heapDesc.NumDescriptors = kSlots * 2;
+	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	hr = deviceB->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(upsampler.descriptors.put()));
+	if (FAILED(hr))
+		return failed("CreateDescriptorHeap", hr);
+	upsampler.descriptorSize = deviceB->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	D3D12_RESOURCE_DESC targetDesc{};
+	targetDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	targetDesc.Width = a_width;
+	targetDesc.Height = a_height;
+	targetDesc.DepthOrArraySize = 1;
+	targetDesc.MipLevels = 1;
+	targetDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	targetDesc.SampleDesc.Count = 1;
+	targetDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	targetDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	D3D12_HEAP_PROPERTIES defaultHeap{};
+	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+	uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+	for (UINT slot = 0; slot < kSlots; ++slot) {
+		// COMMON between uses, like the mirrors: FFX's read promotes it implicitly.
+		hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &targetDesc,
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(upsampler.target[slot].put()));
+		if (FAILED(hr))
+			return failed("CreateCommittedResource(full-resolution depth)", hr);
+		D3D12_CPU_DESCRIPTOR_HANDLE handle = upsampler.descriptors->GetCPUDescriptorHandleForHeapStart();
+		handle.ptr += static_cast<SIZE_T>(slot * 2 + 1) * upsampler.descriptorSize;
+		deviceB->CreateUnorderedAccessView(upsampler.target[slot].get(), nullptr, &uavDesc, handle);
+
+		hr = deviceB->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(upsampler.allocators[slot].put()));
+		if (FAILED(hr))
+			return failed("CreateCommandAllocator", hr);
+	}
+	hr = deviceB->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, upsampler.allocators[0].get(), nullptr,
+		IID_PPV_ARGS(upsampler.list.put()));
+	if (SUCCEEDED(hr))
+		hr = upsampler.list->Close();
+	if (FAILED(hr))
+		return failed("CreateCommandList", hr);
+	hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(upsampler.sourceReadyFence.put()));
+	if (FAILED(hr))
+		return failed("CreateFence", hr);
+
+	upsampler.width = a_width;
+	upsampler.height = a_height;
+	return true;
+}
+
+void CrossAdapterBridge::SetDepthUpsampleLane(int a_lane)
+{
+	if (!active || !upsampler.pipeline || a_lane < 0 || static_cast<size_t>(a_lane) >= lanes.size())
+		return;
+	auto& lane = lanes[static_cast<size_t>(a_lane)];
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+	srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Texture2D.MipLevels = 1;
+	for (UINT slot = 0; slot < kSlots; ++slot) {
+		if (!lane.mirrorB[slot]) {
+			REX::ERROR("[FG-GPU1] depth lane has no mirror on the display GPU; depth rebuild disabled");
+			return;
+		}
+		D3D12_CPU_DESCRIPTOR_HANDLE handle = upsampler.descriptors->GetCPUDescriptorHandleForHeapStart();
+		handle.ptr += static_cast<SIZE_T>(slot * 2) * upsampler.descriptorSize;
+		deviceB->CreateShaderResourceView(lane.mirrorB[slot].get(), &srvDesc, handle);
+	}
+	upsampler.lane = a_lane;
+	REX::INFO("[FG-GPU1] depth crosses at {}x{} and is rebuilt at {}x{} on the display GPU ({})", lane.desc.Width,
+		lane.desc.Height, upsampler.width, upsampler.height,
+		asyncUnpack ? "as soon as it lands, while the other lanes still cross" : "on the frame's direct list");
+}
+
+ID3D12Resource* CrossAdapterBridge::UpsampledDepth(UINT a_slot) const noexcept
+{
+	if (!upsampler.Ready() || a_slot >= kSlots)
+		return nullptr;
+	return upsampler.target[a_slot].get();
+}
+
+void CrossAdapterBridge::RecordUpsampleCommands(ID3D12GraphicsCommandList* a_list, UINT a_slot)
+{
+	ID3D12Resource* source = lanes[static_cast<size_t>(upsampler.lane)].mirrorB[a_slot].get();
+	ID3D12Resource* target = upsampler.target[a_slot].get();
+
+	timerDisplay.Mark(a_list, a_slot, kMarkUpsampleBegin);
+
+	// Explicit both ways, so the states are right whether or not the list also unpacked.
+	const D3D12_RESOURCE_BARRIER before[2] = {
+		Transition(source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+		Transition(target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+	};
+	a_list->ResourceBarrier(2, before);
+
+	ID3D12DescriptorHeap* heaps[] = { upsampler.descriptors.get() };
+	a_list->SetDescriptorHeaps(1, heaps);
+	a_list->SetComputeRootSignature(upsampler.rootSignature.get());
+	a_list->SetPipelineState(upsampler.pipeline.get());
+	D3D12_GPU_DESCRIPTOR_HANDLE table = upsampler.descriptors->GetGPUDescriptorHandleForHeapStart();
+	table.ptr += static_cast<UINT64>(a_slot * 2) * upsampler.descriptorSize;
+	a_list->SetComputeRootDescriptorTable(0, table);
+	a_list->Dispatch((upsampler.width + 7) / 8, (upsampler.height + 7) / 8, 1);
+
+	const D3D12_RESOURCE_BARRIER after[2] = {
+		Transition(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+		Transition(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+	};
+	a_list->ResourceBarrier(2, after);
+
+	timerDisplay.Mark(a_list, a_slot, kMarkUpsampleEnd);
+}
+
+void CrossAdapterBridge::RecordDepthUpsample(ID3D12GraphicsCommandList* a_listB, UINT a_slot)
+{
+	if (!active || asyncUnpack || !a_listB || a_slot >= kSlots || !upsampler.Ready())
+		return;
+	RecordUpsampleCommands(a_listB, a_slot);
+}
+
+HRESULT CrossAdapterBridge::SubmitDepthUpsample(UINT a_slot, UINT64 a_frame, ID3D12CommandQueue* a_queueB)
+{
+	// This slot's allocator was last used ahead of the slot's previous direct list on the same
+	// queue; FFX's Present has normally waited for that frame already, so this does not block.
+	if (slotDisplayDone[a_slot]) {
+		const HRESULT hr = WaitCpu(displayDoneFenceB.get(), slotDisplayDone[a_slot]);
+		if (FAILED(hr)) {
+			Fail("waiting for the previous depth rebuild of this slot", hr);
+			return hr;
+		}
+	}
+
+	auto* allocator = upsampler.allocators[a_slot].get();
+	HRESULT hr = allocator->Reset();
+	if (SUCCEEDED(hr))
+		hr = upsampler.list->Reset(allocator, nullptr);
+	if (FAILED(hr)) {
+		Fail("resetting the depth-rebuild list", hr);
+		return hr;
+	}
+	RecordUpsampleCommands(upsampler.list.get(), a_slot);
+	hr = upsampler.list->Close();
+	if (FAILED(hr)) {
+		Fail("closing the depth-rebuild list", hr);
+		return hr;
+	}
+
+	// Only the depth lane: the rebuild overlaps the motion vectors, HUD-less and final frame
+	// still crossing, and the frame's own list waits for all of them right after this.
+	hr = a_queueB->Wait(upsampler.sourceReadyFence.get(), a_frame);
+	if (FAILED(hr)) {
+		Fail("depth-rebuild Wait", hr);
+		return hr;
+	}
+	ID3D12CommandList* lists[] = { upsampler.list.get() };
+	a_queueB->ExecuteCommandLists(1, lists);
+	return S_OK;
+}
+
+void CrossAdapterBridge::ResetUpsampler() noexcept
+{
+	upsampler = DepthUpsampler{};
+}
+
+void CrossAdapterBridge::MarkDisplayList(ID3D12GraphicsCommandList* a_listB, UINT a_slot, UINT a_mark)
+{
+	if (!active)
+		return;
+	timerDisplay.Mark(a_listB, a_slot, a_mark);
+	if (a_mark == kMarkListEnd)
+		timerDisplay.Resolve(a_listB, a_slot);
+}
+
+HRESULT CrossAdapterBridge::SignalDisplayListDone(ID3D12CommandQueue* a_queueB)
+{
+	if (!active || !a_queueB || !displayDoneFenceB)
+		return S_OK;
+	const HRESULT hr = a_queueB->Signal(displayDoneFenceB.get(), ++displayDoneValue);
+	if (FAILED(hr)) {
+		Fail("display-list fence Signal", hr);
+		return hr;
+	}
+	slotDisplayDone[currentSlot] = displayDoneValue;
+	return S_OK;
+}
+
+void CrossAdapterBridge::AddPresentBlock(double a_presentMs, double a_latencyWaitMs)
+{
+	if (!active)
+		return;
+	statPresentBlock.Add(a_presentMs);
+	statLatencyWait.Add(a_latencyWaitMs);
+}
+
 HRESULT CrossAdapterBridge::GateD3D11(UINT a_nextSlot)
 {
 	if (!active || a_nextSlot >= kSlots || !slotTransfer[a_nextSlot])
 		return S_OK;
+	++statGateCalls;
+	// Still copying when the wait is queued. The D3D11 GPU timeline is usually behind the CPU,
+	// so this does not prove a stall, but if it is high the 3090 is waiting on PCIe.
+	if (copyDoneFenceA->GetCompletedValue() < slotTransfer[a_nextSlot])
+		++statGatePending;
 	const HRESULT hr = context11->Wait(copyDoneFence11.get(), slotTransfer[a_nextSlot]);
 	if (FAILED(hr))
 		Fail("D3D11 Wait on the copy-done fence", hr);
 	return hr;
+}
+
+// ---------------------------------------------------------------------------------------
+// Statistics
+
+void CrossAdapterBridge::CalibrateTimers()
+{
+	timerCopyA.Calibrate(copyQueueA.get());
+	if (copyQueueB)
+		timerCopyB.Calibrate(copyQueueB.get());
+	if (displayQueue)
+		timerDisplay.Calibrate(displayQueue);
+}
+
+void CrossAdapterBridge::CollectTimings(UINT a_slot)
+{
+	if (a_slot >= kSlots || !slotTransfer[a_slot] || !qpcFrequency.QuadPart)
+		return;
+
+	const double toMs = 1000.0 / static_cast<double>(qpcFrequency.QuadPart);
+	const double presentQpc = static_cast<double>(slotPresentQpc[a_slot].QuadPart);
+	const auto sincePresent = [&](double a_qpc) { return (a_qpc - presentQpc) * toMs; };
+
+	std::array<double, GpuTimer::kMaxMarks> copyA{};
+	std::array<double, GpuTimer::kMaxMarks> copyB{};
+	std::array<double, GpuTimer::kMaxMarks> display{};
+	UINT validA = 0;
+	UINT validB = 0;
+	UINT validDisplay = 0;
+
+	// The caller already waited for this slot's copy. The other two are checked, never waited
+	// for: if they are still running the sample is dropped (and the slot is re-armed).
+	timerCopyA.Read(a_slot, copyA, validA);
+	if (!asyncUnpack || (unpackFenceB && unpackFenceB->GetCompletedValue() >= slotUnpack[a_slot]))
+		timerCopyB.Read(a_slot, copyB, validB);
+	else
+		timerCopyB.written[a_slot] = 0;
+	if (displayDoneFenceB && displayDoneFenceB->GetCompletedValue() >= slotDisplayDone[a_slot])
+		timerDisplay.Read(a_slot, display, validDisplay);
+	else
+		timerDisplay.written[a_slot] = 0;
+
+	constexpr UINT kListBeginEnd = (1u << kMarkListBegin) | (1u << kMarkListEnd);
+	constexpr UINT kListUnpack = (1u << kMarkListBegin) | (1u << kMarkAfterUnpack);
+
+	// Both copy queues mark phases kMarkWorld, kMarkHudless, kMarkPresent, two marks each.
+	// Only phases that ran count, so the rendering between them is not reported as copy time;
+	// start/end are the first phase's start and the last phase's end.
+	const auto sumPhases = [](const std::array<double, GpuTimer::kMaxMarks>& a_marks, UINT a_valid, double& a_busy,
+							   double& a_start, double& a_end) {
+		bool any = false;
+		a_busy = 0.0;
+		for (UINT phase = 0; phase < 3; ++phase) {
+			const UINT bitStart = 1u << (phase * 2);
+			const UINT bitEnd = 1u << (phase * 2 + 1);
+			if (!(a_valid & bitStart) || !(a_valid & bitEnd))
+				continue;
+			a_busy += a_marks[phase * 2 + 1] - a_marks[phase * 2];
+			if (!any)
+				a_start = a_marks[phase * 2];
+			a_end = a_marks[phase * 2 + 1];
+			any = true;
+		}
+		return any;
+	};
+
+	double busy = 0.0;
+	double start = 0.0;
+	double end = 0.0;
+	if (sumPhases(copyA, validA, busy, start, end)) {
+		statCopyA.Add(busy * toMs);
+		if (timerCopyA.calibrated) {
+			statCopyAStart.Add(sincePresent(start));
+			statCopyAEnd.Add(sincePresent(end));
+		}
+	}
+
+	if (asyncUnpack) {
+		if (sumPhases(copyB, validB, busy, start, end)) {
+			statUnpack.Add(busy * toMs);
+			if (timerCopyB.calibrated) {
+				statUnpackStart.Add(sincePresent(start));
+				statUnpackEnd.Add(sincePresent(end));
+			}
+		}
+	} else if ((validDisplay & kListUnpack) == kListUnpack) {
+		// Serialised: the list starts once the transfer has landed and unpacks first.
+		statUnpack.Add((display[kMarkAfterUnpack] - display[kMarkListBegin]) * toMs);
+		if (timerDisplay.calibrated) {
+			statUnpackStart.Add(sincePresent(display[kMarkListBegin]));
+			statUnpackEnd.Add(sincePresent(display[kMarkAfterUnpack]));
+		}
+	}
+
+	if ((validDisplay & kListBeginEnd) == kListBeginEnd) {
+		statDisplayList.Add((display[kMarkListEnd] - display[kMarkListBegin]) * toMs);
+		if (timerDisplay.calibrated) {
+			statListStart.Add(sincePresent(display[kMarkListBegin]));
+			statListEnd.Add(sincePresent(display[kMarkListEnd]));
+		}
+	}
+
+	constexpr UINT kUpsample = (1u << kMarkUpsampleBegin) | (1u << kMarkUpsampleEnd);
+	if ((validDisplay & kUpsample) == kUpsample) {
+		statUpsample.Add((display[kMarkUpsampleEnd] - display[kMarkUpsampleBegin]) * toMs);
+		if (timerDisplay.calibrated)
+			statUpsampleEnd.Add(sincePresent(display[kMarkUpsampleEnd]));
+	}
 }
 
 void CrossAdapterBridge::LogStats()
@@ -770,11 +1667,11 @@ void CrossAdapterBridge::LogStats()
 
 	const double fps = static_cast<double>(statFrames) * 1000.0 / elapsedMs;
 	const double mbPerFrame = static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0);
-	if (statGpuCopySamples) {
-		const double avgCopy = statGpuCopyMs / static_cast<double>(statGpuCopySamples);
+	if (statCopyA.count) {
+		const double avgCopy = statCopyA.Mean();
 		REX::INFO("[FG-GPU1] {:.1f} game fps | {:.1f} MB/frame = {:.2f} GB/s | copy on render GPU avg {:.2f} ms max {:.2f} ms "
 				  "(~{:.2f} GB/s link) | submit {:.3f} ms | max lag {} | cpu waits {}",
-			fps, mbPerFrame, mbPerFrame * fps / 1024.0, avgCopy, statGpuCopyMaxMs,
+			fps, mbPerFrame, mbPerFrame * fps / 1024.0, avgCopy, statCopyA.max,
 			avgCopy > 0.0 ? mbPerFrame / 1024.0 / (avgCopy / 1000.0) : 0.0,
 			statCpuSubmitMs / static_cast<double>(statFrames), statMaxLag, statCpuWaits);
 	} else {
@@ -783,31 +1680,101 @@ void CrossAdapterBridge::LogStats()
 			statCpuWaits);
 	}
 
+	// Display GPU: how long the read takes and how busy the direct queue is.
+	REX::INFO("[FG-GPU1] display GPU: unpack ({}) avg {:.2f} ms max {:.2f} ms | direct list avg {:.2f} ms max {:.2f} ms",
+		asyncUnpack ? "copy queue" : "direct queue", statUnpack.Mean(), statUnpack.max, statDisplayList.Mean(),
+		statDisplayList.max);
+
+	// One frame's path, in ms after the CPU entered Present for it (both GPUs on the CPU clock).
+	if (statCopyAStart.count && statListEnd.count) {
+		REX::INFO("[FG-GPU1] timeline ms after Present: 3090 copy {:.1f}-{:.1f} | 9060 unpack {:.1f}-{:.1f} | "
+				  "9060 list {:.1f}-{:.1f}",
+			statCopyAStart.Mean(), statCopyAEnd.Mean(), statUnpackStart.Mean(), statUnpackEnd.Mean(),
+			statListStart.Mean(), statListEnd.Mean());
+	}
+
+	// iHalfResDepthMV = 1: compare "done" with the unpack end above; earlier means it is hidden.
+	if (statUpsample.count) {
+		REX::INFO("[FG-GPU1] depth rebuild on display GPU avg {:.2f} ms max {:.2f} ms | done {:.1f} ms after Present",
+			statUpsample.Mean(), statUpsample.max, statUpsampleEnd.Mean());
+	}
+
+	// Back-pressure on the render thread: while it sits here, the 3090 gets no new work.
+	REX::INFO("[FG-GPU1] render thread blocked: FFX Present avg {:.2f} ms max {:.2f} ms | latency wait avg {:.2f} ms "
+			  "max {:.2f} ms | D3D11 gate pending {}/{}",
+		statPresentBlock.Mean(), statPresentBlock.max, statLatencyWait.Mean(), statLatencyWait.max, statGatePending,
+		statGateCalls);
+
 	statFrames = 0;
-	statGpuCopyMs = 0.0;
-	statGpuCopySamples = 0;
-	statGpuCopyMaxMs = 0.0;
+	statCopyA = {};
+	statUnpack = {};
+	statDisplayList = {};
+	statCopyAStart = {};
+	statCopyAEnd = {};
+	statUnpackStart = {};
+	statUnpackEnd = {};
+	statListStart = {};
+	statListEnd = {};
+	statUpsample = {};
+	statUpsampleEnd = {};
+	statPresentBlock = {};
+	statLatencyWait = {};
 	statCpuSubmitMs = 0.0;
 	statMaxLag = 0;
 	statCpuWaits = 0;
+	statGatePending = 0;
+	statGateCalls = 0;
 	statLastLog = now;
 }
 
 void CrossAdapterBridge::Shutdown() noexcept
 {
-	if (copyQueueA && copyDoneFenceA && fenceEvent && transferValue)
-		WaitCpu(copyDoneFenceA.get(), transferValue);
+	if (fenceEvent) {
+		if (copyQueueA && copyDoneFenceA && transferValue)
+			WaitCpu(copyDoneFenceA.get(), transferValue);
+		// A read started at a hook whose Present never came: signal it, or the wait below times out.
+		if (unpackStarted && copyQueueB && unpackFenceB)
+			copyQueueB->Signal(unpackFenceB.get(), unpackFrame);
+		const UINT64 lastUnpack = (std::max)(slotUnpack[0], slotUnpack[1]);
+		if (copyQueueB && unpackFenceB && lastUnpack)
+			WaitCpu(unpackFenceB.get(), lastUnpack);
+		if (displayDoneFenceB && displayDoneValue)
+			WaitCpu(displayDoneFenceB.get(), displayDoneValue);
+	}
 	active = false;
+	asyncUnpack = true;
+	ResetUpsampler();
 	lanes.clear();
 	bytesPerFrame = 0;
+	currentSlot = 0;
 	transferValue = 0;
 	slotTransfer = {};
-	timestampHeap = nullptr;
-	timestampReadback = nullptr;
+	slotPresentQpc = {};
+	frameStarted = false;
+	frameSlot = 0;
+	nextLaneValue = 0;
+	laneValue = {};
+	laneFrame = {};
+	slotUnpack = {};
+	unpackStarted = false;
+	unpackFrame = 0;
+	laneUnpackFrame = {};
+	slotDisplayDone = {};
+	displayDoneValue = 0;
+	timerCopyA.Reset();
+	timerCopyB.Reset();
+	timerDisplay.Reset();
 	listA = nullptr;
 	for (auto& allocator : allocatorsA)
 		allocator = nullptr;
 	copyQueueA = nullptr;
+	listB = nullptr;
+	for (auto& allocator : allocatorsB)
+		allocator = nullptr;
+	copyQueueB = nullptr;
+	unpackFenceB = nullptr;
+	displayQueue = nullptr;
+	displayDoneFenceB = nullptr;
 	transferFenceA = nullptr;
 	transferFenceB = nullptr;
 	consumedFenceA = nullptr;
