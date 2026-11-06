@@ -10,6 +10,9 @@
 #include <ffx2/api/include/dx12/ffx_api_dx12.hpp>
 #include <ffx2/framegeneration/include/ffx_framegeneration.hpp>
 #include <ffx2/framegeneration/include/dx12/ffx_api_framegeneration_dx12.hpp>
+#include <ffx2/upscalers/include/ffx_upscale.hpp>
+
+#include <string>
 
 #include "Buffer.h"
 
@@ -75,12 +78,36 @@ public:
 	ffx::Context frameGenContext{};
 	HWND window = nullptr;
 
+	// FG-GPU1: FSR 4.1 upscaling on the display GPU (SDK 2.4 only; see SecondaryUpscale).
+	ffx::Context upscaleContext{};
+	std::string upscalerProvider;
+
+	// What frame generation reads instead of the plugin's own buffers on a frame the display GPU
+	// upscaled: the FSR 4.1 output as the UI-free frame, and the size and jitter it was rendered at.
+	struct FrameOverride
+	{
+		ID3D12Resource* hudless = nullptr;
+		uint32_t renderWidth = 0;
+		uint32_t renderHeight = 0;
+		float jitterX = 0.0f;  // render pixels, as Upscaling.dll applied it
+		float jitterY = 0.0f;
+	};
+
 	void LoadFFX();
 	// Creates the FFX frame-generation swap chain and the frame generation context. With the SDK
 	// 2.4 runtime a creation failure falls back to SDK 1.1.4 once, so the game still starts.
 	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
 		ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain);
-	void Present(bool a_useFrameGeneration);
+	void Present(bool a_useFrameGeneration, const FrameOverride* a_override = nullptr);
+
+	// FSR 4.x upscaler on a_device for a_render -> a_display. Only the SDK 2.4 runtime, and only an
+	// FSR 4 provider: false (logged) when the runtime, GPU or driver does not offer one.
+	bool CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, uint32_t a_renderHeight, uint32_t a_displayWidth,
+		uint32_t a_displayHeight, bool a_debugChecking);
+	ffx::ReturnCode DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch);
+
+	// The game camera's vertical field of view in radians (FSR upscaling and frame generation).
+	static float VerticalFov(float a_aspect);
 
 	[[nodiscard]] const char* RuntimeName() const;
 

@@ -24,7 +24,7 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | Path | What |
 |---|---|
 | `overlay/` | Full copies of the changed/new upstream files. The build copies them over the pinned checkout. |
-| `overlay/include/ffx2/` | FSR SDK 2.4 API headers (unmodified, MIT), used for both FSR runtimes |
+| `overlay/include/ffx2/` | FSR SDK 2.4 API, frame-generation and upscaler headers (unmodified, MIT), used for both FSR runtimes |
 | `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review (without the vendored SDK headers and licence text) |
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
@@ -33,7 +33,9 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 
 The changes:
 - `CrossAdapterBridge.h/.cpp` are new: adapter choice, cross-adapter heaps and fences, the copy queue, unpacking, stats.
-- `DX11Hooks.cpp`, `DX12SwapChain.*`, `Upscaling.*` and `settings.ini` are small edits.
+- `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU.
+- `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` and `settings.ini` are small edits.
+- `overlay/plugins/Upscaling/` patches FO4Upscaling's `Upscaling.dll` (built and shipped too): upscale method 3 renders for the second GPU's FSR 4.1.
 
 ## Build on this PC
 
@@ -256,11 +258,60 @@ example) wins; the log warns when that happens.
 
 ## Frame generation is not upscaling
 
-GPU1 mode renders the game at whatever resolution the game asks for, on the 3090, and doubles the
-presented frames on the 9060. It does **not** upscale. If the game renders 4K natively, the 3090's
-frame rate is the ceiling: 38 game fps becomes ~75 presented fps, not 100+. To raise the base frame
-rate, add an upscaler (FO4Upscaling's own `Upscaling.dll`, or lower the game's resolution) so the
-3090 renders fewer pixels; FSR3 FG then interpolates the upscaled output.
+GPU1 mode on its own renders the game at whatever resolution the game asks for, on the 3090, and
+doubles the presented frames on the 9060. It does **not** upscale. If the game renders 4K natively,
+the 3090's frame rate is the ceiling: 38 game fps becomes ~75 presented fps, not 100+. To raise the
+base frame rate, let the 3090 render fewer pixels: either FSR 4.1 on the 9060 (next section), or
+FO4Upscaling's DLSS/FSR 3.1 on the 3090 (`iUpscaleMethodPreference = 2` or `1` in the
+`Upscaling.dll` shipped here); FSR3 FG then interpolates the upscaled output.
+
+## FSR 4.1 upscaling on the second GPU
+
+The 9060 XT can also run **AMD FSR Upscaling 4.1** (the ML upscaler, SDK 2.4; it works on
+Windows 10). The 3090 then renders the 3D scene at the quality mode's resolution (Quality: 2560×1440
+for 4K) and the 9060 upscales it to 4K before frame generation. The 3090 keeps drawing the UI at 4K,
+so text stays sharp. This frees most of the 3090's 4K render time for heavier graphics settings
+and mods. The RTX 3090 itself is not offered FSR 4.
+
+Switch it on in **`Upscaling.dll`**'s settings (MCM → Upscaling → Upscale Method Preference →
+"AMD FSR 4.1 (second GPU)", or `iUpscaleMethodPreference = 3` in
+`Data\MCM\Settings\Upscaling.ini`) and restart. The package ships the matching `Upscaling.dll`
+(FO4Upscaling at the same commit, plus this mode); it replaces any other `Upscaling.dll` (doodlum's,
+for example), which cannot do this. Needs `iFSRRuntime = 1` and `bAsyncUnpack = 1`. `iQualityMode`
+picks the render resolution (1 Quality 1.5×, 2 Balanced 1.7×, 3 Performance 2×, 0 Native AA).
+Changing the method or the quality mode needs a restart: the transport and the FSR 4.1 context are
+sized for it at startup.
+
+How a frame goes:
+
+| step | GPU | what |
+|---|---|---|
+| scene | 3090 | `Upscaling.dll` renders at e.g. 2560×1440 into the corner of the 4K targets, with a sub-pixel jitter each frame and **TAA off** (FSR 4.1 is the anti-aliasing) |
+| world hook | 3090 → 9060 | render-resolution depth and motion vectors cross PCIe |
+| end of imagespace | 3090 → 9060 | the render-resolution scene (UI-free) crosses; the 3090 fills its 4K frame buffer from it with a plain bilinear stretch, so the UI is drawn over a background |
+| as soon as those land | 9060 | **FSR 4.1** 1440p → 4K on the direct queue, while the 3090 still draws the UI |
+| Present | 3090 → 9060 | the finished 4K frame (stretch + UI) crosses |
+| Present | 9060 | the UI is composited over the FSR 4.1 result (the 9060 rebuilds the same stretch, keeps what the UI changed); frame generation gets the FSR 4.1 result as its UI-free frame |
+
+Payload at 4K Quality: 14.75 MB scene + 14.75 MB depth + 14.75 MB motion vectors + 33.2 MB finished
+frame ≈ **77 MB/frame** (126.6 MB at native 4K). `iHalfResDepthMV` and `bSendHudlessFrame = 0`
+are ignored in this mode. AMD lists FSR 4.1 at ~3.4 ms on a 9060 XT at 4K; a probe on this PC
+measured 3.3 ms.
+
+Menus `Upscaling.dll` renders natively (Pip-Boy, containers, loading) are shown as rendered, without
+frame generation. If anything is missing (the other `Upscaling.dll`, SDK 1.1.4, no FSR 4 provider,
+an HDR back buffer), the log says why and the game renders at full resolution as before.
+
+```
+[FSR4] upscaler providers offered for the display GPU: 4.1.2, 3.1.6, 2.3.4
+[FSR4] upscaler 4.1.2 on the display GPU: 2560x1440 -> 3840x2160, 317.5 MB
+[FSR4] upscaling on the display GPU: the game renders 2560x1440 (Quality), FSR 4.1.2 upscales to 3840x2160
+[FSR4] lanes bound: scene, depth and motion vectors 2560x1440 -> FSR 4.1 3840x2160; the UI is composited over it
+[FSR4] 2560x1440 -> 3840x2160: 710 frames upscaled, 0 at full resolution, 1 history resets | FSR 4.1.2 on the display GPU avg 3.30 ms max 3.80 ms | UI composite + copy avg 0.25 ms max 0.40 ms
+```
+
+(Expected lines, not a capture.) `Upscaling.log` shows the other side:
+`[UPSCALE] FSR 4.1 on the second GPU is ready: rendering at the quality mode's resolution`.
 
 ## Performance budget
 

@@ -4,6 +4,7 @@
 
 #include "CrossAdapterBridge.h"
 #include "FidelityFX.h"
+#include "SecondaryUpscale.h"
 #include "Streamline.h"
 #include "UICompositor.h"
 #include "Upscaling.h"
@@ -158,6 +159,12 @@ void DX12SwapChain::CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
 	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
 	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
 	REX::INFO("[FG] FSR3 swap chain created: {}x{} ({})", swapChainDesc.Width, swapChainDesc.Height, fidelityFX->RuntimeName());
+
+	// FG-GPU1: FSR 4.1 upscaling on this GPU when Upscaling.dll is set to it. Decided here, before
+	// the lanes exist, because they are sized for it.
+	if (secondaryGPU && swapChain && CrossAdapterBridge::GetSingleton()->IsActive())
+		SecondaryUpscale::GetSingleton()->Initialize(d3d12Device.get(), commandQueue.get(), swapChainDesc.Width,
+			swapChainDesc.Height, swapChainDesc.Format);
 }
 
 void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
@@ -237,10 +244,15 @@ void DX12SwapChain::CreateInterop()
 
 	if (secondaryGPU) {
 		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
+		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it.
+		auto secondaryUpscale = SecondaryUpscale::GetSingleton();
 		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
-			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(), false);
+			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(),
+			secondaryUpscale->Planned());
 		if (finalFrameLane < 0)
 			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
+		else if (secondaryUpscale->Planned())
+			secondaryUpscale->SetFinalLane(finalFrameLane);
 	}
 }
 
@@ -343,6 +355,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			bridge->RecordDepthUpsample(commandLists[frameIndex].get(), frameIndex);
 		}
 		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkAfterUnpack);
+	}
+
+	// FG-GPU1 FSR 4.1 upscaling on this GPU: the finished frame was unpacked into a mirror. Put its
+	// UI over the FSR 4.1 result, or show it as rendered (menus, loading), in the back buffer.
+	auto secondaryUpscale = SecondaryUpscale::GetSingleton();
+	const bool upscaleLanes = crossAdapter && secondaryUpscale->HasFinalMirror();
+	bool upscaledFrame = false;
+	if (upscaleLanes) {
+		upscaledFrame = upscalingForUI->frameUpscaled[frameIndex] && secondaryUpscale->FinishSubmit(frameIndex);
+		secondaryUpscale->RecordPresent(commandLists[frameIndex].get(), frameIndex, upscaledFrame,
+			swapChainBuffers[frameIndex].get());
 	}
 
 	// Transfer frame to swap chain buffer (single-GPU path)
@@ -455,7 +478,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			xessFrameId++;
 		}
 	} else {
-		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
+		FidelityFX::FrameOverride frameOverride{};
+		const FidelityFX::FrameOverride* frameOverridePtr = nullptr;
+		if (upscaleLanes) {
+			// The depth and motion-vector lanes hold the render-resolution scene, so only upscaled
+			// frames can be interpolated; their UI-free frame is the FSR 4.1 result.
+			useFrameGenerationThisFrame = useFrameGenerationThisFrame && upscaledFrame;
+			if (upscaledFrame) {
+				frameOverride.hudless = secondaryUpscale->Output(frameIndex);
+				frameOverride.renderWidth = secondaryUpscale->RenderWidth();
+				frameOverride.renderHeight = secondaryUpscale->RenderHeight();
+				frameOverride.jitterX = upscaling->externalFrame.jitterX;
+				frameOverride.jitterY = upscaling->externalFrame.jitterY;
+				frameOverridePtr = &frameOverride;
+			}
+		}
+		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame, frameOverridePtr);
 	}
 
 	if (crossAdapter)
@@ -477,6 +515,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			bridge->SignalConsumed(commandQueue.get());
 		bridge->SignalDisplayListDone(commandQueue.get());
 	}
+	if (upscaleLanes) {
+		secondaryUpscale->EndFrame(frameIndex, upscaledFrame);
+		secondaryUpscale->LogStats();
+	}
+	// Upscaling.dll reports the next frame before it renders it.
+	upscaling->frameUpscaled[frameIndex] = false;
+	upscaling->externalFrame.valid = false;
+	upscaling->externalFrame.captured = false;
 
 	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
 	// Uses the other command list slot for tagging, submitted before Present

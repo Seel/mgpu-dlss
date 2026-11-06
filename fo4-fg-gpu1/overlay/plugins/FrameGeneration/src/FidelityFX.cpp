@@ -4,9 +4,12 @@
 
 #include "DX12SwapChain.h"
 
+#include <DirectXMath.h>
+
 #include <atomic>
 #include <cmath>
 #include <cwctype>
+#include <format>
 #include <initializer_list>
 #include <vector>
 
@@ -18,6 +21,7 @@ namespace
 	constexpr const wchar_t* kLegacyDll = L"amd_fidelityfx_dx12.dll";
 	constexpr const wchar_t* kLoaderDll = L"amd_fidelityfx_loader_dx12.dll";
 	constexpr const wchar_t* kFrameGenDll = L"amd_fidelityfx_framegeneration_dx12.dll";
+	constexpr const wchar_t* kUpscalerDll = L"amd_fidelityfx_upscaler_dx12.dll";
 
 	std::string Narrow(const wchar_t* a_text)
 	{
@@ -415,6 +419,80 @@ void FidelityFX::DestroyContexts(IDXGISwapChain4** a_swapChain)
 	}
 }
 
+bool FidelityFX::CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, uint32_t a_renderHeight,
+	uint32_t a_displayWidth, uint32_t a_displayHeight, bool a_debugChecking)
+{
+	if (runtime != Runtime::kSDK24) {
+		REX::ERROR("[FSR4] FSR 4.1 upscaling needs the FSR SDK 2.4 runtime (iFSRRuntime = 1); this session runs {}",
+			RuntimeName());
+		return false;
+	}
+	if (upscaleContext)
+		return true;
+
+	// The FSR 4 providers are only offered for a device that can run them, so query with it.
+	const auto offered = QueryProviders(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, a_device);
+	REX::INFO("[FSR4] upscaler providers offered for the display GPU: {}", Join(offered));
+	uint64_t fsr4 = 0;
+	for (size_t i = 0; i < offered.ids.size(); ++i) {
+		if (offered.names[i].starts_with("4.")) {
+			fsr4 = offered.ids[i];  // newest first
+			break;
+		}
+	}
+	if (!fsr4) {
+		REX::ERROR("[FSR4] no FSR 4 upscaler is offered for this GPU and driver (AMD lists RX 6000 or newer and a current "
+				   "Adrenalin driver); upscaling on the second GPU is off");
+		return false;
+	}
+
+	// Fallout 4's frame is upscaled after its imagespace, i.e. tonemapped LDR in a UNORM target:
+	// perceptual colour. Depth is 0 at the near plane (not inverted), motion vectors are at render
+	// resolution and carry no jitter (the same flags Upscaling.dll uses for FSR 3.1).
+	ffx::CreateContextDescUpscale create{};
+	create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+	if (a_debugChecking)
+		create.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+	create.maxRenderSize = { a_renderWidth, a_renderHeight };
+	create.maxUpscaleSize = { a_displayWidth, a_displayHeight };
+	create.fpMessage = FfxMessage;
+
+	ffx::CreateContextDescUpscaleVersion version{};
+	version.version = FFX_UPSCALER_VERSION;
+	ffx::CreateBackendDX12Desc backend{};
+	backend.device = a_device;
+	ffx::CreateContextDescOverrideVersion pin{};
+	pin.versionId = fsr4;
+
+	const auto rc = ffxModule.CreateContext(&upscaleContext,
+		Chain({ &create.header, &version.header, &backend.header, &pin.header }), nullptr);
+	if (rc != FFX_API_RETURN_OK) {
+		upscaleContext = nullptr;
+		REX::ERROR("[FSR4] creating the upscaler context ({}x{} -> {}x{}) failed: {} ({})", a_renderWidth, a_renderHeight,
+			a_displayWidth, a_displayHeight, ffxm::ReturnCodeName(rc), rc);
+		return false;
+	}
+
+	upscalerProvider = ProviderName(upscaleContext);
+	FfxApiEffectMemoryUsage memory{};
+	ffx::QueryDescUpscaleGetGPUMemoryUsage memoryQuery{};
+	memoryQuery.gpuMemoryUsageUpscaler = &memory;
+	const bool haveMemory = ffxm::Query(upscaleContext, memoryQuery) == ffx::ReturnCode::Ok;
+	REX::INFO("[FSR4] upscaler {} on the display GPU: {}x{} -> {}x{}{}{}", upscalerProvider, a_renderWidth, a_renderHeight,
+		a_displayWidth, a_displayHeight,
+		haveMemory ? std::format(", {:.1f} MB", static_cast<double>(memory.totalUsageInBytes) / (1024.0 * 1024.0)) : std::string{},
+		a_debugChecking ? ", API checks on (bEnableDebugLogging)" : "");
+	LogModule(kUpscalerDll);
+	return true;
+}
+
+ffx::ReturnCode FidelityFX::DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch)
+{
+	if (!upscaleContext)
+		return ffx::ReturnCode::Error;
+	return ffxm::Dispatch(upscaleContext, a_dispatch);
+}
+
 void FidelityFX::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
 	ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain)
 {
@@ -443,13 +521,66 @@ void FidelityFX::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_D
 	return singleton.get();
 }
 
-void FidelityFX::Present(bool a_useFrameGeneration)
+float FidelityFX::VerticalFov(float a_aspect)
+{
+	// The camera's projMat field is not a plain projection in this game (its [1][1] read ~0.013,
+	// a 178 degree FOV). Rebuild the projection from the view and the unjittered view-projection,
+	// as the DLSS-G path does, and only trust it if it looks like one: a perspective projection
+	// has P[0][0] * aspect == P[1][1]. Otherwise the 1 rad FSR 3.1 has always been given here.
+	static auto gameViewport = State_GetSingleton();
+	const auto& view = gameViewport->cameraState.camViewData;
+	const auto load = [](const __m128 (&a_rows)[4]) {
+		DirectX::XMMATRIX m;
+		for (int i = 0; i < 4; ++i)
+			m.r[i] = a_rows[i];
+		return m;
+	};
+	const DirectX::XMMATRIX viewMatrix = load(view.viewMat);
+	const DirectX::XMMATRIX viewProj = load(view.viewProjUnjittered);
+	DirectX::XMVECTOR determinant;
+	const DirectX::XMMATRIX inverseView = DirectX::XMMatrixInverse(&determinant, viewMatrix);
+	// Row vectors (v * V * P) first, as the DLSS-G and XeSS paths assume; column vectors second.
+	const DirectX::XMMATRIX candidates[2] = { DirectX::XMMatrixMultiply(inverseView, viewProj),
+		DirectX::XMMatrixMultiply(viewProj, inverseView) };
+
+	float fov = 1.0f;
+	int source = -1;
+	float p11[2]{};
+	for (int i = 0; i < 2; ++i) {
+		const float yScale = std::fabs(DirectX::XMVectorGetY(candidates[i].r[1]));
+		const float xScale = std::fabs(DirectX::XMVectorGetX(candidates[i].r[0]));
+		p11[i] = yScale;
+		if (!std::isfinite(yScale) || !std::isfinite(xScale) || yScale < 0.1f || yScale > 20.0f)
+			continue;
+		if (std::fabs(xScale * a_aspect - yScale) > 0.03f * yScale)
+			continue;  // not a symmetric perspective projection
+		fov = 2.0f * std::atan(1.0f / yScale);
+		source = i;
+		break;
+	}
+
+	static int loggedSource = -2;
+	if (source != loggedSource) {
+		REX::INFO("[FSR] camera vertical FOV {:.3f} rad ({:.1f} deg) from {} (projMat[1][1] {:.4f}, inv(view)*viewProj {:.4f}, "
+				  "viewProj*inv(view) {:.4f}, aspect {:.3f})",
+			fov, fov * 57.29578f,
+			source == 0 ? "inverse(view) * viewProjUnjittered" :
+			source == 1 ? "viewProjUnjittered * inverse(view)" :
+						  "the 1 rad default (no projection found)",
+			Component(view.projMat[1], 1), p11[0], p11[1], a_aspect);
+		loggedSource = source;
+	}
+	return fov;
+}
+
+void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_override)
 {
 	auto upscaling = Upscaling::GetSingleton();
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 	auto commandList = dx12SwapChain->commandLists[dx12SwapChain->frameIndex].get();
 
-	auto HUDLessColor = upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
+	// FG-GPU1 upscaling: the UI-free frame is the FSR 4.1 output, not the render-resolution lane.
+	auto HUDLessColor = a_override ? a_override->hudless : upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
 	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
 	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
 
@@ -541,6 +672,18 @@ void FidelityFX::Present(bool a_useFrameGeneration)
 		float2 jitter;
 		jitter.x = -gameViewport->offsetX * screenSize.x / 2.0f;
 		jitter.y = gameViewport->offsetY * screenSize.y / 2.0f;
+		float2 jitterOffset(-jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale,
+			-jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale);
+
+		// FG-GPU1 upscaling: depth and motion vectors are the render-resolution lanes, and the size
+		// and jitter come from Upscaling.dll for this frame instead of the dynamic-resolution state,
+		// which other hooks change around Present.
+		if (a_override) {
+			renderWidth = a_override->renderWidth;
+			renderHeight = a_override->renderHeight;
+			renderSize = float2(static_cast<float>(renderWidth), static_cast<float>(renderHeight));
+			jitterOffset = float2(-a_override->jitterX, -a_override->jitterY);
+		}
 
 		// The fields both prepare structs share, filled the same way for both runtimes.
 		auto fillCommon = [&](auto& a_prepare) {
@@ -549,8 +692,8 @@ void FidelityFX::Present(bool a_useFrameGeneration)
 			a_prepare.motionVectorScale.y = renderSize.y;
 			a_prepare.renderSize.width = renderWidth;
 			a_prepare.renderSize.height = renderHeight;
-			a_prepare.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale;
-			a_prepare.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale;
+			a_prepare.jitterOffset.x = jitterOffset.x;
+			a_prepare.jitterOffset.y = jitterOffset.y;
 			a_prepare.frameTimeDelta = deltaTime * 1000.f;
 			a_prepare.cameraNear = *(float*)REL::ID({ 57985, 2712882, 2712882 }).address();
 			a_prepare.cameraFar = *(float*)REL::ID({ 958877, 2712883, 2712883 }).address();
@@ -579,10 +722,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
 			StoreUnit(dispatchParameters.cameraRight, view.viewRight);
 			StoreUnit(dispatchParameters.cameraForward, view.viewDir);
 
-			// Vertical FOV from the projection (P[1][1] = 1 / tan(fovY / 2); jitter does not touch it).
-			const float yScale = Component(view.projMat[1], 1);
-			if (std::isfinite(yScale) && yScale > 0.01f)
-				dispatchParameters.cameraFovAngleVertical = 2.0f * std::atan(1.0f / yScale);
+			dispatchParameters.cameraFovAngleVertical = VerticalFov(screenSize.x / screenSize.y);
 
 			prepareResult = ffxm::Dispatch(frameGenContext, dispatchParameters);
 		} else {

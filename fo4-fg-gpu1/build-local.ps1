@@ -1,5 +1,6 @@
 <#
-  Builds AAAFrameGeneration.dll (FG-GPU1) locally with the Visual Studio already installed.
+  Builds AAAFrameGeneration.dll (FG-GPU1) and the matching Upscaling.dll locally with the
+  Visual Studio already installed.
 
   Usage (either shell works; when started from Windows PowerShell 5.1 the script re-runs
   itself under PowerShell 7 if pwsh is installed):
@@ -117,6 +118,10 @@ try {
     Run cmake @("-S", ".", "--preset=default", "-G", $generator)
     Step "Build AAAFrameGeneration (Release)"
     Run cmake @("--build", "build", "--config", "Release", "--target", "AAAFrameGeneration")
+    # The matching Upscaling.dll: render scale, jitter and no TAA for FSR 4.1 on the second GPU
+    # (iUpscaleMethodPreference = 3). Same pinned tree, with the overlay's changes.
+    Step "Build Upscaling (Release)"
+    Run cmake @("--build", "build", "--config", "Release", "--target", "Upscaling")
 } finally { Pop-Location }
 
 # ---------------------------------------------------------------- package
@@ -124,13 +129,21 @@ Step "Package"
 $pkg = "$WorkDir\package"
 if (Test-Path $pkg) { Remove-Item -Recurse -Force $pkg }
 $plugins = "$pkg\Data\F4SE\Plugins"
-New-Item -ItemType Directory -Force "$plugins\FrameGeneration\FidelityFX", "$pkg\Data\MCM\Config\FrameGeneration" | Out-Null
+New-Item -ItemType Directory -Force "$plugins\FrameGeneration\FidelityFX", "$pkg\Data\MCM\Config\FrameGeneration",
+    "$plugins\Upscaling", "$pkg\Data\MCM\Config\Upscaling" | Out-Null
 $bin = "$src\build\plugins\FrameGeneration\Release"
 Copy-Item "$bin\AAAFrameGeneration.dll" $plugins
 if (Test-Path "$bin\AAAFrameGeneration.pdb") { Copy-Item "$bin\AAAFrameGeneration.pdb" $plugins }
 Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\*.hlsl" "$plugins\FrameGeneration"
 Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\FidelityFX\LICENSE.txt" "$plugins\FrameGeneration\FidelityFX"
 Copy-Item -Recurse "$src\package\MCM\Config\FrameGeneration\*" "$pkg\Data\MCM\Config\FrameGeneration"
+# Upscaling.dll (FG-GPU1 build) with its shaders and MCM page. No Streamline runtime: its DLSS
+# method falls back to FSR 3.1 without it, and the FSR 4.1 method does not use it.
+$upBin = "$src\build\plugins\Upscaling\Release"
+Copy-Item "$upBin\Upscaling.dll" $plugins
+if (Test-Path "$upBin\Upscaling.pdb") { Copy-Item "$upBin\Upscaling.pdb" $plugins }
+Copy-Item "$src\package\F4SE\Plugins\Upscaling\*.hlsl" "$plugins\Upscaling"
+Copy-Item -Recurse "$src\package\MCM\Config\Upscaling\*" "$pkg\Data\MCM\Config\Upscaling"
 
 # FidelityFX runtime (same version/hash as upstream scripts/sdk-manifest.sh)
 $ffxZip = "$WorkDir\FidelityFX-SDK-v1.1.4.zip"
@@ -147,16 +160,18 @@ try {
     [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, "$plugins\FrameGeneration\FidelityFX\amd_fidelityfx_dx12.dll", $true)
 } finally { $zip.Dispose() }
 
-# FSR SDK 2.4 runtime (iFSRRuntime = 1): the loader and the frame-generation effect DLL. The v2.4.0
-# release has no binary asset (its source archive is ~250 MB), so the two signed DLLs are fetched
-# one by one from the tagged commit and checked against pinned hashes. The loader finds the effect
-# DLL next to itself, so both go into the same FidelityFX folder as the 1.1.4 DLL.
+# FSR SDK 2.4 runtime (iFSRRuntime = 1): the loader, the frame-generation effect DLL and the
+# upscaler effect DLL (FSR 4.1 on the second GPU). The v2.4.0 release has no binary asset (its
+# source archive is ~250 MB), so the signed DLLs are fetched one by one from the tagged commit and
+# checked against pinned hashes. The loader finds the effect DLLs next to itself, so they all go
+# into the same FidelityFX folder as the 1.1.4 DLL.
 $fsr2Commit = "7539ae8b6568ad29ed78a753404351daf3b5cca7"   # tag v2.4.0
 $fsr2Cache = "$WorkDir\fsr-sdk-2.4.0"
 New-Item -ItemType Directory -Force $fsr2Cache | Out-Null
 $fsr2Dlls = [ordered]@{
     "amd_fidelityfx_loader_dx12.dll"          = "e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb"
     "amd_fidelityfx_framegeneration_dx12.dll" = "e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6"
+    "amd_fidelityfx_upscaler_dx12.dll"        = "aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace"
 }
 foreach ($name in $fsr2Dlls.Keys) {
     $cached = "$fsr2Cache\$name"

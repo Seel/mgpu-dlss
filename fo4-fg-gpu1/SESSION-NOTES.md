@@ -2,7 +2,120 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
-## Latest: FSR SDK 2.4 runtime option (built; first in-game run OK)
+## Latest: FSR 4.1 upscaling on the 9060 (first run 20:32 works; FOV fix built 20:40, not yet run)
+
+**First run (20:32, 4K, Quality → 2560×1440, user's 110° FOV):** worked first try. User: image
+quality "quite good, maybe slightly worse than DLSS"; some grain on thin tree branches (also seen
+with DLSS); "a little hitching here or there", not attributable yet. Log, steady windows:
+
+| | value |
+|---|---|
+| base / presented | 70.0–71.0 / 140.0–142.0, 50% generated (dips 64.9/68.2 = pause menu and a heavier area) |
+| frames upscaled | 650–710 per 10 s, 0 at full resolution, 0–1 history resets |
+| FSR 4.1.2 on the 9060 | avg 4.0–4.3 ms, max 4.3–7.2 ms (probe alone: 3.3 ms; here it shares the GPU with FG and the copy engine, and `bEnableDebugLogging = 1` turned on FSR's API checks) |
+| UI composite + copy | avg 0.40–0.51 ms |
+| payload / 3090 copy | 73.8 MB, avg 5.9 ms (was 102.8 MB / 8.45 ms) |
+| 9060 list end after Present | 5.3–8.2 ms (10.5 in a 3090-bound area) |
+| FFX Present block | avg 0.2–3.1 ms, **max 8–13 ms in most windows** (the 17:48 native-4K run had max 4.1–5.6) |
+
+The occasional 8–13 ms render-thread block is the candidate for the hitches; 10 s aggregates cannot
+tell whether it is this pipeline or FO4 (streaming, HighFPSPhysicsFix). Next: PresentMon A/B at the
+same spot, `iUpscaleMethodPreference = 3` vs `0` (`tools/presentmon-capture.ps1`), with
+`bEnableDebugLogging = 0`.
+
+**Bug found and fixed (20:40): the camera FOV given to FSR was ~178°.** The first upscale logged
+`fovY 3.115`: `camViewData.projMat[1][1]` reads ~0.013 in this game, not 1/tan(fovY/2) (~1.25 for
+110° horizontal at 16:9). The same value went to FSR 3.1.6 frame generation's `PrepareV2` since the
+SDK 2.4 work. `FidelityFX::VerticalFov` now rebuilds the projection as `inverse(view) *
+viewProjUnjittered` (the DLSS-G path's method), accepts it only if `P[0][0] * aspect == P[1][1]`
+(±3%), tries the other multiplication order next, else uses 1 rad (what FSR 3.1 always got). It logs
+the source once: `[FSR] camera vertical FOV ... from ...` — check that line next run (expect ~1.35 rad
+/ ~78° at 110° FOV). Used by both FSR 4.1 and FG.
+
+**Second run (20:46, the 20:40 build):** user: trails reduced, "barely noticeable". But the log
+(1.2 MB) shows the FOV source flipping every frame: at `PostDisplay` (FSR 4.1) the renderer's
+camera state holds a 2D camera (P[1][1] 0.0131, rejected → 1 rad), at Present (FG) a 24° camera
+(P[1][1] 4.7046, `projMat` and `inverse(view) * viewProj` agree, so `projMat` is a real projection;
+the problem is *which* camera is current). Neither is the world camera (~78°). Fixed in the next
+commit: sample in the world pass, latch, log changes sparingly.
+
+Goal: free the 3090 for heavier graphics mods. With `Upscaling.dll`'s
+`iUpscaleMethodPreference = 3`, the 3090 renders the 3D scene at the quality mode's resolution
+(Quality = 2560×1440 at 4K) and the 9060 upscales it with **FSR 4.1.2** (SDK 2.4, ML, works on
+Windows 10) before frame generation. The UI is still drawn at 4K on the 3090. Package:
+`D:\fgb\FO4-FG-GPU1-fsr41.zip` (ships `AAAFrameGeneration.dll` **and** the matching `Upscaling.dll`).
+README section "FSR 4.1 upscaling on the second GPU" has the user-facing description.
+
+Background: DeepSeek's `research/FSR41-UPSCALE-GPU1-REPORT.md` (Option A) and its probe
+(`D:\fsr-probe\upscale\`: 4.1.2 offered on the 9060 under Win10, 3.3 ms 1440p→4K, 317.5 MB). One
+correction to that report and to what this session first said: the "HUD-less buffer sized from
+`kMain` but copied from `kFrameBuffer`" mismatch is **not** a real bug with FO4Upscaling's
+`Upscaling.dll`: it keeps every game render target at full size and renders into the top-left
+render-resolution corner (proxies are swapped in only around a few passes), so `kMain` stays 4K.
+
+How it works (code):
+- **`Upscaling.dll` (overlay `plugins/Upscaling/`)**: new `UpscaleMethod::kSecondaryGPU` (= 3). Same
+  render scale / jitter / TAA-off / mip bias / dynamic-resolution fixes as FSR/DLSS, but `Upscale()`
+  returns early. Each frame `GetUpscaleMethod` asks `FGGPU1_SecondaryUpscalerReady(w, h)` and falls
+  back to native (`kDisabled`) when false; `UpdateUpscaling` calls
+  `FGGPU1_SetSecondaryUpscale(active, w, h, jitterX, jitterY, fSharpness)`. Exports
+  `FO4Upscaling_SecondaryGPUApiVersion` (= 1). `LoadSettings` now reads `MCM\Config` defaults then
+  `MCM\Settings` (upstream read only the latter); the shipped default is 3.
+- **FG plugin, startup** (`SecondaryUpscale::Initialize`, from `CreateSwapChainFSR3`): reads the same
+  two `Upscaling.ini` files; needs method 3, the FG-GPU1 `Upscaling.dll` export, bridge +
+  `bAsyncUnpack`, RGBA8 back buffer, SDK 2.4 and a **4.x** upscaler provider (pinned explicitly).
+  Render size = `(uint)(display * (1 / ratio))`, the same float arithmetic as `Upscaling.dll`.
+  `FidelityFX::CreateUpscaler`: flags `NON_LINEAR_COLORSPACE | AUTO_EXPOSURE` (+`DEBUG_CHECKING` when
+  `bEnableDebugLogging`), messages to the log. Sets `Planned()`; the lanes are then sized for it.
+- **Lanes** (`Upscaling::CreateFrameGenerationResources`): scene (the HUD-less lane), depth, MVs at
+  render size; `iHalfResDepthMV` forced 0, HUD-less forced on; the **final frame lane gets a mirror**
+  instead of being unpacked into the back buffer (`CreateInterop`). `PostAlpha` /
+  `CopyBuffersToSharedResources` copy only the render-size corner.
+- **3090 at `PostDisplay`** (end of imagespace, either hook order works since `Upscale()` is a no-op):
+  copy the corner into the scene lane, `Blit` (`SecondaryUpscaleCS.hlsl`, plain bilinear with
+  `precise` maths) into a 4K texture, `CopyResource` into the frame buffer (RTVs unbound first, as
+  `Upscaling.dll` does), then the UI draws over it. `frameUpscaled[frameIndex]`.
+- **9060**: `CrossAdapterBridge` signals a new `readFenceB` after each lane read;
+  `SecondaryUpscale::BeginFrame` (at `PostDisplay`, right after the scene lane's early transfer/read)
+  queues `Wait(readFence)` + its own direct list with the FSR 4.1 dispatch on the FFX game queue, so
+  the upscale overlaps the 3090's UI pass and the final frame's copy. If the reads are not queued yet
+  (`bEarlyUnpack = 0`), `FinishSubmit` does it at Present after `Unpack`.
+  Present: `RecordPresent` runs `Composite` into a 4K texture and copies it to the back buffer
+  (native frames: plain copy of the final mirror), then FSR3 FG with `FrameOverride` (HUD-less = FSR
+  output, render size + jitter from `Upscaling.dll`). FG only on upscaled frames.
+- **Composite**: rebuilds the 3090's 8-bit stretch from the same scene, `alpha` = smallest UI coverage
+  explaining `final - background`, `out = final + (upscaled - background) * (1 - alpha)`.
+  **Verified on this PC** (scratchpad harness, real shader on both GPUs): 3090 and 9060 stretches
+  differ by ≤1/255 in 3.4% of values; without UI the composite returns the FSR image ±1/255; with
+  synthetic UI (opaque, 50%, 25%, 75%, 10% fade) mean error ≤1.4/255, worst ~15/255 inside opaque UI
+  over a similar-coloured background (FSR detail showing through).
+- Logs: `[FSR4] ...` in `AAAFrameGeneration.log` (providers, context + MB, lanes bound, first
+  upscale with jitter/near/far/fov, every 10 s: frames upscaled/native, resets, FSR GPU ms, composite
+  ms); `[UPSCALE] FSR 4.1 on the second GPU is ready/not ready` in `Upscaling.log`.
+
+Build: `/W4 /WX` 0 warnings; both DLLs export their handshake functions; the shader compiles with
+`fxc /Ges` for Quality/Balanced/Performance/native sizes; `fg-gpu1.patch` (20 files) applies to a
+pristine `3e237a4`. CI workflow builds `Upscaling` too and fetches the upscaler DLL
+(`aad4fccc…`, same commit, verified).
+
+**First test**:
+1. In Vortex, install `FO4-FG-GPU1-fsr41.zip` over the FG-GPU1 mod and let its `Upscaling.dll` win the
+   conflict with the other Upscaling mod (that one is a different, incompatible build).
+2. `Data\MCM\Settings\Upscaling.ini`: `iUpscaleMethodPreference = 3`, `iQualityMode = 1`; FrameGeneration:
+   `iFSRRuntime = 1` (the MCM override had 0 from the 3.1.4 A/B).
+3. Play 60 s at the 4K settings, then grep `[FSR4]`, `[UPSCALE]`, `[FG-GPU1]`, `CRITICAL`. Check: `lanes
+   bound`, `first upscale`, upscaled ≈ all frames, FSR ms ~3.3, presented/game 142/71, `FFX Present`
+   block and the timeline's `9060 list` end, payload ~77 MB.
+4. Look at: UI text sharpness, HUD over sky/foliage (composite), Pip-Boy (native frames), scopes,
+   foliage/weapon ghosting (FO4 motion vectors; `MotionVectorFixes` exists upstream), jitter shimmer
+   (sign/scale of the jitter is the usual suspect: FSR gets `-jitter`, Upscaling.dll's convention).
+5. Then raise graphics settings: the 3090 render time at 1440p is the headroom this buys.
+
+Open risks: FO4 effects drawn after the UI boundary that are not alpha-blended UI; a camera cut does
+not reset FSR history (only native frames / >250 ms gaps do); changing quality mode mid-game falls
+back to native until restart (logged).
+
+## FSR SDK 2.4 runtime option (built; first in-game run OK)
 
 **First run, 2026-11-06 18:30, 4K, raised graphics settings, `iFSRSwapChainProvider = 0`:** swap
 chain **4.0.0** + frame generation **3.1.6**, both DLLs from the plugin folder, window covers the
@@ -671,7 +784,8 @@ same `3e237a4` tree. Watch for Community Shaders conflicts.
 
 | Path | What |
 |---|---|
-| `fo4-fg-gpu1/overlay/` | Modified/new upstream files copied over the pinned checkout |
+| `fo4-fg-gpu1/overlay/` | Modified/new upstream files copied over the pinned checkout (FrameGeneration and Upscaling plugins) |
+| `D:\fgb\FO4-FG-GPU1-fsr41.zip` | Installable zip with FSR 4.1 upscaling on the 9060 (+ matching `Upscaling.dll`) |
 | `fo4-fg-gpu1/build-local.ps1` | Local build + package script (self-relaunches under pwsh 7) |
 | `fo4-fg-gpu1/fg-gpu1.patch` | Full diff against `3e237a4`, applies cleanly |
 | `fo4-fg-gpu1/README.md` | User-facing docs, performance budget, settings |

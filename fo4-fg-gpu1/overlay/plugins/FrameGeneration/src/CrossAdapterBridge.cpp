@@ -552,6 +552,7 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 				allocator = nullptr;
 			copyQueueB = nullptr;
 			unpackFenceB = nullptr;
+			readFenceB = nullptr;
 		};
 		HRESULT hr = deviceB->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(copyQueueB.put()));
 		if (FAILED(hr)) {
@@ -569,6 +570,8 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 				hr = listB->Close();
 			if (SUCCEEDED(hr))
 				hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(unpackFenceB.put()));
+			if (SUCCEEDED(hr))
+				hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(readFenceB.put()));
 			if (FAILED(hr))
 				fallBack("display GPU copy list/fence", hr);
 		}
@@ -1183,6 +1186,16 @@ HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order
 		copyQueueB->ExecuteCommandLists(1, lists);
 		laneUnpackFrame[index] = unpackFrame;
 
+		// FSR 4.1 on this GPU starts as soon as the lanes it reads are in (WaitForLaneReads).
+		if (readFenceB) {
+			hr = copyQueueB->Signal(readFenceB.get(), ++readValue);
+			if (FAILED(hr)) {
+				Fail("lane-read fence Signal", hr);
+				return hr;
+			}
+			laneReadValue[index] = readValue;
+		}
+
 		// iHalfResDepthMV = 1: the depth rebuild may start now, while the other lanes cross.
 		if (upsampler.Ready() && static_cast<int>(index) == upsampler.lane) {
 			hr = copyQueueB->Signal(upsampler.sourceReadyFence.get(), unpackFrame);
@@ -1193,6 +1206,53 @@ HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order
 		}
 	}
 	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::WaitForLaneReads(ID3D12CommandQueue* a_queue, const int* a_lanes, size_t a_count,
+	bool& a_queued)
+{
+	a_queued = false;
+	if (!active)
+		return E_FAIL;
+	if (!asyncUnpack || !copyQueueB || !readFenceB || !a_queue || !a_lanes)
+		return E_INVALIDARG;
+
+	// Only the frame being assembled: its lanes were sent (laneFrame) and their reads queued.
+	UINT64 value = 0;
+	for (size_t position = 0; position < a_count; ++position) {
+		const int lane = a_lanes[position];
+		if (lane < 0 || static_cast<size_t>(lane) >= lanes.size())
+			return E_INVALIDARG;
+		const auto index = static_cast<size_t>(lane);
+		if (laneFrame[index] != transferValue || laneUnpackFrame[index] != transferValue)
+			return S_OK;
+		value = (std::max)(value, laneReadValue[index]);
+	}
+
+	const HRESULT hr = a_queue->Wait(readFenceB.get(), value);
+	if (FAILED(hr)) {
+		Fail("Wait for lane reads", hr);
+		return hr;
+	}
+	a_queued = true;
+	return S_OK;
+}
+
+HRESULT CrossAdapterBridge::WaitDisplayListDone(UINT a_slot)
+{
+	if (!active || a_slot >= kSlots || !displayDoneFenceB || !slotDisplayDone[a_slot])
+		return S_OK;
+	const HRESULT hr = WaitCpu(displayDoneFenceB.get(), slotDisplayDone[a_slot]);
+	if (FAILED(hr))
+		Fail("waiting for the slot's previous direct list", hr);
+	return hr;
+}
+
+bool CrossAdapterBridge::DisplayListDone(UINT a_slot) const noexcept
+{
+	if (!active || a_slot >= kSlots || !displayDoneFenceB)
+		return false;
+	return displayDoneFenceB->GetCompletedValue() >= slotDisplayDone[a_slot];
 }
 
 HRESULT CrossAdapterBridge::WaitTransfer(ID3D12CommandQueue* a_queueB)
@@ -1759,6 +1819,8 @@ void CrossAdapterBridge::Shutdown() noexcept
 	unpackStarted = false;
 	unpackFrame = 0;
 	laneUnpackFrame = {};
+	readValue = 0;
+	laneReadValue = {};
 	slotDisplayDone = {};
 	displayDoneValue = 0;
 	timerCopyA.Reset();
@@ -1773,6 +1835,7 @@ void CrossAdapterBridge::Shutdown() noexcept
 		allocator = nullptr;
 	copyQueueB = nullptr;
 	unpackFenceB = nullptr;
+	readFenceB = nullptr;
 	displayQueue = nullptr;
 	displayDoneFenceB = nullptr;
 	transferFenceA = nullptr;

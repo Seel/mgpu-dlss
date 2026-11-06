@@ -1,5 +1,5 @@
-# Builds AAAFrameGeneration.dll from northaxosky/FO4Upscaling (pinned) with the
-# secondary-GPU frame generation changes in fo4-fg-gpu1/overlay copied over it.
+# Builds AAAFrameGeneration.dll and the matching Upscaling.dll from northaxosky/FO4Upscaling
+# (pinned) with the secondary-GPU changes in fo4-fg-gpu1/overlay copied over it.
 # Output: an artifact "FO4-FG-GPU1" laid out as a mod (Data\...), ready for Vortex/MO2.
 # Manual only (Actions -> FO4 FG on GPU1 -> Run workflow); pushes do not build.
 name: FO4 FG on GPU1
@@ -68,12 +68,17 @@ jobs:
         working-directory: FO4Upscaling
         run: cmake --build build --config Release --target AAAFrameGeneration
 
+      # Render scale, jitter and no TAA for FSR 4.1 on the second GPU (iUpscaleMethodPreference = 3).
+      - name: Build Upscaling
+        working-directory: FO4Upscaling
+        run: cmake --build build --config Release --target Upscaling
+
       - name: Fetch FidelityFX runtime
         shell: bash
         working-directory: FO4Upscaling
         run: bash scripts/fetch-sdks.sh
 
-      # iFSRRuntime = 1: FSR SDK 2.4 loader + frame-generation DLL, pinned to the v2.4.0 commit
+      # iFSRRuntime = 1: FSR SDK 2.4 loader + frame-generation + upscaler DLLs, pinned to the v2.4.0 commit
       # (same files and hashes as build-local.ps1; the release has no binary asset).
       - name: Fetch FSR SDK 2.4 runtime
         shell: bash
@@ -89,13 +94,14 @@ jobs:
           }
           fetch amd_fidelityfx_loader_dx12.dll e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb
           fetch amd_fidelityfx_framegeneration_dx12.dll e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6
+          fetch amd_fidelityfx_upscaler_dx12.dll aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace
 
       - name: Package
         shell: bash
         run: |
           SRC=FO4Upscaling
           OUT=staging/Data
-          mkdir -p "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX" "$OUT/MCM/Config/FrameGeneration"
+          mkdir -p "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX" "$OUT/MCM/Config/FrameGeneration"             "$OUT/F4SE/Plugins/Upscaling" "$OUT/MCM/Config/Upscaling"
           cp "$SRC/build/plugins/FrameGeneration/Release/AAAFrameGeneration.dll" "$OUT/F4SE/Plugins/"
           cp "$SRC/build/plugins/FrameGeneration/Release/AAAFrameGeneration.pdb" "$OUT/F4SE/Plugins/" || true
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/"*.hlsl "$OUT/F4SE/Plugins/FrameGeneration/"
@@ -103,8 +109,13 @@ jobs:
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/LICENSE.txt" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_loader_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_framegeneration_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/amd_fidelityfx_upscaler_dx12.dll" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
           cp "$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX/LICENSE-FSR-SDK-2.4.txt" "$OUT/F4SE/Plugins/FrameGeneration/FidelityFX/"
           cp -r "$SRC/package/MCM/Config/FrameGeneration/." "$OUT/MCM/Config/FrameGeneration/"
+          cp "$SRC/build/plugins/Upscaling/Release/Upscaling.dll" "$OUT/F4SE/Plugins/"
+          cp "$SRC/build/plugins/Upscaling/Release/Upscaling.pdb" "$OUT/F4SE/Plugins/" || true
+          cp "$SRC/package/F4SE/Plugins/Upscaling/"*.hlsl "$OUT/F4SE/Plugins/Upscaling/"
+          cp -r "$SRC/package/MCM/Config/Upscaling/." "$OUT/MCM/Config/Upscaling/"
           cp "$SRC/COPYING" "$SRC/LICENSE" "$SRC/EXCEPTIONS.md" staging/ 2>/dev/null || true
           cp mgpu-dlss/fo4-fg-gpu1/README.md staging/FG-GPU1-README.md
           find staging -type f

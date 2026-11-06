@@ -5,6 +5,7 @@
 #include "CrossAdapterBridge.h"
 #include "DX12SwapChain.h"
 #include "DirectXMath.h"
+#include "SecondaryUpscale.h"
 
 enum class RenderTarget
 {
@@ -206,11 +207,26 @@ void Upscaling::CreateFrameGenerationResources()
 
 	D3D11_TEXTURE2D_DESC mainDesc{};
 	reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
-	SetupHalfResDepthMV(mainDesc.Width, mainDesc.Height);
-	// Latched with the lanes below; a later settings reload must not change it mid-session.
-	hudlessActive = settings.sendHudlessFrame;
-	const UINT halfWidth = (mainDesc.Width + 1) / 2;
-	const UINT halfHeight = (mainDesc.Height + 1) / 2;
+
+	// FG-GPU1 FSR 4.1 upscaling on the second GPU: the UI-free, depth and motion-vector lanes carry
+	// only the render-resolution corner of the game's full-size targets, where Upscaling.dll has the
+	// scene drawn. Otherwise they are full size, as before.
+	auto secondaryUpscale = SecondaryUpscale::GetSingleton();
+	secondaryUpscaleLanes = dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && secondaryUpscale->Planned();
+	laneWidth = secondaryUpscaleLanes ? secondaryUpscale->RenderWidth() : mainDesc.Width;
+	laneHeight = secondaryUpscaleLanes ? secondaryUpscale->RenderHeight() : mainDesc.Height;
+
+	SetupHalfResDepthMV(laneWidth, laneHeight);
+	// Latched with the lanes below; a later settings reload must not change it mid-session. The
+	// upscaler needs the scene, so it is always sent then.
+	hudlessActive = settings.sendHudlessFrame || secondaryUpscaleLanes;
+	if (secondaryUpscaleLanes && !settings.sendHudlessFrame)
+		REX::INFO("[FSR4] bSendHudlessFrame = 0 is ignored: the second GPU upscales the UI-free scene");
+	const UINT halfWidth = (laneWidth + 1) / 2;
+	const UINT halfHeight = (laneHeight + 1) / 2;
+	int sceneLane = -1;
+	int depthLane = -1;
+	int motionLane = -1;
 
 	for (int index = 0; index < 2; index++) {
 		D3D11_TEXTURE2D_DESC texDesc{};
@@ -235,6 +251,9 @@ void Upscaling::CreateFrameGenerationResources()
 		srvDesc.Format = texDesc.Format;
 		rtvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
+		// FSR 4.1 on the second GPU: the render-resolution corner of the frame buffer.
+		texDesc.Width = laneWidth;
+		texDesc.Height = laneHeight;
 
 		HUDLessBufferShared[index] = new Texture2D(texDesc);
 		HUDLessBufferShared[index]->CreateSRV(srvDesc);
@@ -247,8 +266,8 @@ void Upscaling::CreateFrameGenerationResources()
 		uavDesc.Format = texDesc.Format;
 
 		// FG-GPU1 iHalfResDepthMV: depth crosses PCIe at half resolution (modes 1 and 2).
-		texDesc.Width = halfResMode ? halfWidth : mainDesc.Width;
-		texDesc.Height = halfResMode ? halfHeight : mainDesc.Height;
+		texDesc.Width = halfResMode ? halfWidth : laneWidth;
+		texDesc.Height = halfResMode ? halfHeight : laneHeight;
 
 		depthBufferShared[index] = new Texture2D(texDesc);
 		depthBufferShared[index]->CreateSRV(srvDesc);
@@ -265,8 +284,8 @@ void Upscaling::CreateFrameGenerationResources()
 		uavDesc.Format = texDesc.Format;
 
 		// Motion vectors only at half resolution in mode 2.
-		texDesc.Width = halfResMode == 2 ? halfWidth : mainDesc.Width;
-		texDesc.Height = halfResMode == 2 ? halfHeight : mainDesc.Height;
+		texDesc.Width = halfResMode == 2 ? halfWidth : laneWidth;
+		texDesc.Height = halfResMode == 2 ? halfHeight : laneHeight;
 
 		motionVectorBufferShared[index] = new Texture2D(texDesc);
 		motionVectorBufferShared[index]->CreateSRV(srvDesc);
@@ -386,8 +405,8 @@ void Upscaling::CreateFrameGenerationResources()
 		// Registered in the order the data becomes final: the display GPU starts reading the
 		// world-pass lanes while the 3090 is still finishing the frame. Depth first: in
 		// iHalfResDepthMV = 1 the display GPU rebuilds it while the other lanes still cross.
-		const int depthLane = transport(halfResMode ? "depth (half res)" : "depth", depthBufferShared12,
-			CrossAdapterBridge::LaneTiming::kWorld);
+		depthLane = transport(halfResMode ? "depth (half res)" : secondaryUpscaleLanes ? "depth (render res)" : "depth",
+			depthBufferShared12, CrossAdapterBridge::LaneTiming::kWorld);
 		if (halfResMode == 1 && depthLane >= 0) {
 			// FSR3 reads the full-resolution depth rebuilt from the half-resolution mirror.
 			bridge->SetDepthUpsampleLane(depthLane);
@@ -398,10 +417,24 @@ void Upscaling::CreateFrameGenerationResources()
 				REX::CRITICAL("[FG-GPU1] depth rebuild unavailable; FSR3 gets half-resolution depth at full render size. Set iHalfResDepthMV=0 or 2");
 			}
 		}
-		transport(halfResMode == 2 ? "motion vectors (half res)" : "motion vectors", motionVectorBufferShared12,
-			CrossAdapterBridge::LaneTiming::kWorld);
+		motionLane = transport(halfResMode == 2 ? "motion vectors (half res)" :
+							   secondaryUpscaleLanes  ? "motion vectors (render res)" :
+														"motion vectors",
+			motionVectorBufferShared12, CrossAdapterBridge::LaneTiming::kWorld);
 		if (hudlessActive)
-			transport("HUD-less colour", HUDLessBufferShared12, CrossAdapterBridge::LaneTiming::kHudless);
+			sceneLane = transport(secondaryUpscaleLanes ? "scene (render res, UI-free)" : "HUD-less colour",
+				HUDLessBufferShared12, CrossAdapterBridge::LaneTiming::kHudless);
+	}
+
+	// FSR 4.1 on the second GPU reads these three lanes' mirrors; the render GPU fills its frame
+	// buffer from the scene. Without either, frames are shown at the render resolution.
+	if (secondaryUpscaleLanes) {
+		const bool bound = sceneLane >= 0 && depthLane >= 0 && motionLane >= 0 &&
+		                   secondaryUpscale->BindLanes(sceneLane, depthLane, motionLane);
+		if (!bound)
+			secondaryUpscale->Fail("the scene, depth and motion-vector lanes could not be set up");
+		else if (!CreateSceneBlit())
+			secondaryUpscale->Fail("SecondaryUpscaleCS.hlsl (Blit) did not compile on the render GPU");
 	}
 	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !hudlessActive) {
 		// FSR3 treats an empty HUDLessColor as "use the back buffer", so the UI is
@@ -428,6 +461,14 @@ void Upscaling::SetupHalfResDepthMV(UINT a_width, UINT a_height)
 	halfResMode = (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && bridge->IsActive()) ?
 	                  settings.halfResDepthMV :
 	                  0;
+	// FSR 4.1 on the second GPU reconstructs from full-resolution depth and motion vectors; at the
+	// render resolution they are small anyway (1440p: 29.5 MB for both).
+	if (halfResMode && secondaryUpscaleLanes) {
+		REX::INFO("[FSR4] iHalfResDepthMV = {} is ignored: the upscaler needs depth and motion vectors at the render "
+				  "resolution ({}x{})",
+			halfResMode, a_width, a_height);
+		halfResMode = 0;
+	}
 	if (!halfResMode)
 		return;
 
@@ -495,9 +536,12 @@ void Upscaling::PostAlpha()
 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
 
 		{
-			// iHalfResDepthMV: one thread per 2x2 block, same inputs and outputs.
-			const UINT threadsX = halfResMode ? (dx12SwapChain->swapChainDesc.Width + 1) / 2 : dx12SwapChain->swapChainDesc.Width;
-			const UINT threadsY = halfResMode ? (dx12SwapChain->swapChainDesc.Height + 1) / 2 : dx12SwapChain->swapChainDesc.Height;
+			// iHalfResDepthMV: one thread per 2x2 block, same inputs and outputs. FSR 4.1 on the
+			// second GPU: only the render-resolution corner the scene was drawn in.
+			const UINT width = secondaryUpscaleLanes ? laneWidth : dx12SwapChain->swapChainDesc.Width;
+			const UINT height = secondaryUpscaleLanes ? laneHeight : dx12SwapChain->swapChainDesc.Height;
+			const UINT threadsX = halfResMode ? (width + 1) / 2 : width;
+			const UINT threadsY = halfResMode ? (height + 1) / 2 : height;
 			uint32_t dispatchX = (threadsX + 7) / 8;
 			uint32_t dispatchY = (threadsY + 7) / 8;
 
@@ -574,14 +618,23 @@ void Upscaling::CopyBuffersToSharedResources()
 		return;
 	}
 
-	context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
+	if (secondaryUpscaleLanes) {
+		// FSR 4.1 on the second GPU: the render-resolution corner only.
+		const D3D11_BOX box{ 0, 0, 0, laneWidth, laneHeight, 1 };
+		context->CopySubresourceRegion(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), 0, 0, 0, 0,
+			reinterpret_cast<ID3D11Texture2D*>(motionVector.texture), 0, &box);
+	} else {
+		context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
+	}
 
 	{
 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
 
 		{
-			uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
-			uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
+			const UINT width = secondaryUpscaleLanes ? laneWidth : dx12SwapChain->swapChainDesc.Width;
+			const UINT height = secondaryUpscaleLanes ? laneHeight : dx12SwapChain->swapChainDesc.Height;
+			uint32_t dispatchX = (uint32_t)std::ceil(float(width) / 8.0f);
+			uint32_t dispatchY = (uint32_t)std::ceil(float(height) / 8.0f);
 
 
 			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
@@ -734,11 +787,48 @@ void Upscaling::PostDisplay()
 	auto rendererData = RE::BSGraphics::GetRendererData();
 
 	auto& swapChain = rendererData->renderTargets[(uint)RenderTarget::kFrameBuffer];
-	ID3D11Resource* swapChainResource;
-	reinterpret_cast<ID3D11RenderTargetView*>(swapChain.rtView)->GetResource(&swapChainResource);
+	winrt::com_ptr<ID3D11Resource> swapChainResource;
+	reinterpret_cast<ID3D11RenderTargetView*>(swapChain.rtView)->GetResource(swapChainResource.put());
 
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource);
+
+	if (secondaryUpscaleLanes) {
+		// FSR 4.1 on the second GPU. Upscaling.dll drew this frame's scene into the frame buffer's
+		// render-resolution corner and skipped its own upscale (whichever plugin's hook on this call
+		// runs first). Send the corner, and fill the frame buffer from it so the UI that follows is
+		// drawn at full resolution over a background the display GPU can rebuild exactly.
+		auto& frame = externalFrame;
+		const UINT fi = dx12SwapChain->frameIndex;
+		if (frame.captured)
+			return;  // once per frame: the frame buffer now holds the stretch, not the scene
+		frameUpscaled[fi] = false;
+		const bool scaled = frame.valid && frame.active && frame.width == laneWidth && frame.height == laneHeight;
+		if (scaled) {
+			frame.captured = true;
+			const D3D11_BOX box{ 0, 0, 0, laneWidth, laneHeight, 1 };
+			context->CopySubresourceRegion(HUDLessBufferShared[fi]->resource.get(), 0, 0, 0, 0, swapChainResource.get(), 0, &box);
+			if (sceneBlitCS && sceneBlitTarget) {
+				FillFrameBufferFromScene(context, swapChainResource.get());
+				frameUpscaled[fi] = SecondaryUpscale::GetSingleton()->Ready();
+			}
+		}
+
+		static bool loggedOnce = false;
+		if (!loggedOnce && scaled) {
+			REX::INFO("[FSR4] PostDisplay: scene {}x{} captured for the display GPU, frame buffer filled for the UI (frameIdx={})",
+				laneWidth, laneHeight, fi);
+			loggedOnce = true;
+		}
+
+		dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kHudless);
+		// With bEarlyUnpack the display GPU has the scene, depth and motion vectors queued now, so
+		// FSR 4.1 starts while this GPU is still drawing the UI. Otherwise it starts at Present.
+		if (frameUpscaled[fi])
+			SecondaryUpscale::GetSingleton()->BeginFrame(fi, frame.jitterX, frame.jitterY, frame.sharpness);
+		return;
+	}
+
+	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource.get());
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -748,6 +838,66 @@ void Upscaling::PostDisplay()
 
 	// The UI-free frame is final now: start its PCIe copy instead of waiting for Present.
 	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kHudless);
+}
+
+bool Upscaling::CreateSceneBlit()
+{
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	if (dx12SwapChain->swapChainDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+		return false;
+
+	const std::string renderW = std::to_string(laneWidth);
+	const std::string renderH = std::to_string(laneHeight);
+	const std::string displayW = std::to_string(dx12SwapChain->swapChainDesc.Width);
+	const std::string displayH = std::to_string(dx12SwapChain->swapChainDesc.Height);
+	const D3D_SHADER_MACRO defines[] = { { "RENDER_WIDTH", renderW.c_str() }, { "RENDER_HEIGHT", renderH.c_str() },
+		{ "DISPLAY_WIDTH", displayW.c_str() }, { "DISPLAY_HEIGHT", displayH.c_str() }, { nullptr, nullptr } };
+	sceneBlitCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl",
+		"cs_5_0", "Blit", defines);
+	if (!sceneBlitCS)
+		return false;
+
+	D3D11_TEXTURE2D_DESC desc{};
+	desc.Width = dx12SwapChain->swapChainDesc.Width;
+	desc.Height = dx12SwapChain->swapChainDesc.Height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	sceneBlitTarget = new Texture2D(desc);
+
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+	uavDesc.Format = desc.Format;
+	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+	sceneBlitTarget->CreateUAV(uavDesc);
+	return true;
+}
+
+void Upscaling::FillFrameBufferFromScene(ID3D11DeviceContext* a_context, ID3D11Resource* a_frameBuffer)
+{
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	const UINT fi = dx12SwapChain->frameIndex;
+
+	// The frame buffer is written below; unbind it the way Upscaling.dll does before its own
+	// upscale writes it at this point of the frame.
+	a_context->OMSetRenderTargets(0, nullptr, nullptr);
+
+	ID3D11ShaderResourceView* views[1] = { HUDLessBufferShared[fi]->srv.get() };
+	a_context->CSSetShaderResources(0, 1, views);
+	ID3D11UnorderedAccessView* uavs[1] = { sceneBlitTarget->uav.get() };
+	a_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+	a_context->CSSetShader(sceneBlitCS, nullptr, 0);
+	a_context->Dispatch((dx12SwapChain->swapChainDesc.Width + 7) / 8, (dx12SwapChain->swapChainDesc.Height + 7) / 8, 1);
+
+	ID3D11ShaderResourceView* nullViews[1] = { nullptr };
+	a_context->CSSetShaderResources(0, 1, nullViews);
+	ID3D11UnorderedAccessView* nullUavs[1] = { nullptr };
+	a_context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+	a_context->CSSetShader(nullptr, nullptr, 0);
+
+	a_context->CopyResource(a_frameBuffer, sceneBlitTarget->resource.get());
 }
 
 void Upscaling::GenerateUIBuffer()

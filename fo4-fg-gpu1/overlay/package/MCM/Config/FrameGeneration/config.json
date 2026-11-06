@@ -156,6 +156,10 @@
 			"type": "text"
 		},
 		{
+			"text": "FSR 4.1 upscaling on that GPU too: set Upscaling > Upscale Method Preference to AMD FSR 4.1 (second GPU) and restart. The game then renders at the quality mode's resolution and the second GPU upscales it before frame generation. Needs FSR Runtime = FSR SDK 2.4 and the Upscaling.dll from this package.",
+			"type": "text"
+		},
+		{
 			"text": "",
 			"type": "text"
 		},

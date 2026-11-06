@@ -133,8 +133,90 @@ index 0000000..9533257
 +	OutputMotionVectors[DTid.xy] = nearestMotion;
 +#endif
 +}
+diff --git a/package/F4SE/Plugins/FrameGeneration/SecondaryUpscaleCS.hlsl b/package/F4SE/Plugins/FrameGeneration/SecondaryUpscaleCS.hlsl
+new file mode 100644
+index 0000000..45fa33c
+--- /dev/null
++++ b/package/F4SE/Plugins/FrameGeneration/SecondaryUpscaleCS.hlsl
+@@ -0,0 +1,76 @@
++// FG-GPU1: FSR 4.1 upscaling on the second GPU.
++//
++// The render GPU draws the scene at render resolution into the top-left corner of the full-size
++// frame buffer. The UI then needs a full-size background to blend over, and the second GPU needs
++// the UI without that background:
++//
++//   Blit       (render GPU, D3D11) fills the frame buffer from the render-resolution scene, so the
++//              UI is drawn over it at full resolution. It is never shown as it is.
++//   Composite  (display GPU, D3D12) puts the UI on top of the FSR 4.1 result. It rebuilds the same
++//              background from the same scene with the same arithmetic and keeps what the UI changed:
++//                  out = final + (upscaled - background) * (1 - alpha)
++//              with alpha the smallest UI coverage that explains final - background. Where there is
++//              no UI, final == background and out == upscaled; under opaque UI, out == final.
++//
++// Compiled with RENDER_WIDTH, RENDER_HEIGHT, DISPLAY_WIDTH, DISPLAY_HEIGHT defined. Both entry
++// points use the same registers; Blit only reads t0 and writes u0.
++
++static const uint2 RenderSize = uint2(RENDER_WIDTH, RENDER_HEIGHT);
++static const uint2 DisplaySize = uint2(DISPLAY_WIDTH, DISPLAY_HEIGHT);
++
++Texture2D<float4> Scene : register(t0);     // the render-resolution scene (the lane both GPUs have)
++Texture2D<float4> Final : register(t1);     // Composite: the finished frame from the render GPU
++Texture2D<float4> Upscaled : register(t2);  // Composite: the FSR 4.1 output
++RWTexture2D<float4> Output : register(u0);
++
++// Bilinear from render to display resolution with plain loads and precise arithmetic (no fused
++// or reordered operations), so both GPUs get the same background from the same scene. Pixel
++// centres map onto pixel centres.
++float4 SceneBilinear(uint2 a_pixel)
++{
++	precise float2 scale = float2(RenderSize) / float2(DisplaySize);
++	precise float2 position = (float2(a_pixel) + 0.5) * scale - 0.5;
++	position = clamp(position, 0.0, float2(RenderSize - 1));
++
++	uint2 i0 = uint2(position);  // position >= 0, so truncation is floor
++	uint2 i1 = min(i0 + 1, RenderSize - 1);
++	precise float2 f = position - float2(i0);
++
++	float4 c00 = Scene.Load(int3(i0.x, i0.y, 0));
++	float4 c10 = Scene.Load(int3(i1.x, i0.y, 0));
++	float4 c01 = Scene.Load(int3(i0.x, i1.y, 0));
++	float4 c11 = Scene.Load(int3(i1.x, i1.y, 0));
++
++	precise float4 top = c00 + (c10 - c00) * f.x;
++	precise float4 bottom = c01 + (c11 - c01) * f.x;
++	precise float4 result = top + (bottom - top) * f.y;
++	return result;
++}
++
++[numthreads(8, 8, 1)] void Blit(uint3 a_id : SV_DispatchThreadID)
++{
++	if (any(a_id.xy >= DisplaySize))
++		return;
++	Output[a_id.xy] = SceneBilinear(a_id.xy);
++}
++
++[numthreads(8, 8, 1)] void Composite(uint3 a_id : SV_DispatchThreadID)
++{
++	if (any(a_id.xy >= DisplaySize))
++		return;
++
++	// The render GPU stored its background in an 8-bit target before drawing the UI over it.
++	float3 background = round(saturate(SceneBilinear(a_id.xy).rgb) * 255.0) / 255.0;
++	float3 final = Final.Load(int3(a_id.xy, 0)).rgb;
++	float3 upscaled = Upscaled.Load(int3(a_id.xy, 0)).rgb;
++
++	// UI with coverage a and colour c moves a channel by a * (c - background), and |c - background|
++	// is at most max(background, 1 - background): this is the smallest a that explains the change.
++	// Any error is (upscaled - background) * (alpha - a): fine scene detail under translucent UI.
++	float3 change = abs(final - background);
++	float3 room = max(max(background, 1.0 - background), 1.0 / 255.0);
++	float3 coverage = change / room;
++	float alpha = saturate(max(coverage.r, max(coverage.g, coverage.b)));
++
++	Output[a_id.xy] = float4(saturate(final + (upscaled - background) * (1.0 - alpha)), 1.0);
++}
 diff --git a/package/MCM/Config/FrameGeneration/config.json b/package/MCM/Config/FrameGeneration/config.json
-index 554ba18..09a78b7 100644
+index 554ba18..b218cca 100644
 --- a/package/MCM/Config/FrameGeneration/config.json
 +++ b/package/MCM/Config/FrameGeneration/config.json
 @@ -22,7 +22,15 @@
@@ -195,7 +277,7 @@ index 554ba18..09a78b7 100644
  			"valueOptions": {
  				"sourceType": "ModSettingInt",
  				"options": [
-@@ -92,15 +100,146 @@
+@@ -92,15 +100,150 @@
  			"text": "",
  			"type": "text"
  		},
@@ -252,6 +334,10 @@ index 554ba18..09a78b7 100644
 +		},
 +		{
 +			"text": "The game renders on one GPU; FSR3 frame generation and presentation run on the GPU the monitor is plugged into. Every frame's colour, UI-free colour, depth and motion vectors are copied across PCIe.",
++			"type": "text"
++		},
++		{
++			"text": "FSR 4.1 upscaling on that GPU too: set Upscaling > Upscale Method Preference to AMD FSR 4.1 (second GPU) and restart. The game then renders at the quality mode's resolution and the second GPU upscales it before frame generation. Needs FSR Runtime = FSR SDK 2.4 and the Upscaling.dll from this package.",
 +			"type": "text"
 +		},
 +		{
@@ -345,10 +431,10 @@ index 554ba18..09a78b7 100644
  				"sourceType": "ModSettingBool"
  			}
 diff --git a/package/MCM/Config/FrameGeneration/settings.ini b/package/MCM/Config/FrameGeneration/settings.ini
-index fa75993..1535640 100644
+index fa75993..c0933ee 100644
 --- a/package/MCM/Config/FrameGeneration/settings.ini
 +++ b/package/MCM/Config/FrameGeneration/settings.ini
-@@ -8,18 +8,86 @@ bFrameGenerationMode = 1
+@@ -8,18 +8,95 @@ bFrameGenerationMode = 1
  ; Default: true
  bFrameLimitMode = 1
  
@@ -427,6 +513,15 @@ index fa75993..1535640 100644
 +; Read every ~60 frames, so it can be toggled while the game runs. Default: true
 +bEarlyUnpack = 1
 +
++; [FG-GPU1] FSR 4.1 upscaling on the frame-generation GPU is switched on in Upscaling.dll's
++; settings (Data\MCM\Settings\Upscaling.ini, or MCM > Upscaling): iUpscaleMethodPreference = 3.
++; The game then renders at iQualityMode's resolution with TAA off, the render-resolution scene,
++; depth and motion vectors cross PCIe, and this GPU upscales with FSR 4.1 before frame
++; generation; the UI is drawn at full resolution and composited over the result. Needs
++; iFSRRuntime = 1, bAsyncUnpack = 1 and the Upscaling.dll shipped with FG-GPU1. In that mode
++; bSendHudlessFrame and iHalfResDepthMV are ignored (the scene is always sent, at full render
++; resolution). Changing the method or the quality mode needs a restart.
++
 +; [FG-GPU1] Send depth (and optionally motion vectors) at half resolution to save PCIe time.
 +; Only the generated frames use them; real frames and the HUD-less colour stay full resolution.
 +;   0 = both at full resolution (as before).
@@ -438,12 +533,51 @@ index fa75993..1535640 100644
 +;       use it if 1 still falls short of your frame cap in CPU-heavy areas.
 +; Requires restart. Default: 1
 +iHalfResDepthMV = 1
+diff --git a/package/MCM/Config/Upscaling/config.json b/package/MCM/Config/Upscaling/config.json
+index e4f87dd..e28aad6 100644
+--- a/package/MCM/Config/Upscaling/config.json
++++ b/package/MCM/Config/Upscaling/config.json
+@@ -37,13 +37,14 @@
+ 			"id": "iUpscaleMethodPreference:Settings",
+ 			"text": "Upscale Method Preference",
+ 			"type": "stepper",
+-			"help": "NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used. (Default: DLSS)",
++			"help": "NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used. FSR 4.1 (second GPU) renders here at the quality mode's resolution and upscales on the GPU that runs frame generation (FG-GPU1); the game renders natively until that GPU is ready. Changing to or from it, or changing the quality mode while it is on, needs a game restart. (Default: FSR 4.1 (second GPU))",
+ 			"valueOptions": {
+ 				"sourceType": "ModSettingInt",
+ 				"options": [
+ 					"Disabled",
+ 					"AMD FSR 3.1",
+-					"NVIDIA DLSS 4"
++					"NVIDIA DLSS 4",
++					"AMD FSR 4.1 (second GPU)"
+ 				]
+ 			}
+ 		},
+diff --git a/package/MCM/Config/Upscaling/settings.ini b/package/MCM/Config/Upscaling/settings.ini
+index 92296d7..f0a195f 100644
+--- a/package/MCM/Config/Upscaling/settings.ini
++++ b/package/MCM/Config/Upscaling/settings.ini
+@@ -3,8 +3,11 @@
+ ; AMD Robust Contrast Adaptive Sharpening improves image clarity, even when upscaling is disabled or in 3D menus.
+ 
+ ; NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used.
+-; Default: 2 (0 = Disabled, 1 = FSR, 2 = DLSS)
+-iUpscaleMethodPreference = 2
++; 3 = AMD FSR 4.1 on the second GPU (FG-GPU1): the game renders here at the quality mode's resolution
++; and AAAFrameGeneration.dll upscales it on the GPU that runs frame generation. Native resolution
++; until that GPU is ready. Changing to or from 3, or iQualityMode while it is 3, needs a restart.
++; Default: 3 in the FG-GPU1 package (0 = Disabled, 1 = FSR, 2 = DLSS, 3 = FSR 4.1 on the second GPU)
++iUpscaleMethodPreference = 3
+ 
+ ; Controls the internal resolution.
+ ; Default: 1 (1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance, 0=Native AA)
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..7710e6f
+index 0000000..8a39d7d
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,1791 @@
+@@ -0,0 +1,1854 @@
 +#include "CrossAdapterBridge.h"
 +
 +#include <d3dcompiler.h>
@@ -998,6 +1132,7 @@ index 0000000..7710e6f
 +				allocator = nullptr;
 +			copyQueueB = nullptr;
 +			unpackFenceB = nullptr;
++			readFenceB = nullptr;
 +		};
 +		HRESULT hr = deviceB->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(copyQueueB.put()));
 +		if (FAILED(hr)) {
@@ -1015,6 +1150,8 @@ index 0000000..7710e6f
 +				hr = listB->Close();
 +			if (SUCCEEDED(hr))
 +				hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(unpackFenceB.put()));
++			if (SUCCEEDED(hr))
++				hr = deviceB->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(readFenceB.put()));
 +			if (FAILED(hr))
 +				fallBack("display GPU copy list/fence", hr);
 +		}
@@ -1629,6 +1766,16 @@ index 0000000..7710e6f
 +		copyQueueB->ExecuteCommandLists(1, lists);
 +		laneUnpackFrame[index] = unpackFrame;
 +
++		// FSR 4.1 on this GPU starts as soon as the lanes it reads are in (WaitForLaneReads).
++		if (readFenceB) {
++			hr = copyQueueB->Signal(readFenceB.get(), ++readValue);
++			if (FAILED(hr)) {
++				Fail("lane-read fence Signal", hr);
++				return hr;
++			}
++			laneReadValue[index] = readValue;
++		}
++
 +		// iHalfResDepthMV = 1: the depth rebuild may start now, while the other lanes cross.
 +		if (upsampler.Ready() && static_cast<int>(index) == upsampler.lane) {
 +			hr = copyQueueB->Signal(upsampler.sourceReadyFence.get(), unpackFrame);
@@ -1639,6 +1786,53 @@ index 0000000..7710e6f
 +		}
 +	}
 +	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::WaitForLaneReads(ID3D12CommandQueue* a_queue, const int* a_lanes, size_t a_count,
++	bool& a_queued)
++{
++	a_queued = false;
++	if (!active)
++		return E_FAIL;
++	if (!asyncUnpack || !copyQueueB || !readFenceB || !a_queue || !a_lanes)
++		return E_INVALIDARG;
++
++	// Only the frame being assembled: its lanes were sent (laneFrame) and their reads queued.
++	UINT64 value = 0;
++	for (size_t position = 0; position < a_count; ++position) {
++		const int lane = a_lanes[position];
++		if (lane < 0 || static_cast<size_t>(lane) >= lanes.size())
++			return E_INVALIDARG;
++		const auto index = static_cast<size_t>(lane);
++		if (laneFrame[index] != transferValue || laneUnpackFrame[index] != transferValue)
++			return S_OK;
++		value = (std::max)(value, laneReadValue[index]);
++	}
++
++	const HRESULT hr = a_queue->Wait(readFenceB.get(), value);
++	if (FAILED(hr)) {
++		Fail("Wait for lane reads", hr);
++		return hr;
++	}
++	a_queued = true;
++	return S_OK;
++}
++
++HRESULT CrossAdapterBridge::WaitDisplayListDone(UINT a_slot)
++{
++	if (!active || a_slot >= kSlots || !displayDoneFenceB || !slotDisplayDone[a_slot])
++		return S_OK;
++	const HRESULT hr = WaitCpu(displayDoneFenceB.get(), slotDisplayDone[a_slot]);
++	if (FAILED(hr))
++		Fail("waiting for the slot's previous direct list", hr);
++	return hr;
++}
++
++bool CrossAdapterBridge::DisplayListDone(UINT a_slot) const noexcept
++{
++	if (!active || a_slot >= kSlots || !displayDoneFenceB)
++		return false;
++	return displayDoneFenceB->GetCompletedValue() >= slotDisplayDone[a_slot];
 +}
 +
 +HRESULT CrossAdapterBridge::WaitTransfer(ID3D12CommandQueue* a_queueB)
@@ -2205,6 +2399,8 @@ index 0000000..7710e6f
 +	unpackStarted = false;
 +	unpackFrame = 0;
 +	laneUnpackFrame = {};
++	readValue = 0;
++	laneReadValue = {};
 +	slotDisplayDone = {};
 +	displayDoneValue = 0;
 +	timerCopyA.Reset();
@@ -2219,6 +2415,7 @@ index 0000000..7710e6f
 +		allocator = nullptr;
 +	copyQueueB = nullptr;
 +	unpackFenceB = nullptr;
++	readFenceB = nullptr;
 +	displayQueue = nullptr;
 +	displayDoneFenceB = nullptr;
 +	transferFenceA = nullptr;
@@ -2237,10 +2434,10 @@ index 0000000..7710e6f
 +}
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
 new file mode 100644
-index 0000000..b357a49
+index 0000000..07df767
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,411 @@
 +#pragma once
 +
 +// CrossAdapterBridge - frame generation on a second GPU.
@@ -2417,6 +2614,17 @@ index 0000000..b357a49
 +	// submits it on its own as soon as the depth lane has landed, while the rest still crosses.)
 +	void RecordDepthUpsample(ID3D12GraphicsCommandList* a_listB, UINT a_slot);
 +
++	// --- FSR 4.1 upscaling on B (async path) ------------------------------------------
++	// a_queue waits until B's copy queue has read these lanes of the frame being assembled.
++	// a_queued is false (and nothing is queued) while any of them has not been given to the copy
++	// queue yet this frame; the caller then tries again after Unpack at Present.
++	HRESULT WaitForLaneReads(ID3D12CommandQueue* a_queue, const int* a_lanes, size_t a_count, bool& a_queued);
++
++	// CPU: the direct list that last used a_slot has finished (allocator reuse). Normally already true.
++	HRESULT WaitDisplayListDone(UINT a_slot);
++	// Non-blocking version, for reading timestamps.
++	[[nodiscard]] bool DisplayListDone(UINT a_slot) const noexcept;
++
 +	// --- Both paths -------------------------------------------------------------------
 +	// Timestamp on the frame's direct list on B (kMarkListBegin / kMarkAfterUnpack / kMarkListEnd).
 +	void MarkDisplayList(ID3D12GraphicsCommandList* a_listB, UINT a_slot, UINT a_mark);
@@ -2579,6 +2787,9 @@ index 0000000..b357a49
 +	bool unpackStarted = false;                // a frame's read has been submitted in part (BeginUnpack)
 +	UINT64 unpackFrame = 0;                    // ...for this frame
 +	std::array<UINT64, kMaxLanes> laneUnpackFrame{};  // frame whose read of each lane was last submitted
++	winrt::com_ptr<ID3D12Fence> readFenceB;           // B copy queue signals after each lane's read
++	UINT64 readValue = 0;
++	std::array<UINT64, kMaxLanes> laneReadValue{};    // readFenceB value of each lane's latest read
 +
 +	// B's direct queue (FFX game queue). Not owned.
 +	ID3D12CommandQueue* displayQueue = nullptr;
@@ -2733,10 +2944,10 @@ index 81be80f..5f5de78 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..6cabc1d 100644
+index e10d528..9fc6c41 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-@@ -1,8 +1,8 @@
+@@ -1,9 +1,10 @@
  #include "DX12SwapChain.h"
  
 -#include <dx12/ffx_api_dx12.hpp>
@@ -2744,9 +2955,11 @@ index e10d528..6cabc1d 100644
  
 +#include "CrossAdapterBridge.h"
  #include "FidelityFX.h"
++#include "SecondaryUpscale.h"
  #include "Streamline.h"
  #include "UICompositor.h"
-@@ -29,6 +29,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
+ #include "Upscaling.h"
+@@ -29,6 +30,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
  	REX::INFO("[FG] D3D12 device created");
  }
  
@@ -2790,7 +3003,7 @@ index e10d528..6cabc1d 100644
  void DX12SwapChain::CreateD3D12CommandQueues()
  {
  	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-@@ -44,9 +81,32 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+@@ -44,9 +82,32 @@ void DX12SwapChain::CreateD3D12CommandQueues()
  		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
  		commandLists[i]->Close();
  	}
@@ -2823,7 +3036,7 @@ index e10d528..6cabc1d 100644
  void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
  {
  	swapChainDesc = {};
-@@ -91,24 +151,13 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+@@ -91,24 +152,19 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
  
  void DX12SwapChain::CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
  {
@@ -2843,17 +3056,22 @@ index e10d528..6cabc1d 100644
 -	if (ffx::CreateContext(fidelityFX->swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
 -		REX::CRITICAL("[FidelityFX] Failed to create swap chain context!");
 -	}
--
--	fidelityFX->SetupFrameGeneration();
--	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
 +	// Swap chain context + frame generation context; with iFSRRuntime = 1 this logs the providers
 +	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
 +	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
 +	REX::INFO("[FG] FSR3 swap chain created: {}x{} ({})", swapChainDesc.Width, swapChainDesc.Height, fidelityFX->RuntimeName());
+ 
+-	fidelityFX->SetupFrameGeneration();
+-	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
++	// FG-GPU1: FSR 4.1 upscaling on this GPU when Upscaling.dll is set to it. Decided here, before
++	// the lanes exist, because they are sized for it.
++	if (secondaryGPU && swapChain && CrossAdapterBridge::GetSingleton()->IsActive())
++		SecondaryUpscale::GetSingleton()->Initialize(d3d12Device.get(), commandQueue.get(), swapChainDesc.Width,
++			swapChainDesc.Height, swapChainDesc.Format);
  }
  
  void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
-@@ -145,9 +194,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -145,9 +201,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -2869,7 +3087,7 @@ index e10d528..6cabc1d 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +219,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +226,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -2878,7 +3096,7 @@ index e10d528..6cabc1d 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +232,16 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +239,21 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -2889,15 +3107,20 @@ index e10d528..6cabc1d 100644
 +
 +	if (secondaryGPU) {
 +		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
++		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it.
++		auto secondaryUpscale = SecondaryUpscale::GetSingleton();
 +		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
-+			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(), false);
++			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(),
++			secondaryUpscale->Planned());
 +		if (finalFrameLane < 0)
 +			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
++		else if (secondaryUpscale->Planned())
++			secondaryUpscale->SetFinalLane(finalFrameLane);
 +	}
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -239,17 +300,53 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +312,64 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -2951,13 +3174,43 @@ index e10d528..6cabc1d 100644
 +		bridge->MarkDisplayList(commandLists[frameIndex].get(), frameIndex, CrossAdapterBridge::kMarkAfterUnpack);
 +	}
 +
++	// FG-GPU1 FSR 4.1 upscaling on this GPU: the finished frame was unpacked into a mirror. Put its
++	// UI over the FSR 4.1 result, or show it as rendered (menus, loading), in the back buffer.
++	auto secondaryUpscale = SecondaryUpscale::GetSingleton();
++	const bool upscaleLanes = crossAdapter && secondaryUpscale->HasFinalMirror();
++	bool upscaledFrame = false;
++	if (upscaleLanes) {
++		upscaledFrame = upscalingForUI->frameUpscaled[frameIndex] && secondaryUpscale->FinishSubmit(frameIndex);
++		secondaryUpscale->RecordPresent(commandLists[frameIndex].get(), frameIndex, upscaledFrame,
++			swapChainBuffers[frameIndex].get());
++	}
++
 +	// Transfer frame to swap chain buffer (single-GPU path)
 +	if (!secondaryGPU) {
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -361,6 +458,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
- 		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
+@@ -358,9 +478,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 			xessFrameId++;
+ 		}
+ 	} else {
+-		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
++		FidelityFX::FrameOverride frameOverride{};
++		const FidelityFX::FrameOverride* frameOverridePtr = nullptr;
++		if (upscaleLanes) {
++			// The depth and motion-vector lanes hold the render-resolution scene, so only upscaled
++			// frames can be interpolated; their UI-free frame is the FSR 4.1 result.
++			useFrameGenerationThisFrame = useFrameGenerationThisFrame && upscaledFrame;
++			if (upscaledFrame) {
++				frameOverride.hudless = secondaryUpscale->Output(frameIndex);
++				frameOverride.renderWidth = secondaryUpscale->RenderWidth();
++				frameOverride.renderHeight = secondaryUpscale->RenderHeight();
++				frameOverride.jitterX = upscaling->externalFrame.jitterX;
++				frameOverride.jitterY = upscaling->externalFrame.jitterY;
++				frameOverridePtr = &frameOverride;
++			}
++		}
++		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame, frameOverridePtr);
  	}
  
 +	if (crossAdapter)
@@ -2966,7 +3219,7 @@ index e10d528..6cabc1d 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +470,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +508,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -2977,11 +3230,19 @@ index e10d528..6cabc1d 100644
 +			bridge->SignalConsumed(commandQueue.get());
 +		bridge->SignalDisplayListDone(commandQueue.get());
 +	}
++	if (upscaleLanes) {
++		secondaryUpscale->EndFrame(frameIndex, upscaledFrame);
++		secondaryUpscale->LogStats();
++	}
++	// Upscaling.dll reports the next frame before it renders it.
++	upscaling->frameUpscaled[frameIndex] = false;
++	upscaling->externalFrame.valid = false;
++	upscaling->externalFrame.captured = false;
 +
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +545,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +591,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -3000,7 +3261,7 @@ index e10d528..6cabc1d 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +565,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +611,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -3050,7 +3311,7 @@ index e10d528..6cabc1d 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +616,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +662,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -3143,18 +3404,21 @@ index 692f459..15205cf 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..8e474ab 100644
+index 9fa46df..d00a765 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
-@@ -3,34 +3,432 @@
+@@ -3,34 +3,510 @@
  #include "Upscaling.h"
  
  #include "DX12SwapChain.h"
 -#include <dx12/ffx_api_dx12.hpp>
 +
++#include <DirectXMath.h>
++
 +#include <atomic>
 +#include <cmath>
 +#include <cwctype>
++#include <format>
 +#include <initializer_list>
 +#include <vector>
  
@@ -3166,6 +3430,7 @@ index 9fa46df..8e474ab 100644
 +	constexpr const wchar_t* kLegacyDll = L"amd_fidelityfx_dx12.dll";
 +	constexpr const wchar_t* kLoaderDll = L"amd_fidelityfx_loader_dx12.dll";
 +	constexpr const wchar_t* kFrameGenDll = L"amd_fidelityfx_framegeneration_dx12.dll";
++	constexpr const wchar_t* kUpscalerDll = L"amd_fidelityfx_upscaler_dx12.dll";
 +
 +	std::string Narrow(const wchar_t* a_text)
 +	{
@@ -3489,7 +3754,7 @@ index 9fa46df..8e474ab 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation swap chain failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
-+
+ 
 +	std::string swapChainProvider = "3.1.4";
 +	if (sdk24) {
 +		swapChainProvider = ProviderName(swapChainContext);
@@ -3497,7 +3762,7 @@ index 9fa46df..8e474ab 100644
 +			swapChainProvider.starts_with("3") ? " (no driver-assisted frame pacing; that needs 4.0.0 or newer)" :
 +												 " (driver-assisted frame pacing capable)");
 +	}
- 
++
 +	// ---- frame generation
  	ffx::CreateContextDescFrameGeneration createFg{};
 -	createFg.displaySize = { dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height };
@@ -3552,9 +3817,7 @@ index 9fa46df..8e474ab 100644
 +	}
 +	return true;
 +}
- 
--	ffx::CreateBackendDX12Desc createBackend{};
--	createBackend.device = dx12SwapChain->d3d12Device.get();
++
 +void FidelityFX::DestroyContexts(IDXGISwapChain4** a_swapChain)
 +{
 +	if (frameGenContext) {
@@ -3570,6 +3833,82 @@ index 9fa46df..8e474ab 100644
 +		(*a_swapChain)->Release();
 +		*a_swapChain = nullptr;
 +	}
++}
++
++bool FidelityFX::CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, uint32_t a_renderHeight,
++	uint32_t a_displayWidth, uint32_t a_displayHeight, bool a_debugChecking)
++{
++	if (runtime != Runtime::kSDK24) {
++		REX::ERROR("[FSR4] FSR 4.1 upscaling needs the FSR SDK 2.4 runtime (iFSRRuntime = 1); this session runs {}",
++			RuntimeName());
++		return false;
++	}
++	if (upscaleContext)
++		return true;
++
++	// The FSR 4 providers are only offered for a device that can run them, so query with it.
++	const auto offered = QueryProviders(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, a_device);
++	REX::INFO("[FSR4] upscaler providers offered for the display GPU: {}", Join(offered));
++	uint64_t fsr4 = 0;
++	for (size_t i = 0; i < offered.ids.size(); ++i) {
++		if (offered.names[i].starts_with("4.")) {
++			fsr4 = offered.ids[i];  // newest first
++			break;
++		}
++	}
++	if (!fsr4) {
++		REX::ERROR("[FSR4] no FSR 4 upscaler is offered for this GPU and driver (AMD lists RX 6000 or newer and a current "
++				   "Adrenalin driver); upscaling on the second GPU is off");
++		return false;
++	}
++
++	// Fallout 4's frame is upscaled after its imagespace, i.e. tonemapped LDR in a UNORM target:
++	// perceptual colour. Depth is 0 at the near plane (not inverted), motion vectors are at render
++	// resolution and carry no jitter (the same flags Upscaling.dll uses for FSR 3.1).
++	ffx::CreateContextDescUpscale create{};
++	create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
++	if (a_debugChecking)
++		create.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
++	create.maxRenderSize = { a_renderWidth, a_renderHeight };
++	create.maxUpscaleSize = { a_displayWidth, a_displayHeight };
++	create.fpMessage = FfxMessage;
++
++	ffx::CreateContextDescUpscaleVersion version{};
++	version.version = FFX_UPSCALER_VERSION;
++	ffx::CreateBackendDX12Desc backend{};
++	backend.device = a_device;
++	ffx::CreateContextDescOverrideVersion pin{};
++	pin.versionId = fsr4;
++
++	const auto rc = ffxModule.CreateContext(&upscaleContext,
++		Chain({ &create.header, &version.header, &backend.header, &pin.header }), nullptr);
++	if (rc != FFX_API_RETURN_OK) {
++		upscaleContext = nullptr;
++		REX::ERROR("[FSR4] creating the upscaler context ({}x{} -> {}x{}) failed: {} ({})", a_renderWidth, a_renderHeight,
++			a_displayWidth, a_displayHeight, ffxm::ReturnCodeName(rc), rc);
++		return false;
++	}
++
++	upscalerProvider = ProviderName(upscaleContext);
++	FfxApiEffectMemoryUsage memory{};
++	ffx::QueryDescUpscaleGetGPUMemoryUsage memoryQuery{};
++	memoryQuery.gpuMemoryUsageUpscaler = &memory;
++	const bool haveMemory = ffxm::Query(upscaleContext, memoryQuery) == ffx::ReturnCode::Ok;
++	REX::INFO("[FSR4] upscaler {} on the display GPU: {}x{} -> {}x{}{}{}", upscalerProvider, a_renderWidth, a_renderHeight,
++		a_displayWidth, a_displayHeight,
++		haveMemory ? std::format(", {:.1f} MB", static_cast<double>(memory.totalUsageInBytes) / (1024.0 * 1024.0)) : std::string{},
++		a_debugChecking ? ", API checks on (bEnableDebugLogging)" : "");
++	LogModule(kUpscalerDll);
++	return true;
++}
+ 
+-	ffx::CreateBackendDX12Desc createBackend{};
+-	createBackend.device = dx12SwapChain->d3d12Device.get();
++ffx::ReturnCode FidelityFX::DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch)
++{
++	if (!upscaleContext)
++		return ffx::ReturnCode::Error;
++	return ffxm::Dispatch(upscaleContext, a_dispatch);
 +}
  
 -	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
@@ -3591,16 +3930,77 @@ index 9fa46df..8e474ab 100644
  }
  
  [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
-@@ -50,7 +448,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -45,13 +521,66 @@ void FidelityFX::SetupFrameGeneration()
+ 	return singleton.get();
+ }
+ 
+-void FidelityFX::Present(bool a_useFrameGeneration)
++float FidelityFX::VerticalFov(float a_aspect)
++{
++	// The camera's projMat field is not a plain projection in this game (its [1][1] read ~0.013,
++	// a 178 degree FOV). Rebuild the projection from the view and the unjittered view-projection,
++	// as the DLSS-G path does, and only trust it if it looks like one: a perspective projection
++	// has P[0][0] * aspect == P[1][1]. Otherwise the 1 rad FSR 3.1 has always been given here.
++	static auto gameViewport = State_GetSingleton();
++	const auto& view = gameViewport->cameraState.camViewData;
++	const auto load = [](const __m128 (&a_rows)[4]) {
++		DirectX::XMMATRIX m;
++		for (int i = 0; i < 4; ++i)
++			m.r[i] = a_rows[i];
++		return m;
++	};
++	const DirectX::XMMATRIX viewMatrix = load(view.viewMat);
++	const DirectX::XMMATRIX viewProj = load(view.viewProjUnjittered);
++	DirectX::XMVECTOR determinant;
++	const DirectX::XMMATRIX inverseView = DirectX::XMMatrixInverse(&determinant, viewMatrix);
++	// Row vectors (v * V * P) first, as the DLSS-G and XeSS paths assume; column vectors second.
++	const DirectX::XMMATRIX candidates[2] = { DirectX::XMMatrixMultiply(inverseView, viewProj),
++		DirectX::XMMatrixMultiply(viewProj, inverseView) };
++
++	float fov = 1.0f;
++	int source = -1;
++	float p11[2]{};
++	for (int i = 0; i < 2; ++i) {
++		const float yScale = std::fabs(DirectX::XMVectorGetY(candidates[i].r[1]));
++		const float xScale = std::fabs(DirectX::XMVectorGetX(candidates[i].r[0]));
++		p11[i] = yScale;
++		if (!std::isfinite(yScale) || !std::isfinite(xScale) || yScale < 0.1f || yScale > 20.0f)
++			continue;
++		if (std::fabs(xScale * a_aspect - yScale) > 0.03f * yScale)
++			continue;  // not a symmetric perspective projection
++		fov = 2.0f * std::atan(1.0f / yScale);
++		source = i;
++		break;
++	}
++
++	static int loggedSource = -2;
++	if (source != loggedSource) {
++		REX::INFO("[FSR] camera vertical FOV {:.3f} rad ({:.1f} deg) from {} (projMat[1][1] {:.4f}, inv(view)*viewProj {:.4f}, "
++				  "viewProj*inv(view) {:.4f}, aspect {:.3f})",
++			fov, fov * 57.29578f,
++			source == 0 ? "inverse(view) * viewProjUnjittered" :
++			source == 1 ? "viewProjUnjittered * inverse(view)" :
++						  "the 1 rad default (no projection found)",
++			Component(view.projMat[1], 1), p11[0], p11[1], a_aspect);
++		loggedSource = source;
++	}
++	return fov;
++}
++
++void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_override)
+ {
  	auto upscaling = Upscaling::GetSingleton();
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
  	auto commandList = dx12SwapChain->commandLists[dx12SwapChain->frameIndex].get();
 -	
+-	auto HUDLessColor = upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
 +
- 	auto HUDLessColor = upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
++	// FG-GPU1 upscaling: the UI-free frame is the FSR 4.1 output, not the render-resolution lane.
++	auto HUDLessColor = a_override ? a_override->hudless : upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
  	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
  	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
-@@ -60,9 +458,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+ 
+@@ -60,9 +589,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	if (a_useFrameGeneration) {
  		configParameters.frameGenerationEnabled = true;
  
@@ -3611,7 +4011,7 @@ index 9fa46df..8e474ab 100644
  		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
  
  		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
-@@ -93,7 +489,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -93,7 +620,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
  	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
  
@@ -3620,7 +4020,7 @@ index 9fa46df..8e474ab 100644
  		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
  	}
  
-@@ -113,49 +509,115 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -113,49 +640,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	QueryPerformanceCounter(&currentFrameTime);
  
  	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
@@ -3666,6 +4066,18 @@ index 9fa46df..8e474ab 100644
  		float2 jitter;
  		jitter.x = -gameViewport->offsetX * screenSize.x / 2.0f;
  		jitter.y = gameViewport->offsetY * screenSize.y / 2.0f;
++		float2 jitterOffset(-jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale,
++			-jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale);
++
++		// FG-GPU1 upscaling: depth and motion vectors are the render-resolution lanes, and the size
++		// and jitter come from Upscaling.dll for this frame instead of the dynamic-resolution state,
++		// which other hooks change around Present.
++		if (a_override) {
++			renderWidth = a_override->renderWidth;
++			renderHeight = a_override->renderHeight;
++			renderSize = float2(static_cast<float>(renderWidth), static_cast<float>(renderHeight));
++			jitterOffset = float2(-a_override->jitterX, -a_override->jitterY);
++		}
  
 -		dispatchParameters.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio;
 -		dispatchParameters.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio;
@@ -3689,8 +4101,8 @@ index 9fa46df..8e474ab 100644
 +			a_prepare.motionVectorScale.y = renderSize.y;
 +			a_prepare.renderSize.width = renderWidth;
 +			a_prepare.renderSize.height = renderHeight;
-+			a_prepare.jitterOffset.x = -jitter.x / renderTargetManager->dynamicWidthRatio * jitterScale;
-+			a_prepare.jitterOffset.y = -jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale;
++			a_prepare.jitterOffset.x = jitterOffset.x;
++			a_prepare.jitterOffset.y = jitterOffset.y;
 +			a_prepare.frameTimeDelta = deltaTime * 1000.f;
 +			a_prepare.cameraNear = *(float*)REL::ID({ 57985, 2712882, 2712882 }).address();
 +			a_prepare.cameraFar = *(float*)REL::ID({ 958877, 2712883, 2712883 }).address();
@@ -3719,10 +4131,7 @@ index 9fa46df..8e474ab 100644
 +			StoreUnit(dispatchParameters.cameraRight, view.viewRight);
 +			StoreUnit(dispatchParameters.cameraForward, view.viewDir);
 +
-+			// Vertical FOV from the projection (P[1][1] = 1 / tan(fovY / 2); jitter does not touch it).
-+			const float yScale = Component(view.projMat[1], 1);
-+			if (std::isfinite(yScale) && yScale > 0.01f)
-+				dispatchParameters.cameraFovAngleVertical = 2.0f * std::atan(1.0f / yScale);
++			dispatchParameters.cameraFovAngleVertical = VerticalFov(screenSize.x / screenSize.y);
 +
 +			prepareResult = ffxm::Dispatch(frameGenContext, dispatchParameters);
 +		} else {
@@ -3763,10 +4172,10 @@ index 9fa46df..8e474ab 100644
 +	}
  }
 diff --git a/plugins/FrameGeneration/src/FidelityFX.h b/plugins/FrameGeneration/src/FidelityFX.h
-index 78bb041..ec01a79 100644
+index 78bb041..c1d8652 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.h
 +++ b/plugins/FrameGeneration/src/FidelityFX.h
-@@ -1,13 +1,57 @@
+@@ -1,13 +1,60 @@
  #pragma once
  
 -#include <dx12/ffx_api_dx12.h>
@@ -3784,6 +4193,9 @@ index 78bb041..ec01a79 100644
 +#include <ffx2/api/include/dx12/ffx_api_dx12.hpp>
 +#include <ffx2/framegeneration/include/ffx_framegeneration.hpp>
 +#include <ffx2/framegeneration/include/dx12/ffx_api_framegeneration_dx12.hpp>
++#include <ffx2/upscalers/include/ffx_upscale.hpp>
++
++#include <string>
  
  #include "Buffer.h"
  
@@ -3829,7 +4241,7 @@ index 78bb041..ec01a79 100644
  class FidelityFX
  {
  public:
-@@ -17,12 +61,33 @@ public:
+@@ -17,12 +64,57 @@ public:
  		return &singleton;
  	}
  
@@ -3847,14 +4259,39 @@ index 78bb041..ec01a79 100644
 -	ffx::Context frameGenContext;
 +	ffx::Context frameGenContext{};
 +	HWND window = nullptr;
++
++	// FG-GPU1: FSR 4.1 upscaling on the display GPU (SDK 2.4 only; see SecondaryUpscale).
++	ffx::Context upscaleContext{};
++	std::string upscalerProvider;
++
++	// What frame generation reads instead of the plugin's own buffers on a frame the display GPU
++	// upscaled: the FSR 4.1 output as the UI-free frame, and the size and jitter it was rendered at.
++	struct FrameOverride
++	{
++		ID3D12Resource* hudless = nullptr;
++		uint32_t renderWidth = 0;
++		uint32_t renderHeight = 0;
++		float jitterX = 0.0f;  // render pixels, as Upscaling.dll applied it
++		float jitterY = 0.0f;
++	};
  
  	void LoadFFX();
 -	void SetupFrameGeneration();
+-	void Present(bool a_useFrameGeneration);
 +	// Creates the FFX frame-generation swap chain and the frame generation context. With the SDK
 +	// 2.4 runtime a creation failure falls back to SDK 1.1.4 once, so the game still starts.
 +	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
 +		ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain);
- 	void Present(bool a_useFrameGeneration);
++	void Present(bool a_useFrameGeneration, const FrameOverride* a_override = nullptr);
++
++	// FSR 4.x upscaler on a_device for a_render -> a_display. Only the SDK 2.4 runtime, and only an
++	// FSR 4 provider: false (logged) when the runtime, GPU or driver does not offer one.
++	bool CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, uint32_t a_renderHeight, uint32_t a_displayWidth,
++		uint32_t a_displayHeight, bool a_debugChecking);
++	ffx::ReturnCode DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch);
++
++	// The game camera's vertical field of view in radians (FSR upscaling and frame generation).
++	static float VerticalFov(float a_aspect);
 +
 +	[[nodiscard]] const char* RuntimeName() const;
 +
@@ -3865,19 +4302,854 @@ index 78bb041..ec01a79 100644
 +	void DestroyContexts(IDXGISwapChain4** a_swapChain);
 +	void LogEnvironment(HWND a_window);
  };
+diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.cpp b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
+new file mode 100644
+index 0000000..08da073
+--- /dev/null
++++ b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
+@@ -0,0 +1,651 @@
++#include "SecondaryUpscale.h"
++
++#include <d3dcompiler.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <iterator>
++#include <string>
++
++#include "CrossAdapterBridge.h"
++#include "FidelityFX.h"
++#include "Upscaling.h"
++
++namespace
++{
++	constexpr const wchar_t* kShaderPath = L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl";
++
++	D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before,
++		D3D12_RESOURCE_STATES a_after)
++	{
++		D3D12_RESOURCE_BARRIER barrier{};
++		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		barrier.Transition.pResource = a_resource;
++		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		barrier.Transition.StateBefore = a_before;
++		barrier.Transition.StateAfter = a_after;
++		return barrier;
++	}
++
++
++	// FSR's quality modes, the ratios ffxFsr3GetUpscaleRatioFromQualityMode returns in Upscaling.dll.
++	constexpr float kUpscaleRatio[] = { 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
++	constexpr const char* kQualityName[] = { "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance" };
++}
++
++bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth,
++	UINT a_displayHeight, DXGI_FORMAT a_backBufferFormat)
++{
++	if (planned || !a_device || !a_queue)
++		return planned;
++
++	// Upscaling.dll's own settings decide, read the way it reads them (shipped defaults, then the
++	// user's MCM file), so the two plugins agree on the render size without talking yet.
++	CSimpleIniA ini;
++	ini.SetUnicode();
++	ini.LoadFile("Data\\MCM\\Config\\Upscaling\\settings.ini");
++	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
++	const long method = ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2);
++	if (method != 3) {
++		REX::INFO("[FSR4] Upscaling.dll iUpscaleMethodPreference = {} (3 = FSR 4.1 on the display GPU): not upscaling here",
++			method);
++		return false;
++	}
++	qualityMode = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iQualityMode", 1)), 0, 4);
++
++	using VersionFn = uint32_t (*)();
++	HMODULE upscalingDll = GetModuleHandleW(L"Upscaling.dll");
++	const auto version = upscalingDll ?
++	                         reinterpret_cast<VersionFn>(GetProcAddress(upscalingDll, "FO4Upscaling_SecondaryGPUApiVersion")) :
++	                         nullptr;
++	if (!version || version() != kApiVersion) {
++		REX::ERROR("[FSR4] iUpscaleMethodPreference = 3 needs the Upscaling.dll from the FG-GPU1 package ({}); "
++				   "the game renders at full resolution",
++			!upscalingDll ? "no Upscaling.dll is loaded" :
++			!version      ? "the loaded one is a different build" :
++							"the loaded one is a different version");
++		return false;
++	}
++
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	if (!bridge->IsActive() || !bridge->IsAsyncUnpack()) {
++		REX::ERROR("[FSR4] upscaling on the display GPU needs the cross-adapter transport with bAsyncUnpack = 1");
++		return false;
++	}
++	if (a_backBufferFormat != DXGI_FORMAT_R8G8B8A8_UNORM) {
++		REX::ERROR("[FSR4] the back buffer is format {}, not R8G8B8A8_UNORM (28); upscaling on the display GPU is off "
++				   "(HDR add-ons change it)",
++			static_cast<int>(a_backBufferFormat));
++		return false;
++	}
++
++	// The arithmetic Upscaling.dll uses for its render targets and jitter.
++	const float scale = 1.0f / kUpscaleRatio[qualityMode];
++	renderWidth = static_cast<UINT>(static_cast<float>(a_displayWidth) * scale);
++	renderHeight = static_cast<UINT>(static_cast<float>(a_displayHeight) * scale);
++	displayWidth = a_displayWidth;
++	displayHeight = a_displayHeight;
++	device.copy_from(a_device);
++	queue = a_queue;
++
++	if (!FidelityFX::GetSingleton()->CreateUpscaler(a_device, renderWidth, renderHeight, displayWidth, displayHeight,
++			Upscaling::GetSingleton()->settings.debugLogging))
++		return false;
++	if (!CreatePipeline())
++		return false;
++
++	planned = true;
++	QueryPerformanceCounter(&statLastLog);
++	REX::INFO("[FSR4] upscaling on the display GPU: the game renders {}x{} ({}), FSR {} upscales to {}x{}", renderWidth,
++		renderHeight, kQualityName[qualityMode], FidelityFX::GetSingleton()->upscalerProvider, displayWidth, displayHeight);
++	return true;
++}
++
++bool SecondaryUpscale::CreatePipeline()
++{
++	const auto fail = [](const char* a_what, HRESULT a_hr) {
++		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
++		return false;
++	};
++
++	const std::string renderW = std::to_string(renderWidth);
++	const std::string renderH = std::to_string(renderHeight);
++	const std::string displayW = std::to_string(displayWidth);
++	const std::string displayH = std::to_string(displayHeight);
++	const D3D_SHADER_MACRO defines[] = { { "RENDER_WIDTH", renderW.c_str() }, { "RENDER_HEIGHT", renderH.c_str() },
++		{ "DISPLAY_WIDTH", displayW.c_str() }, { "DISPLAY_HEIGHT", displayH.c_str() }, { nullptr, nullptr } };
++
++	winrt::com_ptr<ID3DBlob> shader;
++	winrt::com_ptr<ID3DBlob> errors;
++	HRESULT hr = D3DCompileFromFile(kShaderPath, defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "Composite", "cs_5_0",
++		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), errors.put());
++	if (FAILED(hr)) {
++		if (errors)
++			REX::ERROR("[FSR4] {}", static_cast<const char*>(errors->GetBufferPointer()));
++		return fail("compiling SecondaryUpscaleCS.hlsl (Composite)", hr);
++	}
++
++	// One table per slot: t0-t2, u0.
++	D3D12_DESCRIPTOR_RANGE ranges[2]{};
++	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++	ranges[0].NumDescriptors = 3;
++	ranges[0].OffsetInDescriptorsFromTableStart = 0;
++	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++	ranges[1].NumDescriptors = 1;
++	ranges[1].OffsetInDescriptorsFromTableStart = 3;
++
++	D3D12_ROOT_PARAMETER parameter{};
++	parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++	parameter.DescriptorTable.NumDescriptorRanges = 2;
++	parameter.DescriptorTable.pDescriptorRanges = ranges;
++	parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++
++	D3D12_ROOT_SIGNATURE_DESC rootDesc{};
++	rootDesc.NumParameters = 1;
++	rootDesc.pParameters = &parameter;
++
++	winrt::com_ptr<ID3DBlob> serialized;
++	winrt::com_ptr<ID3DBlob> rootErrors;
++	hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, serialized.put(), rootErrors.put());
++	if (FAILED(hr))
++		return fail("D3D12SerializeRootSignature", hr);
++	hr = device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
++		IID_PPV_ARGS(rootSignature.put()));
++	if (FAILED(hr))
++		return fail("CreateRootSignature", hr);
++
++	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
++	pipelineDesc.pRootSignature = rootSignature.get();
++	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
++	hr = device->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(pipeline.put()));
++	if (FAILED(hr))
++		return fail("CreateComputePipelineState", hr);
++
++	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
++	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++	heapDesc.NumDescriptors = kSlots * kDescriptorsPerSlot;
++	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++	hr = device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(descriptors.put()));
++	if (FAILED(hr))
++		return fail("CreateDescriptorHeap", hr);
++	descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++
++	// FSR 4.1 outputs (one per slot: frame generation reads a frame's while the next is upscaled)
++	// and the composite. COMMON between uses, like the bridge's mirrors.
++	D3D12_RESOURCE_DESC desc{};
++	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++	desc.Width = displayWidth;
++	desc.Height = displayHeight;
++	desc.DepthOrArraySize = 1;
++	desc.MipLevels = 1;
++	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++	desc.SampleDesc.Count = 1;
++	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++	D3D12_HEAP_PROPERTIES defaultHeap{};
++	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
++	for (auto& output : outputs) {
++		hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++			IID_PPV_ARGS(output.put()));
++		if (FAILED(hr))
++			return fail("CreateCommittedResource(FSR 4.1 output)", hr);
++		output->SetName(L"FG-GPU1 FSR 4.1 output");
++	}
++	hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(composite.put()));
++	if (FAILED(hr))
++		return fail("CreateCommittedResource(composite)", hr);
++	composite->SetName(L"FG-GPU1 FSR 4.1 composite");
++
++	for (auto& allocator : allocators) {
++		hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put()));
++		if (FAILED(hr))
++			return fail("CreateCommandAllocator", hr);
++	}
++	hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0].get(), nullptr, IID_PPV_ARGS(list.put()));
++	if (SUCCEEDED(hr))
++		hr = list->Close();
++	if (FAILED(hr))
++		return fail("CreateCommandList", hr);
++
++	// Timestamps are optional.
++	if (SUCCEEDED(queue->GetTimestampFrequency(&timestampFrequency)) && timestampFrequency) {
++		D3D12_QUERY_HEAP_DESC queryDesc{};
++		queryDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++		queryDesc.Count = kSlots * kMarks;
++		D3D12_RESOURCE_DESC bufferDesc{};
++		bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++		bufferDesc.Width = sizeof(UINT64) * kSlots * kMarks;
++		bufferDesc.Height = 1;
++		bufferDesc.DepthOrArraySize = 1;
++		bufferDesc.MipLevels = 1;
++		bufferDesc.SampleDesc.Count = 1;
++		bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++		D3D12_HEAP_PROPERTIES readbackHeap{};
++		readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
++		if (FAILED(device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(queryHeap.put()))) ||
++			FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
++				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(readback.put())))) {
++			queryHeap = nullptr;
++			readback = nullptr;
++			REX::INFO("[FSR4] timestamps unavailable; upscale time will not be reported");
++		}
++	}
++	return true;
++}
++
++bool SecondaryUpscale::ReadyFor(uint32_t a_width, uint32_t a_height)
++{
++	// Lanes are bound at the first frame hook, which comes after this question for that frame.
++	if (!planned || failed || !CrossAdapterBridge::GetSingleton()->IsActive())
++		return false;
++	if (a_width == renderWidth && a_height == renderHeight)
++		return true;
++	if (!loggedSizeMismatch) {
++		REX::WARN("[FSR4] Upscaling.dll now renders {}x{}, but this session's buffers and FSR 4.1 context are {}x{} "
++				  "(iQualityMode changed?); full resolution until the game is restarted",
++			a_width, a_height, renderWidth, renderHeight);
++		loggedSizeMismatch = true;
++	}
++	return false;
++}
++
++bool SecondaryUpscale::HasFinalMirror() const noexcept
++{
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	return planned && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
++}
++
++bool SecondaryUpscale::BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane)
++{
++	if (!planned || failed)
++		return false;
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	if (!HasFinalMirror()) {
++		Fail("the finished frame has no mirror on the display GPU");
++		return false;
++	}
++
++	sceneLane = a_sceneLane;
++	depthLane = a_depthLane;
++	motionLane = a_motionLane;
++	for (UINT slot = 0; slot < kSlots; ++slot) {
++		ID3D12Resource* scene = bridge->Mirror(sceneLane, slot);
++		ID3D12Resource* finished = bridge->Mirror(finalLane, slot);
++		if (!scene || !finished || !bridge->Mirror(depthLane, slot) || !bridge->Mirror(motionLane, slot)) {
++			Fail("a lane has no mirror on the display GPU");
++			return false;
++		}
++		const auto sceneDesc = scene->GetDesc();
++		if (sceneDesc.Width != renderWidth || sceneDesc.Height != renderHeight) {
++			Fail("the scene lane is not at the render resolution");
++			return false;
++		}
++
++		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
++		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
++		ID3D12Resource* sources[3] = { scene, finished, outputs[slot].get() };
++		for (auto* source : sources) {
++			D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++			srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++			srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++			srv.Texture2D.MipLevels = 1;
++			device->CreateShaderResourceView(source, &srv, handle);
++			handle.ptr += descriptorSize;
++		}
++		D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++		uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++		device->CreateUnorderedAccessView(composite.get(), nullptr, &uav, handle);
++	}
++	bound = true;
++	REX::INFO("[FSR4] lanes bound: scene, depth and motion vectors {}x{} -> FSR 4.1 {}x{}; the UI is composited over it",
++		renderWidth, renderHeight, displayWidth, displayHeight);
++	return true;
++}
++
++void SecondaryUpscale::Fail(const char* a_reason)
++{
++	if (!failed)
++		REX::CRITICAL("[FSR4] {}; upscaling on the display GPU is off for this session (frames are shown at the render "
++					  "resolution until a restart, without frame generation)",
++			a_reason);
++	failed = true;
++	pending = {};
++	submitted = {};
++}
++
++void SecondaryUpscale::BeginFrame(UINT a_slot, float a_jitterX, float a_jitterY, float a_sharpness)
++{
++	if (!Ready() || a_slot >= kSlots)
++		return;
++
++	auto& p = params[a_slot];
++	p.jitterX = a_jitterX;
++	p.jitterY = a_jitterY;
++	p.sharpness = std::clamp(a_sharpness, 0.0f, 1.0f);
++	p.cameraNear = *(float*)REL::ID({ 57985, 2712882, 2712882 }).address();
++	p.cameraFar = *(float*)REL::ID({ 958877, 2712883, 2712883 }).address();
++	p.fovY = FidelityFX::VerticalFov(static_cast<float>(displayWidth) / static_cast<float>(displayHeight));
++
++	pending[a_slot] = true;
++	submitted[a_slot] = false;
++	TrySubmit(a_slot);
++}
++
++bool SecondaryUpscale::FinishSubmit(UINT a_slot)
++{
++	if (!Ready() || a_slot >= kSlots)
++		return false;
++	if (pending[a_slot] && !TrySubmit(a_slot) && pending[a_slot]) {
++		// Unpack queued every read of the frame, so this only happens if a lane was not sent.
++		REX::WARN("[FSR4] the scene, depth or motion-vector lane did not reach the display GPU this frame; shown without upscaling");
++		pending[a_slot] = false;
++	}
++	return submitted[a_slot];
++}
++
++bool SecondaryUpscale::TrySubmit(UINT a_slot)
++{
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	const int needed[] = { sceneLane, depthLane, motionLane };
++	bool queued = false;
++	HRESULT hr = bridge->WaitForLaneReads(queue, needed, std::size(needed), queued);
++	if (FAILED(hr)) {
++		Fail("waiting for the lane reads");
++		return false;
++	}
++	if (!queued)
++		return false;  // not read yet this frame: Present tries again after Unpack
++
++	// The slot's allocator and timestamps were last used two frames ago.
++	if (FAILED(bridge->WaitDisplayListDone(a_slot))) {
++		Fail("waiting for the slot's previous frame");
++		return false;
++	}
++	CollectTimings(a_slot);
++
++	auto* allocator = allocators[a_slot].get();
++	hr = allocator->Reset();
++	if (SUCCEEDED(hr))
++		hr = list->Reset(allocator, nullptr);
++	if (FAILED(hr)) {
++		Fail("resetting the upscale list");
++		return false;
++	}
++
++	ID3D12Resource* scene = bridge->Mirror(sceneLane, a_slot);
++	ID3D12Resource* depth = bridge->Mirror(depthLane, a_slot);
++	ID3D12Resource* motion = bridge->Mirror(motionLane, a_slot);
++	ID3D12Resource* output = outputs[a_slot].get();
++
++	if (queryHeap)
++		list->EndQuery(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks + kMarkUpscaleBegin);
++
++	const D3D12_RESOURCE_BARRIER before[4] = {
++		Transition(scene, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++		Transition(depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++		Transition(motion, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++		Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++	};
++	list->ResourceBarrier(4, before);
++
++	LARGE_INTEGER now{};
++	LARGE_INTEGER frequency{};
++	QueryPerformanceCounter(&now);
++	QueryPerformanceFrequency(&frequency);
++	const double deltaMs = lastDispatch.QuadPart ?
++	                           static_cast<double>(now.QuadPart - lastDispatch.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart) :
++	                           0.0;
++	lastDispatch = now;
++	// History is only valid across consecutive upscaled frames (menus and loading render natively).
++	const bool reset = !lastFrameUpscaled || deltaMs <= 0.0 || deltaMs > 250.0;
++	if (reset)
++		++statResets;
++
++	const auto& p = params[a_slot];
++	ffx::DispatchDescUpscale dispatch{};
++	dispatch.commandList = list.get();
++	dispatch.color = ffxApiGetResourceDX12(scene, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++	dispatch.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++	dispatch.motionVectors = ffxApiGetResourceDX12(motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++	dispatch.output = ffxApiGetResourceDX12(output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
++	// Upscaling.dll's conventions for FSR: jitter in render pixels, negated; motion vectors in UV
++	// units, so their scale is the render size.
++	dispatch.jitterOffset.x = -p.jitterX;
++	dispatch.jitterOffset.y = -p.jitterY;
++	dispatch.motionVectorScale.x = static_cast<float>(renderWidth);
++	dispatch.motionVectorScale.y = static_cast<float>(renderHeight);
++	dispatch.renderSize = { renderWidth, renderHeight };
++	dispatch.upscaleSize = { displayWidth, displayHeight };
++	dispatch.enableSharpening = p.sharpness > 0.0f;
++	dispatch.sharpness = p.sharpness;
++	dispatch.frameTimeDelta = static_cast<float>(reset ? 0.0 : deltaMs);
++	dispatch.preExposure = 1.0f;
++	dispatch.reset = reset;
++	dispatch.cameraNear = p.cameraNear;
++	dispatch.cameraFar = p.cameraFar;
++	dispatch.cameraFovAngleVertical = p.fovY;
++	dispatch.viewSpaceToMetersFactor = 0.01428222656f;
++	dispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
++
++	const auto rc = FidelityFX::GetSingleton()->DispatchUpscale(dispatch);
++
++	const D3D12_RESOURCE_BARRIER after[4] = {
++		Transition(scene, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++		Transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++		Transition(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++		Transition(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
++	};
++	list->ResourceBarrier(4, after);
++
++	if (queryHeap) {
++		list->EndQuery(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks + kMarkUpscaleEnd);
++		written[a_slot] |= (1u << kMarkUpscaleBegin) | (1u << kMarkUpscaleEnd);
++	}
++
++	hr = list->Close();
++	if (FAILED(hr)) {
++		Fail("closing the upscale list");
++		return false;
++	}
++	if (rc != ffx::ReturnCode::Ok) {
++		REX::ERROR("[FSR4] the upscale dispatch failed: {} ({})", ffxm::ReturnCodeName(static_cast<uint32_t>(rc)),
++			static_cast<uint32_t>(rc));
++		Fail("FSR 4.1 dispatch");
++		return false;
++	}
++
++	ID3D12CommandList* lists[] = { list.get() };
++	queue->ExecuteCommandLists(1, lists);
++
++	if (!loggedFirstDispatch) {
++		REX::INFO("[FSR4] first upscale: {}x{} -> {}x{}, jitter ({:.3f}, {:.3f}), sharpness {:.2f}, near {} far {} fovY {:.3f}",
++			renderWidth, renderHeight, displayWidth, displayHeight, -p.jitterX, -p.jitterY, p.sharpness, p.cameraNear,
++			p.cameraFar, p.fovY);
++		loggedFirstDispatch = true;
++	}
++
++	pending[a_slot] = false;
++	submitted[a_slot] = true;
++	return true;
++}
++
++void SecondaryUpscale::RecordPresent(ID3D12GraphicsCommandList* a_list, UINT a_slot, bool a_upscaled,
++	ID3D12Resource* a_backBuffer)
++{
++	if (!HasFinalMirror() || !a_list || !a_backBuffer || a_slot >= kSlots)
++		return;
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	ID3D12Resource* finished = bridge->Mirror(finalLane, a_slot);
++	const bool compositeUi = a_upscaled && Ready();
++
++	// A native frame does not pass TrySubmit, which collects the slot's previous timestamps; do it
++	// here, and drop them if that frame is somehow still running, so two frames never mix.
++	if (!a_upscaled) {
++		CollectTimings(a_slot);
++		written[a_slot] = 0;
++	}
++
++	if (queryHeap)
++		a_list->EndQuery(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks + kMarkPresentBegin);
++
++	if (compositeUi) {
++		ID3D12Resource* scene = bridge->Mirror(sceneLane, a_slot);
++		ID3D12Resource* output = outputs[a_slot].get();
++		const D3D12_RESOURCE_BARRIER before[4] = {
++			Transition(scene, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++			Transition(finished, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++			Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++			Transition(composite.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++		};
++		a_list->ResourceBarrier(4, before);
++
++		ID3D12DescriptorHeap* heaps[] = { descriptors.get() };
++		a_list->SetDescriptorHeaps(1, heaps);
++		a_list->SetComputeRootSignature(rootSignature.get());
++		a_list->SetPipelineState(pipeline.get());
++		D3D12_GPU_DESCRIPTOR_HANDLE table = descriptors->GetGPUDescriptorHandleForHeapStart();
++		table.ptr += static_cast<UINT64>(a_slot * kDescriptorsPerSlot) * descriptorSize;
++		a_list->SetComputeRootDescriptorTable(0, table);
++		a_list->Dispatch((displayWidth + 7) / 8, (displayHeight + 7) / 8, 1);
++
++		const D3D12_RESOURCE_BARRIER after[5] = {
++			Transition(scene, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++			Transition(finished, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++			Transition(output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++			Transition(composite.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
++			Transition(a_backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
++		};
++		a_list->ResourceBarrier(5, after);
++		a_list->CopyResource(a_backBuffer, composite.get());
++		const D3D12_RESOURCE_BARRIER done[2] = {
++			Transition(composite.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
++			Transition(a_backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
++		};
++		a_list->ResourceBarrier(2, done);
++	} else {
++		// Rendered natively (menus, loading) or not upscalable: shown as the render GPU finished it.
++		const D3D12_RESOURCE_BARRIER before[2] = {
++			Transition(finished, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
++			Transition(a_backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
++		};
++		a_list->ResourceBarrier(2, before);
++		a_list->CopyResource(a_backBuffer, finished);
++		const D3D12_RESOURCE_BARRIER after[2] = {
++			Transition(finished, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
++			Transition(a_backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
++		};
++		a_list->ResourceBarrier(2, after);
++	}
++
++	if (queryHeap) {
++		a_list->EndQuery(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks + kMarkPresentEnd);
++		written[a_slot] |= (1u << kMarkPresentBegin) | (1u << kMarkPresentEnd);
++		if (compositeUi)
++			written[a_slot] |= 1u << 31;  // the present marks time a composite, not a plain copy
++		a_list->ResolveQueryData(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks, kMarks, readback.get(),
++			sizeof(UINT64) * a_slot * kMarks);
++	}
++}
++
++ID3D12Resource* SecondaryUpscale::Output(UINT a_slot) const noexcept
++{
++	return a_slot < kSlots ? outputs[a_slot].get() : nullptr;
++}
++
++void SecondaryUpscale::EndFrame(UINT a_slot, bool a_upscaled)
++{
++	if (a_slot >= kSlots)
++		return;
++	pending[a_slot] = false;
++	submitted[a_slot] = false;
++	lastFrameUpscaled = a_upscaled;
++	if (!planned)
++		return;
++	if (a_upscaled)
++		++statUpscaled;
++	else
++		++statNative;
++}
++
++void SecondaryUpscale::CollectTimings(UINT a_slot)
++{
++	if (!queryHeap || !readback || !written[a_slot])
++		return;
++	if (!CrossAdapterBridge::GetSingleton()->DisplayListDone(a_slot))
++		return;  // keep the marks for the next try
++
++	const UINT marks = written[a_slot];
++	written[a_slot] = 0;
++	D3D12_RANGE range{ sizeof(UINT64) * a_slot * kMarks, sizeof(UINT64) * (a_slot + 1) * kMarks };
++	void* data = nullptr;
++	if (FAILED(readback->Map(0, &range, &data)) || !data)
++		return;
++	UINT64 ticks[kMarks]{};
++	std::memcpy(ticks, static_cast<const std::uint8_t*>(data) + range.Begin, sizeof(ticks));
++	D3D12_RANGE nothing{ 0, 0 };
++	readback->Unmap(0, &nothing);
++
++	const double toMs = 1000.0 / static_cast<double>(timestampFrequency);
++	const auto span = [&](UINT a_begin, UINT a_end, Average& a_stat) {
++		if ((marks & (1u << a_begin)) && (marks & (1u << a_end)) && ticks[a_end] >= ticks[a_begin])
++			a_stat.Add(static_cast<double>(ticks[a_end] - ticks[a_begin]) * toMs);
++	};
++	span(kMarkUpscaleBegin, kMarkUpscaleEnd, statUpscale);
++	if (marks & (1u << 31))
++		span(kMarkPresentBegin, kMarkPresentEnd, statComposite);
++}
++
++void SecondaryUpscale::LogStats()
++{
++	if (!planned)
++		return;
++	LARGE_INTEGER now{};
++	LARGE_INTEGER frequency{};
++	QueryPerformanceCounter(&now);
++	QueryPerformanceFrequency(&frequency);
++	if (static_cast<double>(now.QuadPart - statLastLog.QuadPart) < 10.0 * static_cast<double>(frequency.QuadPart))
++		return;
++	statLastLog = now;
++
++	REX::INFO("[FSR4] {}x{} -> {}x{}: {} frames upscaled, {} at full resolution, {} history resets | FSR {} on the display GPU "
++			  "avg {:.2f} ms max {:.2f} ms | UI composite + copy avg {:.2f} ms max {:.2f} ms{}",
++		renderWidth, renderHeight, displayWidth, displayHeight, statUpscaled, statNative, statResets,
++		FidelityFX::GetSingleton()->upscalerProvider, statUpscale.Mean(), statUpscale.max, statComposite.Mean(),
++		statComposite.max, failed ? " | OFF (see the CRITICAL line above)" : "");
++	statUpscale = {};
++	statComposite = {};
++	statUpscaled = 0;
++	statNative = 0;
++	statResets = 0;
++}
++
++// ---------------------------------------------------------------------------------------
++// Upscaling.dll (FG-GPU1 build) calls these; see Upscaling::SecondaryGPU there.
++
++extern "C" __declspec(dllexport) uint32_t FGGPU1_UpscaleApiVersion()
++{
++	return SecondaryUpscale::kApiVersion;
++}
++
++extern "C" __declspec(dllexport) bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight)
++{
++	return SecondaryUpscale::GetSingleton()->ReadyFor(a_renderWidth, a_renderHeight);
++}
++
++extern "C" __declspec(dllexport) void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth,
++	uint32_t a_renderHeight, float a_jitterX, float a_jitterY, float a_sharpness)
++{
++	auto& frame = Upscaling::GetSingleton()->externalFrame;
++	frame.valid = true;
++	frame.active = a_active;
++	frame.width = a_renderWidth;
++	frame.height = a_renderHeight;
++	frame.jitterX = a_jitterX;
++	frame.jitterY = a_jitterY;
++	frame.sharpness = a_sharpness;
++	frame.captured = false;
++}
+diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.h b/plugins/FrameGeneration/src/SecondaryUpscale.h
+new file mode 100644
+index 0000000..6a69738
+--- /dev/null
++++ b/plugins/FrameGeneration/src/SecondaryUpscale.h
+@@ -0,0 +1,169 @@
++#pragma once
++
++// SecondaryUpscale - FG-GPU1: FSR 4.1 upscaling on the display GPU.
++//
++// With Upscaling.dll's iUpscaleMethodPreference = 3, the render GPU draws the 3D scene at the
++// quality mode's resolution with a sub-pixel jitter and no TAA (Upscaling.dll), and skips the
++// upscale. This plugin then
++//
++//   render GPU   PostDisplay: copies the render-resolution scene (UI-free) into its lane and fills
++//                the full-size frame buffer from it with a plain bilinear blit, so the UI is drawn
++//                at full resolution over a background (SecondaryUpscaleCS.hlsl, Blit).
++//   display GPU  as soon as the scene, depth and motion-vector lanes are read (before Present with
++//                bEarlyUnpack): FSR 4.1 render -> display resolution on the direct queue.
++//                At Present: the finished frame (blit + UI) is unpacked into a mirror; the composite
++//                puts its UI over the FSR 4.1 result into the back buffer (Composite), and frame
++//                generation reads the FSR 4.1 result as the UI-free frame.
++//
++// Frames Upscaling.dll renders natively (menus, before this is ready) are copied to the back
++// buffer as they are, without frame generation: the depth and motion-vector lanes are sized for
++// the render resolution. Everything runs on the game's render thread.
++
++#include <d3d12.h>
++#include <dxgi.h>
++#include <winrt/base.h>
++
++#include <array>
++#include <cstdint>
++
++class SecondaryUpscale
++{
++public:
++	static constexpr UINT kSlots = 2;
++	// FGGPU1_UpscaleApiVersion / FO4Upscaling_SecondaryGPUApiVersion: both plugins must agree.
++	static constexpr uint32_t kApiVersion = 1;
++
++	static SecondaryUpscale* GetSingleton()
++	{
++		static SecondaryUpscale singleton;
++		return &singleton;
++	}
++
++	// At swap-chain creation, after the FSR frame-generation contexts. When Upscaling.dll's settings
++	// ask for it and everything it needs is there, creates the FSR 4.1 context, its outputs and the
++	// composite. False (logged) leaves the session exactly as before.
++	bool Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth, UINT a_displayHeight,
++		DXGI_FORMAT a_backBufferFormat);
++
++	// Set up for it: the lanes are sized for the render resolution and the finished frame is
++	// unpacked into a mirror. Fixed for the session.
++	[[nodiscard]] bool Planned() const noexcept { return planned; }
++	// Frames can be upscaled: planned, lanes bound, nothing has failed.
++	[[nodiscard]] bool Ready() const noexcept { return planned && bound && !failed; }
++	[[nodiscard]] UINT RenderWidth() const noexcept { return renderWidth; }
++	[[nodiscard]] UINT RenderHeight() const noexcept { return renderHeight; }
++
++	// Upscaling.dll asks every frame before it renders at a_width x a_height.
++	bool ReadyFor(uint32_t a_width, uint32_t a_height);
++
++	// The finished frame's lane (CreateInterop), and the scene/depth/motion-vector lanes
++	// (CreateFrameGenerationResources). BindLanes false (logged) means frames cannot be upscaled.
++	void SetFinalLane(int a_lane) { finalLane = a_lane; }
++	[[nodiscard]] bool HasFinalMirror() const noexcept;
++	bool BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane);
++	void Fail(const char* a_reason);
++
++	// PostDisplay of a frame the render GPU drew for upscaling, after its scene lane was sent.
++	// Queues the upscale as soon as the three lanes' reads are queued.
++	void BeginFrame(UINT a_slot, float a_jitterX, float a_jitterY, float a_sharpness);
++	// Present, after the bridge's Unpack: queues the upscale if BeginFrame could not yet. True when
++	// the frame was upscaled.
++	bool FinishSubmit(UINT a_slot);
++	// On the frame's direct list: the composite (a_upscaled) or a copy of the finished frame into
++	// the back buffer (PRESENT before and after).
++	void RecordPresent(ID3D12GraphicsCommandList* a_list, UINT a_slot, bool a_upscaled, ID3D12Resource* a_backBuffer);
++	// The FSR 4.1 result of a_slot: the UI-free frame for frame generation.
++	[[nodiscard]] ID3D12Resource* Output(UINT a_slot) const noexcept;
++	// After the frame's list was executed.
++	void EndFrame(UINT a_slot, bool a_upscaled);
++
++	// Every ~10 s from Present.
++	void LogStats();
++
++private:
++	static constexpr UINT kMarkUpscaleBegin = 0;
++	static constexpr UINT kMarkUpscaleEnd = 1;
++	static constexpr UINT kMarkPresentBegin = 2;
++	static constexpr UINT kMarkPresentEnd = 3;
++	static constexpr UINT kMarks = 4;
++	static constexpr UINT kDescriptorsPerSlot = 4;  // t0 scene, t1 finished frame, t2 FSR output, u0 composite
++
++	struct FrameParams
++	{
++		float jitterX = 0.0f;
++		float jitterY = 0.0f;
++		float sharpness = 0.0f;
++		float cameraNear = 0.0f;
++		float cameraFar = 0.0f;
++		float fovY = 1.0f;
++	};
++
++	bool CreatePipeline();
++	bool TrySubmit(UINT a_slot);
++	void CollectTimings(UINT a_slot);
++
++	bool planned = false;
++	bool bound = false;
++	bool failed = false;
++
++	UINT renderWidth = 0;
++	UINT renderHeight = 0;
++	UINT displayWidth = 0;
++	UINT displayHeight = 0;
++	int qualityMode = 1;
++
++	int finalLane = -1;
++	int sceneLane = -1;
++	int depthLane = -1;
++	int motionLane = -1;
++
++	winrt::com_ptr<ID3D12Device> device;
++	ID3D12CommandQueue* queue = nullptr;  // the FFX game queue, not owned
++
++	std::array<winrt::com_ptr<ID3D12Resource>, kSlots> outputs;  // FSR 4.1 results (UI-free, display size)
++	winrt::com_ptr<ID3D12Resource> composite;                    // UI over the FSR 4.1 result, copied to the back buffer
++
++	winrt::com_ptr<ID3D12RootSignature> rootSignature;
++	winrt::com_ptr<ID3D12PipelineState> pipeline;
++	winrt::com_ptr<ID3D12DescriptorHeap> descriptors;
++	UINT descriptorSize = 0;
++
++	// The upscale's own list per slot, submitted ahead of the frame's list on the same queue.
++	std::array<winrt::com_ptr<ID3D12CommandAllocator>, kSlots> allocators;
++	winrt::com_ptr<ID3D12GraphicsCommandList> list;
++
++	std::array<bool, kSlots> pending{};    // BeginFrame ran, upscale not queued yet
++	std::array<bool, kSlots> submitted{};  // upscale queued for this frame
++	std::array<FrameParams, kSlots> params{};
++	bool lastFrameUpscaled = false;
++	LARGE_INTEGER lastDispatch{};
++
++	// Timestamps on the direct queue (durations only).
++	winrt::com_ptr<ID3D12QueryHeap> queryHeap;
++	winrt::com_ptr<ID3D12Resource> readback;
++	UINT64 timestampFrequency = 0;
++	std::array<UINT, kSlots> written{};  // bit per mark recorded since the slot was last read
++
++	struct Average
++	{
++		double sum = 0.0;
++		double max = 0.0;
++		UINT64 count = 0;
++		void Add(double a_value)
++		{
++			max = (count == 0 || a_value > max) ? a_value : max;
++			sum += a_value;
++			++count;
++		}
++		[[nodiscard]] double Mean() const { return count ? sum / static_cast<double>(count) : 0.0; }
++	};
++
++	Average statUpscale;    // ms, FSR 4.1 on the display GPU
++	Average statComposite;  // ms, composite + copy into the back buffer
++	UINT64 statUpscaled = 0;
++	UINT64 statNative = 0;
++	UINT64 statResets = 0;
++	LARGE_INTEGER statLastLog{};
++	bool loggedFirstDispatch = false;
++	bool loggedSizeMismatch = false;
++};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..cc7bd45 100644
+index 3483d96..4f96481 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
-@@ -2,6 +2,7 @@
+@@ -2,8 +2,10 @@
  
  #include <d3dcompiler.h>
  
 +#include "CrossAdapterBridge.h"
  #include "DX12SwapChain.h"
  #include "DirectXMath.h"
++#include "SecondaryUpscale.h"
  
-@@ -79,7 +80,8 @@ enum class DepthStencilTarget
+ enum class RenderTarget
+ {
+@@ -79,7 +81,8 @@ enum class DepthStencilTarget
  	kCount = 13
  };
  
@@ -3887,7 +5159,7 @@ index 3483d96..cc7bd45 100644
  {
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto device = reinterpret_cast<ID3D11Device*>(rendererData->device);
-@@ -99,7 +101,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
+@@ -99,7 +102,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
  		REX::ERROR("Failed to compile shader; {} does not exist", str);
  		return nullptr;
  	}
@@ -3896,7 +5168,7 @@ index 3483d96..cc7bd45 100644
  		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
  		if (shaderErrors) shaderErrors->Release();
  		if (shaderBlob) shaderBlob->Release();
-@@ -131,6 +133,21 @@ void Upscaling::LoadSettings()
+@@ -131,6 +134,21 @@ void Upscaling::LoadSettings()
  	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
  	// MCM stepper is 0-indexed (0=2x, 1=3x, 2=4x) but we store as numFramesToGenerate (1, 2, 3)
  	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
@@ -3918,7 +5190,7 @@ index 3483d96..cc7bd45 100644
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +155,22 @@ void Upscaling::LoadSettings()
+@@ -138,6 +156,22 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -3941,7 +5213,7 @@ index 3483d96..cc7bd45 100644
  		loggedOnce = true;
  	}
  }
-@@ -169,6 +202,15 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,6 +203,30 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
@@ -3949,37 +5221,62 @@ index 3483d96..cc7bd45 100644
 +
 +	D3D11_TEXTURE2D_DESC mainDesc{};
 +	reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
-+	SetupHalfResDepthMV(mainDesc.Width, mainDesc.Height);
-+	// Latched with the lanes below; a later settings reload must not change it mid-session.
-+	hudlessActive = settings.sendHudlessFrame;
-+	const UINT halfWidth = (mainDesc.Width + 1) / 2;
-+	const UINT halfHeight = (mainDesc.Height + 1) / 2;
++
++	// FG-GPU1 FSR 4.1 upscaling on the second GPU: the UI-free, depth and motion-vector lanes carry
++	// only the render-resolution corner of the game's full-size targets, where Upscaling.dll has the
++	// scene drawn. Otherwise they are full size, as before.
++	auto secondaryUpscale = SecondaryUpscale::GetSingleton();
++	secondaryUpscaleLanes = dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && secondaryUpscale->Planned();
++	laneWidth = secondaryUpscaleLanes ? secondaryUpscale->RenderWidth() : mainDesc.Width;
++	laneHeight = secondaryUpscaleLanes ? secondaryUpscale->RenderHeight() : mainDesc.Height;
++
++	SetupHalfResDepthMV(laneWidth, laneHeight);
++	// Latched with the lanes below; a later settings reload must not change it mid-session. The
++	// upscaler needs the scene, so it is always sent then.
++	hudlessActive = settings.sendHudlessFrame || secondaryUpscaleLanes;
++	if (secondaryUpscaleLanes && !settings.sendHudlessFrame)
++		REX::INFO("[FSR4] bSendHudlessFrame = 0 is ignored: the second GPU upscales the UI-free scene");
++	const UINT halfWidth = (laneWidth + 1) / 2;
++	const UINT halfHeight = (laneHeight + 1) / 2;
++	int sceneLane = -1;
++	int depthLane = -1;
++	int motionLane = -1;
  
  	for (int index = 0; index < 2; index++) {
  		D3D11_TEXTURE2D_DESC texDesc{};
-@@ -204,6 +246,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -193,6 +251,9 @@ void Upscaling::CreateFrameGenerationResources()
+ 		srvDesc.Format = texDesc.Format;
+ 		rtvDesc.Format = texDesc.Format;
+ 		uavDesc.Format = texDesc.Format;
++		// FSR 4.1 on the second GPU: the render-resolution corner of the frame buffer.
++		texDesc.Width = laneWidth;
++		texDesc.Height = laneHeight;
+ 
+ 		HUDLessBufferShared[index] = new Texture2D(texDesc);
+ 		HUDLessBufferShared[index]->CreateSRV(srvDesc);
+@@ -204,6 +265,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
 +		// FG-GPU1 iHalfResDepthMV: depth crosses PCIe at half resolution (modes 1 and 2).
-+		texDesc.Width = halfResMode ? halfWidth : mainDesc.Width;
-+		texDesc.Height = halfResMode ? halfHeight : mainDesc.Height;
++		texDesc.Width = halfResMode ? halfWidth : laneWidth;
++		texDesc.Height = halfResMode ? halfHeight : laneHeight;
 +
  		depthBufferShared[index] = new Texture2D(texDesc);
  		depthBufferShared[index]->CreateSRV(srvDesc);
  		depthBufferShared[index]->CreateRTV(rtvDesc);
-@@ -218,6 +264,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -218,6 +283,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
 +		// Motion vectors only at half resolution in mode 2.
-+		texDesc.Width = halfResMode == 2 ? halfWidth : mainDesc.Width;
-+		texDesc.Height = halfResMode == 2 ? halfHeight : mainDesc.Height;
++		texDesc.Width = halfResMode == 2 ? halfWidth : laneWidth;
++		texDesc.Height = halfResMode == 2 ? halfHeight : laneHeight;
 +
  		motionVectorBufferShared[index] = new Texture2D(texDesc);
  		motionVectorBufferShared[index]->CreateSRV(srvDesc);
  		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
-@@ -228,14 +278,14 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -228,14 +297,14 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -3996,7 +5293,7 @@ index 3483d96..cc7bd45 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +298,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +317,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -4005,7 +5302,7 @@ index 3483d96..cc7bd45 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +318,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +337,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -4014,7 +5311,7 @@ index 3483d96..cc7bd45 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +338,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +357,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -4023,7 +5320,7 @@ index 3483d96..cc7bd45 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +358,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +377,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -4032,7 +5329,7 @@ index 3483d96..cc7bd45 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,6 +367,50 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,6 +386,64 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
@@ -4055,8 +5352,8 @@ index 3483d96..cc7bd45 100644
 +		// Registered in the order the data becomes final: the display GPU starts reading the
 +		// world-pass lanes while the 3090 is still finishing the frame. Depth first: in
 +		// iHalfResDepthMV = 1 the display GPU rebuilds it while the other lanes still cross.
-+		const int depthLane = transport(halfResMode ? "depth (half res)" : "depth", depthBufferShared12,
-+			CrossAdapterBridge::LaneTiming::kWorld);
++		depthLane = transport(halfResMode ? "depth (half res)" : secondaryUpscaleLanes ? "depth (render res)" : "depth",
++			depthBufferShared12, CrossAdapterBridge::LaneTiming::kWorld);
 +		if (halfResMode == 1 && depthLane >= 0) {
 +			// FSR3 reads the full-resolution depth rebuilt from the half-resolution mirror.
 +			bridge->SetDepthUpsampleLane(depthLane);
@@ -4067,10 +5364,24 @@ index 3483d96..cc7bd45 100644
 +				REX::CRITICAL("[FG-GPU1] depth rebuild unavailable; FSR3 gets half-resolution depth at full render size. Set iHalfResDepthMV=0 or 2");
 +			}
 +		}
-+		transport(halfResMode == 2 ? "motion vectors (half res)" : "motion vectors", motionVectorBufferShared12,
-+			CrossAdapterBridge::LaneTiming::kWorld);
++		motionLane = transport(halfResMode == 2 ? "motion vectors (half res)" :
++							   secondaryUpscaleLanes  ? "motion vectors (render res)" :
++														"motion vectors",
++			motionVectorBufferShared12, CrossAdapterBridge::LaneTiming::kWorld);
 +		if (hudlessActive)
-+			transport("HUD-less colour", HUDLessBufferShared12, CrossAdapterBridge::LaneTiming::kHudless);
++			sceneLane = transport(secondaryUpscaleLanes ? "scene (render res, UI-free)" : "HUD-less colour",
++				HUDLessBufferShared12, CrossAdapterBridge::LaneTiming::kHudless);
++	}
++
++	// FSR 4.1 on the second GPU reads these three lanes' mirrors; the render GPU fills its frame
++	// buffer from the scene. Without either, frames are shown at the render resolution.
++	if (secondaryUpscaleLanes) {
++		const bool bound = sceneLane >= 0 && depthLane >= 0 && motionLane >= 0 &&
++		                   secondaryUpscale->BindLanes(sceneLane, depthLane, motionLane);
++		if (!bound)
++			secondaryUpscale->Fail("the scene, depth and motion-vector lanes could not be set up");
++		else if (!CreateSceneBlit())
++			secondaryUpscale->Fail("SecondaryUpscaleCS.hlsl (Blit) did not compile on the render GPU");
 +	}
 +	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && !hudlessActive) {
 +		// FSR3 treats an empty HUDLessColor as "use the back buffer", so the UI is
@@ -4083,7 +5394,7 @@ index 3483d96..cc7bd45 100644
  	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
  	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
  	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
-@@ -324,6 +418,49 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -324,6 +451,57 @@ void Upscaling::CreateFrameGenerationResources()
  	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
  }
  
@@ -4097,6 +5408,14 @@ index 3483d96..cc7bd45 100644
 +	halfResMode = (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain && bridge->IsActive()) ?
 +	                  settings.halfResDepthMV :
 +	                  0;
++	// FSR 4.1 on the second GPU reconstructs from full-resolution depth and motion vectors; at the
++	// render resolution they are small anyway (1440p: 29.5 MB for both).
++	if (halfResMode && secondaryUpscaleLanes) {
++		REX::INFO("[FSR4] iHalfResDepthMV = {} is ignored: the upscaler needs depth and motion vectors at the render "
++				  "resolution ({}x{})",
++			halfResMode, a_width, a_height);
++		halfResMode = 0;
++	}
 +	if (!halfResMode)
 +		return;
 +
@@ -4133,24 +5452,28 @@ index 3483d96..cc7bd45 100644
  void Upscaling::PreAlpha()
  {
  	auto rendererData = RE::BSGraphics::GetRendererData();
-@@ -358,10 +495,13 @@ void Upscaling::PostAlpha()
+@@ -358,10 +536,16 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
 -			uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
 -			uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
-+			// iHalfResDepthMV: one thread per 2x2 block, same inputs and outputs.
-+			const UINT threadsX = halfResMode ? (dx12SwapChain->swapChainDesc.Width + 1) / 2 : dx12SwapChain->swapChainDesc.Width;
-+			const UINT threadsY = halfResMode ? (dx12SwapChain->swapChainDesc.Height + 1) / 2 : dx12SwapChain->swapChainDesc.Height;
+-
+-			ID3D11ShaderResourceView* views[4] = { 
++			// iHalfResDepthMV: one thread per 2x2 block, same inputs and outputs. FSR 4.1 on the
++			// second GPU: only the render-resolution corner the scene was drawn in.
++			const UINT width = secondaryUpscaleLanes ? laneWidth : dx12SwapChain->swapChainDesc.Width;
++			const UINT height = secondaryUpscaleLanes ? laneHeight : dx12SwapChain->swapChainDesc.Height;
++			const UINT threadsX = halfResMode ? (width + 1) / 2 : width;
++			const UINT threadsY = halfResMode ? (height + 1) / 2 : height;
 +			uint32_t dispatchX = (threadsX + 7) / 8;
 +			uint32_t dispatchY = (threadsY + 7) / 8;
- 
--			ID3D11ShaderResourceView* views[4] = { 
++
 +			ID3D11ShaderResourceView* views[4] = {
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +513,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +557,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -4165,7 +5488,7 @@ index 3483d96..cc7bd45 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +527,9 @@ void Upscaling::PostAlpha()
+@@ -387,6 +571,9 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
@@ -4175,10 +5498,12 @@ index 3483d96..cc7bd45 100644
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -405,8 +548,34 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -405,14 +592,49 @@ void Upscaling::CopyBuffersToSharedResources()
  	context->OMSetRenderTargets(0, nullptr, nullptr);
  
  	auto& motionVector = rendererData->renderTargets[(uint)RenderTarget::kMotionVectors];
+-	context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
+-		
 +
 +	if (halfResMode) {
 +		// iHalfResDepthMV: the shared buffers are smaller than the game's, so one pass shrinks
@@ -4205,13 +5530,29 @@ index 3483d96..cc7bd45 100644
 +		return;
 +	}
 +
- 	context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
--		
++	if (secondaryUpscaleLanes) {
++		// FSR 4.1 on the second GPU: the render-resolution corner only.
++		const D3D11_BOX box{ 0, 0, 0, laneWidth, laneHeight, 1 };
++		context->CopySubresourceRegion(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), 0, 0, 0, 0,
++			reinterpret_cast<ID3D11Texture2D*>(motionVector.texture), 0, &box);
++	} else {
++		context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
++	}
 +
  	{
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
-@@ -558,14 +727,16 @@ void Upscaling::PostDisplay()
+ 		{
+-			uint32_t dispatchX = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Width) / 8.0f);
+-			uint32_t dispatchY = (uint32_t)std::ceil(float(dx12SwapChain->swapChainDesc.Height) / 8.0f);
++			const UINT width = secondaryUpscaleLanes ? laneWidth : dx12SwapChain->swapChainDesc.Width;
++			const UINT height = secondaryUpscaleLanes ? laneHeight : dx12SwapChain->swapChainDesc.Height;
++			uint32_t dispatchX = (uint32_t)std::ceil(float(width) / 8.0f);
++			uint32_t dispatchY = (uint32_t)std::ceil(float(height) / 8.0f);
+ 
+ 
+ 			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
+@@ -558,22 +780,124 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
@@ -4222,29 +5563,130 @@ index 3483d96..cc7bd45 100644
  	auto rendererData = RE::BSGraphics::GetRendererData();
  
  	auto& swapChain = rendererData->renderTargets[(uint)RenderTarget::kFrameBuffer];
- 	ID3D11Resource* swapChainResource;
- 	reinterpret_cast<ID3D11RenderTargetView*>(swapChain.rtView)->GetResource(&swapChainResource);
- 
--	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+-	ID3D11Resource* swapChainResource;
+-	reinterpret_cast<ID3D11RenderTargetView*>(swapChain.rtView)->GetResource(&swapChainResource);
 -
- 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
- 	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource);
+-	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	winrt::com_ptr<ID3D11Resource> swapChainResource;
++	reinterpret_cast<ID3D11RenderTargetView*>(swapChain.rtView)->GetResource(swapChainResource.put());
  
-@@ -574,6 +745,9 @@ void Upscaling::PostDisplay()
+ 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+-	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource);
++
++	if (secondaryUpscaleLanes) {
++		// FSR 4.1 on the second GPU. Upscaling.dll drew this frame's scene into the frame buffer's
++		// render-resolution corner and skipped its own upscale (whichever plugin's hook on this call
++		// runs first). Send the corner, and fill the frame buffer from it so the UI that follows is
++		// drawn at full resolution over a background the display GPU can rebuild exactly.
++		auto& frame = externalFrame;
++		const UINT fi = dx12SwapChain->frameIndex;
++		if (frame.captured)
++			return;  // once per frame: the frame buffer now holds the stretch, not the scene
++		frameUpscaled[fi] = false;
++		const bool scaled = frame.valid && frame.active && frame.width == laneWidth && frame.height == laneHeight;
++		if (scaled) {
++			frame.captured = true;
++			const D3D11_BOX box{ 0, 0, 0, laneWidth, laneHeight, 1 };
++			context->CopySubresourceRegion(HUDLessBufferShared[fi]->resource.get(), 0, 0, 0, 0, swapChainResource.get(), 0, &box);
++			if (sceneBlitCS && sceneBlitTarget) {
++				FillFrameBufferFromScene(context, swapChainResource.get());
++				frameUpscaled[fi] = SecondaryUpscale::GetSingleton()->Ready();
++			}
++		}
++
++		static bool loggedOnce = false;
++		if (!loggedOnce && scaled) {
++			REX::INFO("[FSR4] PostDisplay: scene {}x{} captured for the display GPU, frame buffer filled for the UI (frameIdx={})",
++				laneWidth, laneHeight, fi);
++			loggedOnce = true;
++		}
++
++		dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kHudless);
++		// With bEarlyUnpack the display GPU has the scene, depth and motion vectors queued now, so
++		// FSR 4.1 starts while this GPU is still drawing the UI. Otherwise it starts at Present.
++		if (frameUpscaled[fi])
++			SecondaryUpscale::GetSingleton()->BeginFrame(fi, frame.jitterX, frame.jitterY, frame.sharpness);
++		return;
++	}
++
++	context->CopyResource(HUDLessBufferShared[dx12SwapChain->frameIndex]->resource.get(), swapChainResource.get());
+ 
+ 	static bool loggedOnce = false;
+ 	if (!loggedOnce) {
  		REX::INFO("[FG] PostDisplay captured HUDLess (frameIdx={})", dx12SwapChain->frameIndex);
  		loggedOnce = true;
  	}
 +
 +	// The UI-free frame is final now: start its PCIe copy instead of waiting for Present.
 +	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kHudless);
++}
++
++bool Upscaling::CreateSceneBlit()
++{
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	if (dx12SwapChain->swapChainDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
++		return false;
++
++	const std::string renderW = std::to_string(laneWidth);
++	const std::string renderH = std::to_string(laneHeight);
++	const std::string displayW = std::to_string(dx12SwapChain->swapChainDesc.Width);
++	const std::string displayH = std::to_string(dx12SwapChain->swapChainDesc.Height);
++	const D3D_SHADER_MACRO defines[] = { { "RENDER_WIDTH", renderW.c_str() }, { "RENDER_HEIGHT", renderH.c_str() },
++		{ "DISPLAY_WIDTH", displayW.c_str() }, { "DISPLAY_HEIGHT", displayH.c_str() }, { nullptr, nullptr } };
++	sceneBlitCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl",
++		"cs_5_0", "Blit", defines);
++	if (!sceneBlitCS)
++		return false;
++
++	D3D11_TEXTURE2D_DESC desc{};
++	desc.Width = dx12SwapChain->swapChainDesc.Width;
++	desc.Height = dx12SwapChain->swapChainDesc.Height;
++	desc.MipLevels = 1;
++	desc.ArraySize = 1;
++	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++	desc.SampleDesc.Count = 1;
++	desc.Usage = D3D11_USAGE_DEFAULT;
++	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
++	sceneBlitTarget = new Texture2D(desc);
++
++	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
++	uavDesc.Format = desc.Format;
++	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
++	sceneBlitTarget->CreateUAV(uavDesc);
++	return true;
++}
++
++void Upscaling::FillFrameBufferFromScene(ID3D11DeviceContext* a_context, ID3D11Resource* a_frameBuffer)
++{
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	const UINT fi = dx12SwapChain->frameIndex;
++
++	// The frame buffer is written below; unbind it the way Upscaling.dll does before its own
++	// upscale writes it at this point of the frame.
++	a_context->OMSetRenderTargets(0, nullptr, nullptr);
++
++	ID3D11ShaderResourceView* views[1] = { HUDLessBufferShared[fi]->srv.get() };
++	a_context->CSSetShaderResources(0, 1, views);
++	ID3D11UnorderedAccessView* uavs[1] = { sceneBlitTarget->uav.get() };
++	a_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
++	a_context->CSSetShader(sceneBlitCS, nullptr, 0);
++	a_context->Dispatch((dx12SwapChain->swapChainDesc.Width + 7) / 8, (dx12SwapChain->swapChainDesc.Height + 7) / 8, 1);
++
++	ID3D11ShaderResourceView* nullViews[1] = { nullptr };
++	a_context->CSSetShaderResources(0, 1, nullViews);
++	ID3D11UnorderedAccessView* nullUavs[1] = { nullptr };
++	a_context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
++	a_context->CSSetShader(nullptr, nullptr, 0);
++
++	a_context->CopyResource(a_frameBuffer, sceneBlitTarget->resource.get());
  }
  
  void Upscaling::GenerateUIBuffer()
 diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
-index 838f927..c4bfa2e 100644
+index 838f927..e73ffeb 100644
 --- a/plugins/FrameGeneration/src/Upscaling.h
 +++ b/plugins/FrameGeneration/src/Upscaling.h
-@@ -23,10 +23,28 @@ public:
+@@ -23,10 +23,55 @@ public:
  		bool debugLogging = false;
  		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
  		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
@@ -4270,10 +5712,37 @@ index 838f927..c4bfa2e 100644
 +	// instead of leaving FSR3 with a lane that is no longer filled.
 +	bool hudlessActive = true;
 +
++	// FG-GPU1: FSR 4.1 upscaling on the second GPU (SecondaryUpscale). Upscaling.dll reports each
++	// frame, before it renders, whether it renders it for the second GPU to upscale, at which size
++	// and with which jitter (render pixels). Cleared at Present, so a frame it did not report is native.
++	struct ExternalFrame
++	{
++		bool valid = false;
++		bool active = false;
++		uint32_t width = 0;
++		uint32_t height = 0;
++		float jitterX = 0.0f;
++		float jitterY = 0.0f;
++		float sharpness = 0.0f;
++		bool captured = false;  // PostDisplay already took the scene (it must not take the stretch back)
++	};
++	ExternalFrame externalFrame;
++	// The lanes carry the render-resolution scene, depth and motion vectors (fixed for the session).
++	bool secondaryUpscaleLanes = false;
++	UINT laneWidth = 0;
++	UINT laneHeight = 0;
++	// PostDisplay copied this frame's scene for the second GPU (per frameIndex, cleared at Present).
++	bool frameUpscaled[2] = { false, false };
++	// Render GPU: the full-size frame buffer is filled from the scene before the UI is drawn.
++	Texture2D* sceneBlitTarget = nullptr;
++	ID3D11ComputeShader* sceneBlitCS = nullptr;
++	bool CreateSceneBlit();
++	void FillFrameBufferFromScene(ID3D11DeviceContext* a_context, ID3D11Resource* a_frameBuffer);
++
  	bool highFPSPhysicsFixLoaded = false;
  
  	FrameGenType activeFrameGenType = FrameGenType::kFSR3;
-@@ -46,6 +64,8 @@ public:
+@@ -46,6 +91,8 @@ public:
  	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
  	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
  	ID3D11ComputeShader* generateUIBufferCS = nullptr;
@@ -4282,7 +5751,7 @@ index 838f927..c4bfa2e 100644
  
  	bool setupBuffers = false;
  
-@@ -57,6 +77,8 @@ public:
+@@ -57,6 +104,8 @@ public:
  	void PostPostLoad();
  
  	void CreateFrameGenerationResources();
@@ -4291,3 +5760,225 @@ index 838f927..c4bfa2e 100644
  	void PreAlpha();
  	void PostAlpha();
  	void CopyBuffersToSharedResources();
+diff --git a/plugins/Upscaling/src/Upscaling.cpp b/plugins/Upscaling/src/Upscaling.cpp
+index b9d8e3c..38aaf2d 100644
+--- a/plugins/Upscaling/src/Upscaling.cpp
++++ b/plugins/Upscaling/src/Upscaling.cpp
+@@ -371,9 +371,13 @@ void Upscaling::LoadSettings()
+ {
+ 	CSimpleIniA ini;
+ 	ini.SetUnicode();
++	// Shipped defaults first, then the user's MCM changes (the frame-generation plugin reads the
++	// same two files in the same order to size its buffers for kSecondaryGPU).
++	ini.LoadFile("Data\\MCM\\Config\\Upscaling\\settings.ini");
+ 	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
+ 
+-	settings.upscaleMethodPreference = static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2));
++	settings.upscaleMethodPreference = std::min(static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2)),
++		static_cast<uint>(UpscaleMethod::kSecondaryGPU));
+ 	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
+ 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", 0.5)), 0.0f, 1.0f);
+ 
+@@ -945,6 +949,11 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
+ 
+ 	UpscaleMethod currentUpscaleMethod = (UpscaleMethod)settings.upscaleMethodPreference;
+ 
++	// FG-GPU1: only while the second GPU can take this frame at the current render size;
++	// otherwise native resolution with TAA, which needs nothing from the other plugin.
++	if (currentUpscaleMethod == UpscaleMethod::kSecondaryGPU && !SecondaryGPUReady())
++		currentUpscaleMethod = UpscaleMethod::kDisabled;
++
+ 	// If DLSS is not available, default to FSR
+ 	if (!streamline->featureDLSS && currentUpscaleMethod == UpscaleMethod::kDLSS) {
+ 		static bool loggedDLSSFallback = false;
+@@ -968,7 +977,7 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
+ 
+ 	static bool loggedOnce = false;
+ 	if (!loggedOnce && !a_checkMenu) {
+-		REX::INFO("[UPSCALE] GetUpscaleMethod resolved: method={} (0=Disabled, 1=FSR, 2=DLSS), preference={}, enbLoaded={}, dlssAvailable={}",
++		REX::INFO("[UPSCALE] GetUpscaleMethod resolved: method={} (0=Disabled, 1=FSR, 2=DLSS, 3=FSR 4.1 on the second GPU), preference={}, enbLoaded={}, dlssAvailable={}",
+ 			static_cast<uint>(currentUpscaleMethod), settings.upscaleMethodPreference, enbLoaded, streamline->featureDLSS);
+ 		loggedOnce = true;
+ 	}
+@@ -993,7 +1002,7 @@ void Upscaling::CheckResources()
+ 
+ 	// Detect when upscaling method changes and manage resources accordingly
+ 	if (previousUpscaleMethodNoMenu != upscaleMethodNoMenu) {
+-		REX::INFO("[UPSCALE] Method transition: {} -> {} (0=Disabled, 1=FSR, 2=DLSS)",
++		REX::INFO("[UPSCALE] Method transition: {} -> {} (0=Disabled, 1=FSR, 2=DLSS, 3=FSR 4.1 on the second GPU)",
+ 			static_cast<uint>(previousUpscaleMethodNoMenu), static_cast<uint>(upscaleMethodNoMenu));
+ 		// Clean up resources from the previous upscaling method
+ 		if (previousUpscaleMethodNoMenu == UpscaleMethod::kDisabled)
+@@ -1129,7 +1138,8 @@ void Upscaling::UpdateUpscaling()
+ 	// Example: 0.67 scale -> log2(0.67) = -0.58
+ 	float currentMipBias = std::log2f(resolutionScale);
+ 
+-	if (upscaleMethodNoMenu == UpscaleMethod::kDLSS || upscaleMethodNoMenu == UpscaleMethod::kFSR)
++	if (upscaleMethodNoMenu == UpscaleMethod::kDLSS || upscaleMethodNoMenu == UpscaleMethod::kFSR ||
++		upscaleMethodNoMenu == UpscaleMethod::kSecondaryGPU)
+ 		currentMipBias -= 1.0f;
+ 
+ 	UpdateSamplerStates(currentMipBias);
+@@ -1168,14 +1178,91 @@ void Upscaling::UpdateUpscaling()
+ 	Util::SetDynamicResolution(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio,
+ 		originalDynamicWidthRatio != 1.0f || originalDynamicHeightRatio != 1.0f);
+ 
++	// FG-GPU1: tell the frame-generation plugin whether this frame is the second GPU's to
++	// upscale, at which size and with which jitter (render pixels, as FSR expects them negated).
++	if (secondaryGPU.Available()) {
++		const bool external = upscaleMethod == UpscaleMethod::kSecondaryGPU;
++		secondaryGPU.setFrame(external, RenderExtent(gameViewport->screenWidth, resolutionScale),
++			RenderExtent(gameViewport->screenHeight, resolutionScale), external ? jitter.x : 0.0f,
++			external ? jitter.y : 0.0f, settings.sharpness);
++	}
++
+ 	CheckResources();
+ }
+ 
++uint32_t Upscaling::RenderExtent(uint32_t a_displayExtent, float a_resolutionScale)
++{
++	return static_cast<uint32_t>(static_cast<float>(a_displayExtent) * a_resolutionScale);
++}
++
++void Upscaling::SecondaryGPU::Resolve()
++{
++	if (resolved)
++		return;
++	resolved = true;
++
++	HMODULE frameGeneration = GetModuleHandleW(L"AAAFrameGeneration.dll");
++	if (!frameGeneration) {
++		REX::WARN("[UPSCALE] FSR 4.1 on the second GPU needs AAAFrameGeneration.dll (FG-GPU1 build), which is not loaded; "
++				  "rendering at native resolution");
++		return;
++	}
++	using VersionFn = uint32_t (*)();
++	const auto version = reinterpret_cast<VersionFn>(GetProcAddress(frameGeneration, "FGGPU1_UpscaleApiVersion"));
++	if (!version || version() != kApiVersion) {
++		REX::WARN("[UPSCALE] AAAFrameGeneration.dll does not offer upscaling on the second GPU (version {}, need {}); "
++				  "install the matching FG-GPU1 build. Rendering at native resolution",
++			version ? version() : 0, kApiVersion);
++		return;
++	}
++	ready = reinterpret_cast<ReadyFn>(GetProcAddress(frameGeneration, "FGGPU1_SecondaryUpscalerReady"));
++	setFrame = reinterpret_cast<SetFrameFn>(GetProcAddress(frameGeneration, "FGGPU1_SetSecondaryUpscale"));
++	if (!Available()) {
++		ready = nullptr;
++		setFrame = nullptr;
++		REX::WARN("[UPSCALE] AAAFrameGeneration.dll is missing an FG-GPU1 export; rendering at native resolution");
++		return;
++	}
++	REX::INFO("[UPSCALE] FSR 4.1 on the second GPU: connected to AAAFrameGeneration.dll");
++}
++
++bool Upscaling::SecondaryGPUReady()
++{
++	secondaryGPU.Resolve();
++	if (!secondaryGPU.Available() || enbLoaded)
++		return false;
++
++	static auto gameViewport = Util::State_GetSingleton();
++	const float scale = 1.0f / ffxFsr3GetUpscaleRatioFromQualityMode((FfxFsr3QualityMode)GetEffectiveQualityMode());
++	const bool ready = secondaryGPU.ready(RenderExtent(gameViewport->screenWidth, scale), RenderExtent(gameViewport->screenHeight, scale));
++
++	static int previous = -1;
++	if (previous != static_cast<int>(ready)) {
++		REX::INFO("[UPSCALE] FSR 4.1 on the second GPU {}", ready ? "is ready: rendering at the quality mode's resolution" :
++																	"is not ready (see AAAFrameGeneration.log): rendering at native resolution");
++		previous = static_cast<int>(ready);
++	}
++	return ready;
++}
++
++// FG-GPU1: the frame-generation plugin checks that this Upscaling.dll knows kSecondaryGPU before
++// it sizes its buffers for it.
++extern "C" __declspec(dllexport) uint32_t FO4Upscaling_SecondaryGPUApiVersion()
++{
++	return Upscaling::SecondaryGPU::kApiVersion;
++}
++
+ void Upscaling::Upscale()
+ {
+ 	if (upscaleMethod == UpscaleMethod::kDisabled)
+ 		return;
+ 
++	// FG-GPU1: the frame buffer keeps the render-resolution scene in its top-left corner. The
++	// frame-generation plugin's hook on this call copies it out for the second GPU and fills the
++	// frame buffer for the UI, whichever of the two hooks runs first.
++	if (upscaleMethod == UpscaleMethod::kSecondaryGPU)
++		return;
++
+ 	static auto rendererData = RE::BSGraphics::GetRendererData();
+ 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+ 
+diff --git a/plugins/Upscaling/src/Upscaling.h b/plugins/Upscaling/src/Upscaling.h
+index d99a9c1..3e212f1 100644
+--- a/plugins/Upscaling/src/Upscaling.h
++++ b/plugins/Upscaling/src/Upscaling.h
+@@ -64,18 +64,62 @@ public:
+ 	 */
+ 	enum class UpscaleMethod
+ 	{
+-		kDisabled,  ///< No upscaling, native TAA
+-		kFSR,       ///< AMD FidelityFX Super Resolution 3
+-		kDLSS       ///< NVIDIA Deep Learning Super Sampling
++		kDisabled,     ///< No upscaling, native TAA
++		kFSR,          ///< AMD FidelityFX Super Resolution 3
++		kDLSS,         ///< NVIDIA Deep Learning Super Sampling
++		kSecondaryGPU  ///< FG-GPU1: render scale, jitter and no TAA here; AMD FSR 4.1 runs on the second GPU
+ 	};
+ 
++	// ========================================
++	// FG-GPU1: upscaling on the second GPU
++	// ========================================
++
++	/**
++	 * @brief The frame-generation plugin's side of kSecondaryGPU
++	 *
++	 * AAAFrameGeneration.dll (FG-GPU1 build) exports these. This plugin keeps doing everything
++	 * that makes a frame upscalable (render scale, jitter, TAA off, mip bias, the dynamic
++	 * resolution fixes) and skips its own upscale; the frame-generation plugin sends the
++	 * render-resolution scene to the second GPU, runs FSR 4.1 there and fills the full-size
++	 * frame buffer for the UI. Without it (or before its FSR 4.1 context exists) the method
++	 * falls back to native resolution with TAA.
++	 */
++	struct SecondaryGPU
++	{
++		using ReadyFn = bool (*)(uint32_t, uint32_t);
++		using SetFrameFn = void (*)(bool, uint32_t, uint32_t, float, float, float);
++
++		static constexpr uint32_t kApiVersion = 1;
++
++		bool resolved = false;
++		ReadyFn ready = nullptr;
++		SetFrameFn setFrame = nullptr;
++
++		void Resolve();
++		[[nodiscard]] bool Available() const noexcept { return ready && setFrame; }
++	};
++
++	SecondaryGPU secondaryGPU;
++
++	/**
++	 * @brief Whether the second GPU can upscale this frame at the render size kSecondaryGPU uses
++	 */
++	bool SecondaryGPUReady();
++
++	/**
++	 * @brief Render size for a display size at the current quality mode
++	 *
++	 * The same arithmetic the jitter, the frame-generation plugin and the second GPU use.
++	 */
++	static uint32_t RenderExtent(uint32_t a_displayExtent, float a_resolutionScale);
++
+ 	/**
+ 	 * @struct Settings
+ 	 * @brief User-configurable upscaling settings
+ 	 */
+ 	struct Settings
+ 	{
+-		uint upscaleMethodPreference = (uint)UpscaleMethod::kDLSS; ///< Preferred upscaling method
++		uint upscaleMethodPreference = (uint)UpscaleMethod::kDLSS; ///< Preferred upscaling method (3 = FSR 4.1 on the second GPU)
+ 		uint qualityMode = 1;									   ///< Quality mode: 0=Native AA, 1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance
+ 		float sharpness = 0.5f;									   ///< Post-upscale sharpening: 0.0=off, 1.0=max
+ 	};

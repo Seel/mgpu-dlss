@@ -45,6 +45,33 @@ public:
 	// instead of leaving FSR3 with a lane that is no longer filled.
 	bool hudlessActive = true;
 
+	// FG-GPU1: FSR 4.1 upscaling on the second GPU (SecondaryUpscale). Upscaling.dll reports each
+	// frame, before it renders, whether it renders it for the second GPU to upscale, at which size
+	// and with which jitter (render pixels). Cleared at Present, so a frame it did not report is native.
+	struct ExternalFrame
+	{
+		bool valid = false;
+		bool active = false;
+		uint32_t width = 0;
+		uint32_t height = 0;
+		float jitterX = 0.0f;
+		float jitterY = 0.0f;
+		float sharpness = 0.0f;
+		bool captured = false;  // PostDisplay already took the scene (it must not take the stretch back)
+	};
+	ExternalFrame externalFrame;
+	// The lanes carry the render-resolution scene, depth and motion vectors (fixed for the session).
+	bool secondaryUpscaleLanes = false;
+	UINT laneWidth = 0;
+	UINT laneHeight = 0;
+	// PostDisplay copied this frame's scene for the second GPU (per frameIndex, cleared at Present).
+	bool frameUpscaled[2] = { false, false };
+	// Render GPU: the full-size frame buffer is filled from the scene before the UI is drawn.
+	Texture2D* sceneBlitTarget = nullptr;
+	ID3D11ComputeShader* sceneBlitCS = nullptr;
+	bool CreateSceneBlit();
+	void FillFrameBufferFromScene(ID3D11DeviceContext* a_context, ID3D11Resource* a_frameBuffer);
+
 	bool highFPSPhysicsFixLoaded = false;
 
 	FrameGenType activeFrameGenType = FrameGenType::kFSR3;

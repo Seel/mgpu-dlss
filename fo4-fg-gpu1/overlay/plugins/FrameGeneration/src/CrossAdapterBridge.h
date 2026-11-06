@@ -174,6 +174,17 @@ public:
 	// submits it on its own as soon as the depth lane has landed, while the rest still crosses.)
 	void RecordDepthUpsample(ID3D12GraphicsCommandList* a_listB, UINT a_slot);
 
+	// --- FSR 4.1 upscaling on B (async path) ------------------------------------------
+	// a_queue waits until B's copy queue has read these lanes of the frame being assembled.
+	// a_queued is false (and nothing is queued) while any of them has not been given to the copy
+	// queue yet this frame; the caller then tries again after Unpack at Present.
+	HRESULT WaitForLaneReads(ID3D12CommandQueue* a_queue, const int* a_lanes, size_t a_count, bool& a_queued);
+
+	// CPU: the direct list that last used a_slot has finished (allocator reuse). Normally already true.
+	HRESULT WaitDisplayListDone(UINT a_slot);
+	// Non-blocking version, for reading timestamps.
+	[[nodiscard]] bool DisplayListDone(UINT a_slot) const noexcept;
+
 	// --- Both paths -------------------------------------------------------------------
 	// Timestamp on the frame's direct list on B (kMarkListBegin / kMarkAfterUnpack / kMarkListEnd).
 	void MarkDisplayList(ID3D12GraphicsCommandList* a_listB, UINT a_slot, UINT a_mark);
@@ -336,6 +347,9 @@ private:
 	bool unpackStarted = false;                // a frame's read has been submitted in part (BeginUnpack)
 	UINT64 unpackFrame = 0;                    // ...for this frame
 	std::array<UINT64, kMaxLanes> laneUnpackFrame{};  // frame whose read of each lane was last submitted
+	winrt::com_ptr<ID3D12Fence> readFenceB;           // B copy queue signals after each lane's read
+	UINT64 readValue = 0;
+	std::array<UINT64, kMaxLanes> laneReadValue{};    // readFenceB value of each lane's latest read
 
 	// B's direct queue (FFX game queue). Not owned.
 	ID3D12CommandQueue* displayQueue = nullptr;
