@@ -39,6 +39,17 @@ camera state holds a 2D camera (P[1][1] 0.0131, rejected → 1 rad), at Present 
 the problem is *which* camera is current). Neither is the world camera (~78°). Fixed in the next
 commit: sample in the world pass, latch, log changes sparingly.
 
+**FOV latch (built 20:51, not yet run):** `FidelityFX::SampleWorldCameraFov` reads `projMat` in the
+world-pass hooks (`PostAlpha`, `CopyBuffersToSharedResources`), accepts it only if `P[0][0] * aspect
+== P[1][1]` (±3%), and latches it; `VerticalFov()` returns the latch (1 rad until the first sample)
+for FSR 4.1 (`BeginFrame`) and FG (`PrepareV2`). Logged: first sample, each change > 1° (aiming,
+1st/3rd person), the first rejected sample, at most 40 lines, each with `PlayerCamera worldFOV` /
+`firstPersonFOV` for comparison. The user's INI has 110 and 98 (1st / 3rd person, per the user):
+at 16:9 that is ~78.4° and ~65.8° vertical, if the setting is horizontal. If the world-pass sample
+shows something else (e.g. the 24° camera), the world camera is not current there either; next
+candidates: `UpdateDynamicResolution` (Upscaling.dll's hook at the start of the world render) or
+deriving it from `PlayerCamera`.
+
 Goal: free the 3090 for heavier graphics mods. With `Upscaling.dll`'s
 `iUpscaleMethodPreference = 3`, the 3090 renders the 3D scene at the quality mode's resolution
 (Quality = 2560×1440 at 4K) and the 9060 upscales it with **FSR 4.1.2** (SDK 2.4, ML, works on

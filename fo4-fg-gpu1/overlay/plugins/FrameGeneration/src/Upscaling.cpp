@@ -5,6 +5,7 @@
 #include "CrossAdapterBridge.h"
 #include "DX12SwapChain.h"
 #include "DirectXMath.h"
+#include "FidelityFX.h"
 #include "SecondaryUpscale.h"
 
 enum class RenderTarget
@@ -526,6 +527,12 @@ void Upscaling::PostAlpha()
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 
+	// The world camera is the renderer's current camera only during the world pass.
+	if (dx12SwapChain->swapChainDesc.Height)
+		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
+		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),
+			"the world pass (after alpha)");
+
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 
 	{
@@ -588,7 +595,13 @@ void Upscaling::CopyBuffersToSharedResources()
 
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
-	
+
+	// The world camera is the renderer's current camera only during the world pass.
+	if (dx12SwapChain->swapChainDesc.Height)
+		FidelityFX::SampleWorldCameraFov(static_cast<float>(dx12SwapChain->swapChainDesc.Width) /
+		                                     static_cast<float>(dx12SwapChain->swapChainDesc.Height),
+			"the world pass (forward)");
+
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 
 	auto& motionVector = rendererData->renderTargets[(uint)RenderTarget::kMotionVectors];

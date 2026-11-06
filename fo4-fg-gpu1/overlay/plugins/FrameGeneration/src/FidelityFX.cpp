@@ -4,8 +4,6 @@
 
 #include "DX12SwapChain.h"
 
-#include <DirectXMath.h>
-
 #include <atomic>
 #include <cmath>
 #include <cwctype>
@@ -521,56 +519,61 @@ void FidelityFX::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_D
 	return singleton.get();
 }
 
-float FidelityFX::VerticalFov(float a_aspect)
+namespace
 {
-	// The camera's projMat field is not a plain projection in this game (its [1][1] read ~0.013,
-	// a 178 degree FOV). Rebuild the projection from the view and the unjittered view-projection,
-	// as the DLSS-G path does, and only trust it if it looks like one: a perspective projection
-	// has P[0][0] * aspect == P[1][1]. Otherwise the 1 rad FSR 3.1 has always been given here.
+	float worldFov = 1.0f;  // FSR 3.1's long-standing value until the world pass has been sampled
+	bool haveWorldFov = false;
+	int fovLogLines = 0;
+}
+
+void FidelityFX::SampleWorldCameraFov(float a_aspect, const char* a_where)
+{
+	// The renderer's camera state is the camera of the pass that ran last: a 2D camera after
+	// imagespace (P[1][1] ~0.013), a narrow one at Present (~24 deg). During the world pass it is the
+	// world camera. projMat is a real projection (it matches inverse(view) * viewProjUnjittered);
+	// accept it only if it looks like a perspective one, P[0][0] * aspect == P[1][1].
 	static auto gameViewport = State_GetSingleton();
 	const auto& view = gameViewport->cameraState.camViewData;
-	const auto load = [](const __m128 (&a_rows)[4]) {
-		DirectX::XMMATRIX m;
-		for (int i = 0; i < 4; ++i)
-			m.r[i] = a_rows[i];
-		return m;
+	const float yScale = std::fabs(Component(view.projMat[1], 1));
+	const float xScale = std::fabs(Component(view.projMat[0], 0));
+	const bool perspective = std::isfinite(yScale) && std::isfinite(xScale) && yScale > 0.1f && yScale < 20.0f &&
+	                         std::fabs(xScale * a_aspect - yScale) <= 0.03f * yScale;
+
+	const auto report = [&](const char* a_what, float a_fov) {
+		if (fovLogLines > 40)
+			return;
+		if (fovLogLines++ == 40) {
+			REX::INFO("[FSR] further camera FOV changes are not logged");
+			return;
+		}
+		auto camera = RE::PlayerCamera::GetSingleton();
+		REX::INFO("[FSR] camera vertical FOV {}: {:.3f} rad ({:.1f} deg) at {} (P[1][1] {:.4f}, P[0][0]*aspect {:.4f}; "
+				  "PlayerCamera worldFOV {:.1f}, firstPersonFOV {:.1f})",
+			a_what, a_fov, a_fov * 57.29578f, a_where, yScale, xScale * a_aspect, camera ? camera->worldFOV : 0.0f,
+			camera ? camera->firstPersonFOV : 0.0f);
 	};
-	const DirectX::XMMATRIX viewMatrix = load(view.viewMat);
-	const DirectX::XMMATRIX viewProj = load(view.viewProjUnjittered);
-	DirectX::XMVECTOR determinant;
-	const DirectX::XMMATRIX inverseView = DirectX::XMMatrixInverse(&determinant, viewMatrix);
-	// Row vectors (v * V * P) first, as the DLSS-G and XeSS paths assume; column vectors second.
-	const DirectX::XMMATRIX candidates[2] = { DirectX::XMMatrixMultiply(inverseView, viewProj),
-		DirectX::XMMatrixMultiply(viewProj, inverseView) };
 
-	float fov = 1.0f;
-	int source = -1;
-	float p11[2]{};
-	for (int i = 0; i < 2; ++i) {
-		const float yScale = std::fabs(DirectX::XMVectorGetY(candidates[i].r[1]));
-		const float xScale = std::fabs(DirectX::XMVectorGetX(candidates[i].r[0]));
-		p11[i] = yScale;
-		if (!std::isfinite(yScale) || !std::isfinite(xScale) || yScale < 0.1f || yScale > 20.0f)
-			continue;
-		if (std::fabs(xScale * a_aspect - yScale) > 0.03f * yScale)
-			continue;  // not a symmetric perspective projection
-		fov = 2.0f * std::atan(1.0f / yScale);
-		source = i;
-		break;
+	if (!perspective) {
+		static bool loggedReject = false;
+		if (!loggedReject) {
+			report("sample rejected (not a perspective projection), keeping", worldFov);
+			loggedReject = true;
+		}
+		return;
 	}
+	const float fov = 2.0f * std::atan(1.0f / yScale);
+	// Logged when it moves by more than a degree (aiming down sights, scopes), not every frame.
+	if (!haveWorldFov || std::fabs(fov - worldFov) > 0.01745f) {
+		worldFov = fov;
+		report(haveWorldFov ? "changed" : "first sample", fov);
+	}
+	worldFov = fov;
+	haveWorldFov = true;
+}
 
-	static int loggedSource = -2;
-	if (source != loggedSource) {
-		REX::INFO("[FSR] camera vertical FOV {:.3f} rad ({:.1f} deg) from {} (projMat[1][1] {:.4f}, inv(view)*viewProj {:.4f}, "
-				  "viewProj*inv(view) {:.4f}, aspect {:.3f})",
-			fov, fov * 57.29578f,
-			source == 0 ? "inverse(view) * viewProjUnjittered" :
-			source == 1 ? "viewProjUnjittered * inverse(view)" :
-						  "the 1 rad default (no projection found)",
-			Component(view.projMat[1], 1), p11[0], p11[1], a_aspect);
-		loggedSource = source;
-	}
-	return fov;
+float FidelityFX::VerticalFov()
+{
+	return worldFov;
 }
 
 void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_override)
@@ -722,7 +725,7 @@ void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_overr
 			StoreUnit(dispatchParameters.cameraRight, view.viewRight);
 			StoreUnit(dispatchParameters.cameraForward, view.viewDir);
 
-			dispatchParameters.cameraFovAngleVertical = VerticalFov(screenSize.x / screenSize.y);
+			dispatchParameters.cameraFovAngleVertical = VerticalFov();
 
 			prepareResult = ffxm::Dispatch(frameGenContext, dispatchParameters);
 		} else {

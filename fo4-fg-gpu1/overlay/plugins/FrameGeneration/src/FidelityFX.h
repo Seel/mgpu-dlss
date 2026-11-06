@@ -106,8 +106,11 @@ public:
 		uint32_t a_displayHeight, bool a_debugChecking);
 	ffx::ReturnCode DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch);
 
-	// The game camera's vertical field of view in radians (FSR upscaling and frame generation).
-	static float VerticalFov(float a_aspect);
+	// The world camera's vertical field of view in radians (FSR upscaling and frame generation).
+	// The renderer's camera state belongs to whichever pass ran last (a 2D camera after imagespace,
+	// another one at Present), so it is sampled in the world pass and latched; 1 rad until then.
+	static void SampleWorldCameraFov(float a_aspect, const char* a_where);
+	static float VerticalFov();
 
 	[[nodiscard]] const char* RuntimeName() const;
 

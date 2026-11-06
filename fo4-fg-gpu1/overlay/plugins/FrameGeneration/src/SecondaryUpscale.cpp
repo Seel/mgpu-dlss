@@ -328,7 +328,7 @@ void SecondaryUpscale::BeginFrame(UINT a_slot, float a_jitterX, float a_jitterY,
 	p.sharpness = std::clamp(a_sharpness, 0.0f, 1.0f);
 	p.cameraNear = *(float*)REL::ID({ 57985, 2712882, 2712882 }).address();
 	p.cameraFar = *(float*)REL::ID({ 958877, 2712883, 2712883 }).address();
-	p.fovY = FidelityFX::VerticalFov(static_cast<float>(displayWidth) / static_cast<float>(displayHeight));
+	p.fovY = FidelityFX::VerticalFov();  // latched in the world pass
 
 	pending[a_slot] = true;
 	submitted[a_slot] = false;
