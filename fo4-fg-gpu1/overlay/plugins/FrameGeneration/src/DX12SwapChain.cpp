@@ -283,6 +283,32 @@ void DX12SwapChain::CreateInterop()
 	}
 }
 
+ID3D12Resource* DX12SwapChain::HudlessStandInFor(UINT a_slot)
+{
+	if (a_slot >= frameSlots || !d3d12Device || !swapChainBuffers[a_slot])
+		return nullptr;
+
+	if (!hudlessStandIn[a_slot]) {
+		D3D12_RESOURCE_DESC desc = swapChainBuffers[a_slot]->GetDesc();
+		// A plain texture: only ever a copy destination and a shader-read source.
+		desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+		desc.Alignment = 0;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+		const CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
+		const HRESULT hr = d3d12Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(hudlessStandIn[a_slot].put()));
+		if (FAILED(hr)) {
+			REX::CRITICAL("[FG-GPU1] bSendHudlessFrame=0: the stand-in colour texture could not be created (hr={:#010x})",
+				static_cast<std::uint32_t>(hr));
+			return nullptr;
+		}
+		REX::INFO("[FG-GPU1] bSendHudlessFrame=0: slot {} gets a {}x{} stand-in copy of the composed frame for FFX",
+			a_slot, desc.Width, desc.Height);
+	}
+	return hudlessStandIn[a_slot].get();
+}
+
 DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
 {
 	return swapChainProxy;

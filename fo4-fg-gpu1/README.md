@@ -111,7 +111,10 @@ in both GPU1 and single-GPU FSR3 mode.
 `bSendHudlessFrame` is the "extra UI-free frame" switch. On (default) the 3090 sends a second copy
 of each frame with the HUD removed; FSR3 uses it so the HUD is not interpolated. Off removes that
 copy from the PCIe budget (~25% less traffic at 4K) but the HUD is then interpolated with the scene
-and smears a little during camera movement.
+and smears a little during camera movement. With FSR 4.1 on the second GPU there is no second copy
+(the upscale result is the UI-free frame), so the switch only decides what frame generation is given:
+off hands it a copy of the composed frame instead, and the HUD is interpolated with the scene — see
+[FSR 4.1 upscaling on the second GPU](#fsr-41-upscaling-on-the-second-gpu).
 
 `bAsyncUnpack` changes how the 9060 reads what arrives. On (default) it reads on its own copy
 queue and starts on each buffer (final frame, HUD-less, depth, motion vectors) as soon as that
@@ -327,9 +330,15 @@ How a frame goes:
 | Present | 9060 | the UI is composited over the FSR 4.1 result (the 9060 rebuilds the same stretch, keeps what the UI changed); frame generation gets the FSR 4.1 result as its UI-free frame |
 
 Payload at 4K Quality: 14.75 MB scene + 14.75 MB depth + 14.75 MB motion vectors + 33.2 MB finished
-frame ≈ **77 MB/frame** (126.6 MB at native 4K). `iHalfResDepthMV` and `bSendHudlessFrame = 0`
-are ignored in this mode. AMD lists FSR 4.1 at ~3.4 ms on a 9060 XT at 4K; a probe on this PC
-measured 3.3 ms.
+frame ≈ **77 MB/frame** (126.6 MB at native 4K). `iHalfResDepthMV` is ignored here (depth and motion
+vectors already cross at the render resolution). `bSendHudlessFrame = 0` is not ignored: frame
+generation is then handed a copy of the composed frame instead of the FSR 4.1 result, so the HUD is
+interpolated with the scene, and `bFreezeHudMotionVectors` zeroes the motion vectors under the HUD to
+hold it still. With the UI-free frame on, that switch only freezes the scene behind the HUD (visible
+through translucent HUD parts), because the HUD itself is composited after generation. The copy is a
+plain GPU copy into an RGBA8 texture, so it needs an RGBA8 back buffer: under an HDR add-on the
+frame is shown without frame generation instead (logged), not black. AMD lists FSR 4.1 at ~3.4 ms on
+a 9060 XT at 4K; a probe on this PC measured 3.3 ms.
 
 Menus the upscaler renders natively (Pip-Boy, containers, loading) are shown as rendered, without
 frame generation. If anything is missing (another `Upscaling.dll` installed, SDK 1.1.4, no FSR 4

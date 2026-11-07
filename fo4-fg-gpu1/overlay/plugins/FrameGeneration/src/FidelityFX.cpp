@@ -655,7 +655,62 @@ void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_overr
 	auto commandList = dx12SwapChain->commandLists[dx12SwapChain->frameIndex].get();
 
 	// FG-GPU1 upscaling: the UI-free frame is the FSR 4.1 output, not the render-resolution lane.
-	auto HUDLessColor = a_override ? a_override->hudless : upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
+	ID3D12Resource* HUDLessColor = a_override ? a_override->hudless :
+											  upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
+
+	// Test branch (test/mv-freeze-hud-bars): bSendHudlessFrame = 0. FFX still needs a colour
+	// resource to interpolate. Handing it none left the frame generation context without its
+	// scene — the screen went black and only the UI composite survived. So give it a copy of the
+	// composited back buffer instead: the UI difference is then zero, no UI is extracted, and the
+	// HUD is interpolated together with the scene, which is what the switch means on one GPU.
+	if (a_useFrameGeneration && !upscaling->settings.sendHudlessFrame) {
+		// FFX was told the UI-free input is RGBA8 (CreateContextDescFrameGenerationHudless, when the
+		// back buffer is another format) and a plain copy can only land in a matching format, so the
+		// stand-in works while the back buffer really is RGBA8. Under an HDR add-on it does not:
+		// show the composed frame without generation rather than a black screen.
+		if (dx12SwapChain->displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				REX::WARN("[FSR] bSendHudlessFrame = 0 (test branch) needs an RGBA8 back buffer, this one is format {}; "
+						  "frame generation stays off while the switch is 0 (disable ReShade's AutoHDR to run the test)",
+					static_cast<int>(dx12SwapChain->displayFormat));
+			}
+			a_useFrameGeneration = false;
+		} else if (ID3D12Resource* standIn = dx12SwapChain->HudlessStandInFor(dx12SwapChain->frameIndex)) {
+			ID3D12Resource* composed = dx12SwapChain->swapChainBuffers[dx12SwapChain->frameIndex].get();
+			D3D12_RESOURCE_BARRIER toCopy[2]{};
+			for (auto& barrier : toCopy) {
+				barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+				barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			}
+			toCopy[0].Transition.pResource = composed;
+			toCopy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+			toCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			toCopy[1].Transition.pResource = standIn;
+			toCopy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+			commandList->ResourceBarrier(2, toCopy);
+			commandList->CopyResource(standIn, composed);
+
+			D3D12_RESOURCE_BARRIER toPresent[2]{};
+			for (auto& barrier : toPresent) {
+				barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+				barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			}
+			toPresent[0].Transition.pResource = composed;
+			toPresent[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			toPresent[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+			toPresent[1].Transition.pResource = standIn;
+			toPresent[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			toPresent[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			commandList->ResourceBarrier(2, toPresent);
+
+			HUDLessColor = standIn;
+		}
+	}
 	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
 	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
 
@@ -667,7 +722,7 @@ void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_overr
 		configParameters.frameGenerationCallback = FrameGenerationCallback;
 		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
 
-		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
+		configParameters.HUDLessColor = HUDLessColor ? ffxApiGetResourceDX12(HUDLessColor) : FfxApiResource({});
 
 	}
 	else {

@@ -141,6 +141,12 @@ public:
 
 	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kMaxFrameSlots];
 
+	// Test branch: with bSendHudlessFrame = 0 in second-GPU mode, FFX still gets a colour resource
+	// to interpolate: a copy of the composited back buffer (so the UI difference is zero and the
+	// HUD ends up inside the interpolation, as it is on one GPU). Created on first use.
+	winrt::com_ptr<ID3D12Resource> hudlessStandIn[kMaxFrameSlots];
+	ID3D12Resource* HudlessStandInFor(UINT a_slot);
+
 	UINT frameIndex = 0;
 	UINT64 fenceValue = 0;
 
