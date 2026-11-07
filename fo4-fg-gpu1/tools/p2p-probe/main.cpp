@@ -1629,6 +1629,135 @@ namespace
 	}
 }
 
+// ---- --contention: does the copy engine's outgoing traffic slow the 3090's other PCIe traffic? -----------------
+//
+// In game, the 3090 renders while its copy engine sends the lanes out. The game reads system memory every frame
+// (dynamic vertex/constant buffers, streaming), and on PCIe a read request may not pass the posted writes ahead of
+// it on the same link. Writes into the 9060's VRAM drain slower than writes into system RAM (10.2 vs 13.2 GB/s
+// through the X299 root complex), so they could hold those reads up longer. Measured here: system-RAM reads on the
+// 3090's direct queue (bulk 256 KB copies and tiny 256 B ones) alone, while the copy queue writes system RAM, and
+// while it writes the 9060's VRAM.
+namespace
+{
+	int RunContention(void* a_barAmd)
+	{
+		Dx a;
+		if (!a.Create(kVendorNvidia)) return 1;
+
+		ComPtr<ID3D12Resource> vramSrc = a.Buffer(D3D12_HEAP_TYPE_DEFAULT, kSize, D3D12_RESOURCE_STATE_COMMON);
+		ComPtr<ID3D12Resource> vramDst = a.Buffer(D3D12_HEAP_TYPE_DEFAULT, kSize, D3D12_RESOURCE_STATE_COMMON);
+		ComPtr<ID3D12Resource> upload = a.Buffer(D3D12_HEAP_TYPE_UPLOAD, kSize, D3D12_RESOURCE_STATE_GENERIC_READ);
+		// Write targets: a cross-adapter heap in system RAM (today's bridge) and the 9060's BAR block (direct copy).
+		ComPtr<ID3D12Resource> sysTarget;
+		ComPtr<ID3D12Resource> peerTarget;
+		{
+			D3D12_HEAP_DESC hd{};
+			hd.SizeInBytes = kSize;
+			hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+			hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+			hd.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+			ComPtr<ID3D12Heap> heap;
+			if (SUCCEEDED(a.dev->CreateHeap(&hd, IID_PPV_ARGS(&heap)))) sysTarget = a.Placed(heap.Get());
+			ComPtr<ID3D12Heap> peerHeap;
+			if (SUCCEEDED(a.dev->OpenExistingHeapFromAddress(a_barAmd, IID_PPV_ARGS(&peerHeap))))
+				peerTarget = a.Placed(peerHeap.Get());
+		}
+		ComPtr<ID3D12Fence> backgroundFence;
+		a.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&backgroundFence));
+		UINT64 backgroundValue = 0;
+		HANDLE backgroundEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		if (!vramSrc || !vramDst || !upload || !sysTarget || !peerTarget || !backgroundFence ||
+			!a.Fill(vramSrc.Get(), 0xC0FFEEu)) {
+			std::printf("  resources failed\n");
+			return 1;
+		}
+
+		// The measurement on the direct queue: [0,1] 256 x 256 KB system-RAM reads, [2,3] 4000 x 256 B ones.
+		ComPtr<ID3D12QueryHeap> queries;
+		D3D12_QUERY_HEAP_DESC qhd{ D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4, 0 };
+		a.dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queries));
+		ComPtr<ID3D12Resource> stamps = a.Buffer(D3D12_HEAP_TYPE_READBACK, 4 * sizeof(UINT64), D3D12_RESOURCE_STATE_COPY_DEST);
+		constexpr UINT kBulk = 256;
+		constexpr UINT64 kBulkSize = kSize / kBulk;
+		constexpr UINT kSmall = 4000;
+		constexpr UINT64 kSmallSize = 256;
+
+		struct Result
+		{
+			double bulkGBps = 0, smallUs = 0, backgroundGBps = 0;
+		};
+		auto measure = [&](ID3D12Resource* a_backgroundTarget, Result& a_out) -> bool {
+			constexpr UINT kBackgroundCopies = 30;  // ~150-200 ms of writes, far longer than the measurement
+			LARGE_INTEGER f{}, b0{}, b1{};
+			QueryPerformanceFrequency(&f);
+			if (a_backgroundTarget) {
+				a.copy.allocator->Reset();
+				a.copy.list->Reset(a.copy.allocator.Get(), nullptr);
+				for (UINT i = 0; i < kBackgroundCopies; ++i)
+					a.copy.list->CopyBufferRegion(a_backgroundTarget, 0, vramSrc.Get(), 0, kSize);
+				a.copy.list->Close();
+				ID3D12CommandList* lists[] = { a.copy.list.Get() };
+				QueryPerformanceCounter(&b0);
+				a.copy.queue->ExecuteCommandLists(1, lists);
+				a.copy.queue->Signal(backgroundFence.Get(), ++backgroundValue);
+				Sleep(5);  // let the writes get going before the reads start
+			}
+			a.direct.allocator->Reset();
+			a.direct.list->Reset(a.direct.allocator.Get(), nullptr);
+			a.direct.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+			for (UINT i = 0; i < kBulk; ++i)
+				a.direct.list->CopyBufferRegion(vramDst.Get(), i * kBulkSize, upload.Get(), i * kBulkSize, kBulkSize);
+			a.direct.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+			for (UINT i = 0; i < kSmall; ++i)
+				a.direct.list->CopyBufferRegion(vramDst.Get(), (i % 4096) * kSmallSize, upload.Get(), (i % 4096) * kSmallSize,
+					kSmallSize);
+			a.direct.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+			a.direct.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+			a.direct.list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, stamps.Get(), 0);
+			if (!a.Run(a.direct)) return false;
+			if (a_backgroundTarget) {
+				const bool stillWriting = backgroundFence->GetCompletedValue() < backgroundValue;
+				backgroundFence->SetEventOnCompletion(backgroundValue, backgroundEvent);
+				WaitForSingleObject(backgroundEvent, kTimeoutMs);
+				QueryPerformanceCounter(&b1);
+				const double ms = static_cast<double>(b1.QuadPart - b0.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+				a_out.backgroundGBps = static_cast<double>(kSize) * kBackgroundCopies / (ms / 1000.0) / 1e9;
+				if (!stillWriting) std::printf("  (the background writes ended before the reads did; numbers understate it)\n");
+			}
+			UINT64* ts = nullptr;
+			const D3D12_RANGE readRange{ 0, 4 * sizeof(UINT64) };
+			stamps->Map(0, &readRange, reinterpret_cast<void**>(&ts));
+			const double toMs = 1000.0 / static_cast<double>(a.direct.frequency);
+			const double bulkMs = static_cast<double>(ts[1] - ts[0]) * toMs;
+			const double smallMs = static_cast<double>(ts[2] - ts[1]) * toMs;
+			const D3D12_RANGE noWrite{ 0, 0 };
+			stamps->Unmap(0, &noWrite);
+			a_out.bulkGBps = static_cast<double>(kSize) / (bulkMs / 1000.0) / 1e9;
+			a_out.smallUs = smallMs * 1000.0 / kSmall;
+			return true;
+		};
+
+		std::printf("\n  3090 reading system RAM on its direct queue (what the game does every frame), while its copy queue:\n");
+		std::printf("  %-38s %16s %22s %18s\n", "", "bulk 256 KB reads", "tiny 256 B reads", "copy queue writes");
+		const struct
+		{
+			const char* name;
+			ID3D12Resource* target;
+		} modes[] = { { "is idle", nullptr }, { "writes system RAM (today's bridge)", sysTarget.Get() },
+			{ "writes the 9060's VRAM (direct copy)", peerTarget.Get() }, { "is idle (again)", nullptr },
+			{ "writes system RAM (again)", sysTarget.Get() }, { "writes the 9060's VRAM (again)", peerTarget.Get() } };
+		for (const auto& mode : modes) {
+			Result r;
+			if (!measure(mode.target, r)) return 1;
+			std::printf("  %-38s %11.2f GB/s %15.2f us each", mode.name, r.bulkGBps, r.smallUs);
+			if (mode.target) std::printf(" %13.2f GB/s", r.backgroundGBps);
+			std::printf("\n");
+		}
+		CloseHandle(backgroundEvent);
+		return 0;
+	}
+}
+
 #ifdef P2P_EXIT_HOOK
 // ---- --exit-hook, --exit-gpu: the mod's release at process exit (CrossAdapterBridge::ReleaseDirectCopyForExit) --
 //
@@ -1790,7 +1919,9 @@ int wmain(int argc, wchar_t** argv)
 	bool evict = false;
 	bool pipeline = false;
 	bool computeQueue = false;
+	bool contention = false;
 	for (int i = 1; i < argc; ++i) {
+		if (std::wcscmp(argv[i], L"--contention") == 0) contention = true;
 		if (std::wcscmp(argv[i], L"--pipeline") == 0) pipeline = true;
 		if (std::wcscmp(argv[i], L"--compute") == 0) computeQueue = true;
 		if (std::wcscmp(argv[i], L"--dma") == 0) dma = true;
@@ -2039,6 +2170,11 @@ int wmain(int argc, wchar_t** argv)
 	if (pipeline) {
 		std::printf("\n[pipeline] the mod's per-frame sequence, with the 9060's work queued before the 3090 writes\n");
 		return RunPipeline(amd, amdType, 300);
+	}
+
+	if (contention) {
+		std::printf("\n[contention] the copy engine's writes vs the 3090's own system-RAM reads\n");
+		return RunContention(bar);
 	}
 
 	if (interop) {

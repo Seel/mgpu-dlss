@@ -34,6 +34,7 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
 | `tools/bridge-load/` | Standalone D3D12 load generator: replays the bridge's host-memory traffic (77 MB up + 77 MB down per frame) on one GPU, to A/B whether that traffic costs the game fps |
+| `tools/save-runs.ps1` | Keeps each game run's `MGPUScaling.log`, `ReShade.log` and MCM settings in `D:\fgb\runs\<time>-direct<0|1>-<hdr|sdr>` for back-to-back A/B runs (the logs are overwritten on every start) |
 | `tools/p2p-probe/` | Standalone test bed for `bDirectGPUCopy`: can the 3090 write into the 9060's VRAM, how fast in every direction, how the 9060's D3D12 can read it, does the block move under VRAM pressure, and the mod's per-frame sequence 300 times |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
 | `plans/` | Planned work not started yet: `UI-TILES.md` (freeze the HUD with a motion-vector mask, then send only the UI tiles of the finished frame), `DISPLAY-THREAD.md` (FFX Present on its own thread) |

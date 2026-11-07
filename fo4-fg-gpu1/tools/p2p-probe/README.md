@@ -28,6 +28,7 @@ pwsh -ExecutionPolicy Bypass -File D:\projects\mgpu-dlss\fo4-fg-gpu1\tools\p2p-p
 | `--interop` | how the AMD D3D12 device can use the block (three routes) | P2P writes |
 | `--evict` | `--interop`, then 19.5 GiB of VRAM pressure on the AMD GPU: does the block move? | reads only across PCIe; the desktop may stutter for a few seconds |
 | `--pipeline [--compute]` | the mod's per-frame sequence 300 times, the AMD side queued before the NVIDIA write; `--compute` uses an async-compute queue as the mod does | P2P writes |
+| `--contention` | the 3090 reads system RAM on its direct queue (bulk 256 KB and tiny 256 B copies, like the game's dynamic buffers) while its copy queue is idle, writes system RAM, or writes the 9060's VRAM | P2P writes |
 | `--exit-hook`, `--exit-hook-terminate` | installs the mod's exit hooks (same detour library, same prologue check) and ends the process through ExitProcess / TerminateProcess: do the hooks fire and pass the exit code on? | none, no GPU work |
 | `--exit-gpu`, `--exit-gpu-terminate` | ends the process while 40 x 64 MiB P2P copies are still running; the hook waits for them, closes the NVIDIA view, then frees the AMD block (the mod's `ReleaseDirectCopyForExit`) | P2P writes; the order that hung the PC is NOT exercised |
 
@@ -70,6 +71,17 @@ patterns read correctly on the AMD D3D12 copy and direct queues (no stale caches
 
 `--evict`: with 19.5 GiB allocated on the 16 GB card (and the block untouched), the block kept its
 address at default and at maximum priority.
+
+`--contention` (2026-11-08): the 3090's own system-RAM reads while its copy queue writes
+
+| copy queue | bulk reads | 256 B reads | its writes |
+|---|---|---|---|
+| idle | 12.2 GB/s | 0.03 us | |
+| writes system RAM (cross-adapter heap) | 3.7 GB/s | 0.31 us | 13.1 GB/s |
+| writes the 9060's VRAM | 5.7 GB/s | 0.10 us | 10.2 GB/s |
+
+Writes to system RAM compete with the reads at the memory side; card-to-card writes leave them more
+room. So the direct copy does not hold up the game's own PCIe reads more than the old path.
 
 Exit (2026-11-08, after the mod's first build hung the PC on Alt+F4): `--exit-hook` and
 `--exit-hook-terminate` both reach the hook and keep their exit codes; `--exit-gpu` and

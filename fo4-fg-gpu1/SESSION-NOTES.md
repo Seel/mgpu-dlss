@@ -2,20 +2,49 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
-**Next session: start with [plans/UI-TILES.md](plans/UI-TILES.md)**, in its order: part 1, freeze
-the HUD in generated frames with a motion-vector mask (for second-GPU frame generation without FSR
-4.1; new setting `iHudMode`, the user's idea), then part 2, send only the finished frame's UI tiles
-in FSR 4.1 mode (`bSendUITilesOnly`), then measure; only then
-[plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread, `bDisplayThread`).
-Parts 2 and the display thread aim at the last 3-4 fps to the 71 cap with Community Shaders on
-(66.6-68.5 now with `bExtraFrameInFlight = 1`). The user asked for all of them as optional settings.
-**First, though: re-test `bDirectGPUCopy` in game, including quitting with Alt+F4 (below).** UI tiles
-were put off by the user. A single-GPU AutoHDR fix was split into its own session/branch.
+## TODO for the next session (written 2026-11-08 ~01:00)
+
+The PC is being put back together: a hard hang on exit (fixed, below) forced a power-off, and the
+board came back with the RAM at JEDEC 2133 MT/s instead of the user's tuned profile (notes say
+quad-channel DDR4-3800 with tweaked timings; 4 x G.Skill F4-4400C19). Every fps number since 00:05
+on 2026-11-08 is ~25% low for that reason alone. In order:
+
+1. **Check the PC first.** `Get-CimInstance Win32_PhysicalMemory | Select ConfiguredClockSpeed,
+   ConfiguredVoltage` should show the tuned speed (not 2133 / 1200 mV). Resizable BAR still on:
+   `nvidia-smi -q -d MEMORY` BAR1 32768 MiB, and `tools/p2p-probe/p2p-probe.exe` (no arguments)
+   should say the AMD block is "type 2 (heap 1, 15.92 GiB)". If either is off, stop and tell the user.
+2. **Re-baseline in game** (user plays, agent reads logs). Run `tools/save-runs.ps1` first so runs do
+   not overwrite each other (logs land in `D:\fgb\runs\<time>-direct<0|1>-<hdr|sdr>`). Same spot,
+   ~10 s to settle, ~60 s each: `bDirectGPUCopy=1`, then `=0`, AutoHDR on. The user's
+   `Data\MCM\Settings\MGPUScaling.ini` currently has the second GPU, FG, FSR 4.1
+   (`iUpscaleMethodPreference =3`), `bSendHudlessFrame=1`, `bExtraFrameInFlight=1`,
+   `bDirectGPUCopy=1`. Expect ~62-71 game fps like the 00:02 run. At 2133 MT/s direct copy was ~3%
+   faster than system memory (50.5 vs 48.6), AutoHDR cost nothing measurable.
+3. **Quit once with Alt+F4 and once from the main menu** with direct copy on. The last log line must
+   be `direct GPU copy: ... closed the render GPU's views of the display GPU's VRAM, then freed the
+   blocks`. Seen 4 times so far, always "terminating itself" (FO4 ends via TerminateProcess). No hang
+   since the fix.
+4. **The merged AutoHDR branch.** Session "AutoHDR (10-bit swap chain) in single-GPU mode" left
+   `claude/admiring-blackwell-f97e03` (531ec98, worktree `.claude/worktrees/admiring-blackwell-f97e03`,
+   not pushed): single-GPU AutoHDR + build-script fixes, merged with everything from this branch up
+   to 0046e81. Its build `D:\fgh\MGPU-Scaling.zip` is untested in game. Test single-GPU + AutoHDR
+   (`bFrameGenOnSecondaryGPU=0`) and second-GPU mode with it; then ask the user whether to merge it
+   back into `test/mv-freeze-hud-bars` (or main). Uncommitted notes/probe changes on this branch
+   (contention mode, these notes, `tools/save-runs.ps1`) are not in it.
+5. **Optional, direct copy:** it adds ~0.2 ms of render-thread time per frame (`submit` 0.60 vs
+   0.42 ms with it off; one vkQueueSubmit plus a D3D12 fence Signal/Wait per lane). Moving the
+   Vulkan submissions to a worker thread would remove it; only worth it if the user wants the last %.
+6. **Later (user put these off):** [plans/UI-TILES.md](plans/UI-TILES.md) part 2 (send only the
+   finished frame's UI tiles in FSR 4.1 mode, `bSendUITilesOnly`), then
+   [plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread). They aim at
+   the last few fps to the 71 cap with Community Shaders on; part 1 (HUD motion-vector freeze) is on
+   this branch as the `bFreezeHudMotionVectors` test.
 
 ## Latest (2026-11-08, 00:1x): bDirectGPUCopy worked in game; Alt+F4 hung the PC; exit fixed
 
-First in-game run (00:02-00:04, log `MGPUScaling.log`): CS on, ReShade AutoHDR (HDR10), FSR 4.1
-Quality, 3 frames in flight, `bSendHudlessFrame = 0` (HUD MV freeze test). Every frame crossed
+First in-game run (00:02-00:04, log `MGPUScaling.log`): CS on, AutoHDR NOT active (no `format 24`
+warning in that log; corrected 00:4x), FSR 4.1 Quality, 3 frames in flight, `bSendHudlessFrame = 0`
+(HUD MV freeze test). Every frame crossed
 directly (`709/709 frames`), check values never late, 70.9 game fps at the cap, copy on render GPU
 7.6 ms (~9.4 GB/s), Vulkan copy into the landing heaps 0.57 ms, timeline after Present: 3090 copy
 2.5-10.2, 9060 unpack 4.2-11.1, list end 12.2 ms. Earlier that evening AutoHDR had looked broken: not
@@ -43,9 +72,36 @@ detached. Every probe run had closed the 3090's view first. Fix:
   (process ends with 40 x 64 MiB P2P copies running: hook waited 263 ms, closed the view, freed the
   block, clean exit, no events). The order that hung is not exercised on purpose.
 
-**To test** (user): same settings, play a minute, quit with Alt+F4 and once via the main menu; the
-log's last line should be `direct GPU copy: the game is exiting; closed the render GPU's views of the
-display GPU's VRAM, then freed the blocks` (or `...terminating itself...`).
+**Exit fix confirmed in game** (00:30, 00:35): FO4 ends through TerminateProcess; last log line
+`direct GPU copy: the game is terminating itself; closed the render GPU's views ..., then freed the
+blocks`, no hang.
+
+**Resolved (00:5x): the lower base fps is the PC, not the mod.** After the forced power-off at
+00:04 the RAM came back at JEDEC defaults: 4 x G.Skill F4-4400C19 at **2133 MT/s, 1.20 V**
+(`Win32_PhysicalMemory`), where the notes have quad-channel DDR4-3800. ReBAR stayed on. A/B at one
+spot after that boot (logs in `D:\fgb\runs\20261108-0043..` to `-0048..`):
+
+| run | game fps | 3090 frame | 3090 idle |
+|---|---|---|---|
+| bDirectGPUCopy 0, AutoHDR on | 48.1-48.9 | 16.3-16.6 ms | 4.1 ms |
+| bDirectGPUCopy 1, AutoHDR on | 50.5 | 15.1 ms | 4.7 ms |
+| bDirectGPUCopy 1, AutoHDR off | 49.8-50.7 | 15.0-15.3 ms | 4.7 ms |
+
+So direct copy is ~3% faster than system memory at the same settings (CPU-bound; less DRAM
+traffic), AutoHDR costs nothing measurable, and all three are ~25% below the 00:02 run (62.7-70.9,
+before the reset). The 3090 idling 4-5 ms per frame says CPU/memory-bound. Re-test after the user
+restores the memory profile in the BIOS.
+
+Earlier analysis of the same symptom, kept for the record: the 3090's own frame span
+(`frame from its first command to its end`) is 15.5-17.8 ms in the AutoHDR-on direct runs (00:29 FG
+off by the bSendHudlessFrame=0 + 10-bit rule, 42-52 fps; 00:35 one post-load window, 47 fps) vs
+12-13 ms in the AutoHDR-off direct run (00:02, 62.7-70.9) and yesterday's system-RAM runs (16:1x,
+12.0-12.8 ms, 66.6-68.5; AutoHDR state not recorded). Not PCIe head-of-line blocking: p2p-probe
+`--contention` shows the 3090's system-RAM reads slowed LESS by card-to-card writes (bulk 5.7 GB/s,
+small 0.10 us) than by system-RAM writes (3.7 GB/s, 0.31 us; idle 12.2 GB/s, 0.03 us). Known real
+cost: render-thread submit 0.43-0.64 ms/frame with direct copy (vkQueueSubmit + landed/copied
+fence calls per lane) vs 0.086 ms in the old native-4K log. Needed: A/B at one spot, AutoHDR on,
+bDirectGPUCopy 0 vs 1, >= 60 s each after settling.
 
 ## Earlier (2026-11-07, 23:xx): bDirectGPUCopy built
 
