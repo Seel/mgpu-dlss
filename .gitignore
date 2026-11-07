@@ -3,3 +3,12 @@
 
 # Local build log
 build-local.log
+
+# bridge-load build output
+/fo4-fg-gpu1/tools/bridge-load/*.exe
+/fo4-fg-gpu1/tools/bridge-load/*.obj
+
+# p2p-probe build output and run logs
+/fo4-fg-gpu1/tools/p2p-probe/*.exe
+/fo4-fg-gpu1/tools/p2p-probe/*.obj
+/fo4-fg-gpu1/tools/p2p-probe/*.log
