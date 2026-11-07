@@ -9,8 +9,51 @@ in FSR 4.1 mode (`bSendUITilesOnly`), then measure; only then
 [plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread, `bDisplayThread`).
 Parts 2 and the display thread aim at the last 3-4 fps to the 71 cap with Community Shaders on
 (66.6-68.5 now with `bExtraFrameInFlight = 1`). The user asked for all of them as optional settings.
+**First, though: the in-game test of `bDirectGPUCopy` (below).** UI tiles were put off by the user.
 
-## Latest (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
+## Latest (2026-11-07, 23:xx): bDirectGPUCopy built, not yet run in game
+
+The user asked whether the 3090 could copy to the 9060 without system RAM. No API does it across
+vendors (D3D12 cross-adapter heaps are system memory only; GPUDirect is Linux/NVIDIA-only; CUDA P2P
+needs TCC or SLI; AMD's DirectGMA was FirePro-only; ROCm issue 13715 confirms no Radeon P2P on
+Windows; D3D12 GPU upload heaps need Win11 24H2, and the user is on Win10 19045). But with
+Resizable BAR on both cards, the 3090's `OpenExistingHeapFromAddress` (and Vulkan
+`VK_EXT_external_memory_host`) accept the CPU address of a 9060 VRAM block mapped by the 9060's
+Vulkan, and the 3090's copy engine then writes card to card. `tools/p2p-probe` (new, README there)
+measured everything; the user ran nothing, the probe ran here, PC fine, no WHEA events:
+- `--dma`: 64 MiB at 10.3 GB/s, every dword verified on the 9060, the block stays in VRAM.
+- `--bench`: P2P writes 10.2 GB/s (9060->3090 9.9), P2P reads 4-6 (never pull), sysmem 13.2/13.7.
+- `--interop`: the 9060's D3D12 cannot get mappable VRAM on Win10, D3D12 heaps imported into Vulkan
+  are not mappable, mappable Vulkan memory cannot be exported (OUT_OF_DEVICE_MEMORY). Route 3 works:
+  plain Vulkan block -> 9060 Vulkan copy (150 GB/s) -> D3D12 heap imported into Vulkan, synced by a
+  D3D12 fence imported as a timeline semaphore.
+- `--evict`: 19.5 GiB of D3D12 allocations on the 16 GB 9060 did not move the block.
+- `--pipeline --compute`: the mod's exact sequence 300x with the 9060's waits queued before the 3090
+  is released: 0 wrong frames, vkQueueSubmit returns at once (no render-thread stall), the check
+  value is visible to the CPU the moment the 3090's fence completes (0/300 late).
+
+Implemented as `bDirectGPUCopy` ([FrameGeneration], MCM "Direct GPU-to-GPU Copy (restart,
+experimental)", default 0, needs bAsyncUnpack): `PeerCopy.h/.cpp` (Vulkan on the 9060, loaded at
+run time, implicit layers disabled while the instance is created, async-compute queue, memory
+priority 1.0, pageable-device-local NOT enabled), `CrossAdapterBridge` (per lane: block + landing
+heap + A's placed buffer; `frameDirect` fixed per frame in PrepareFrame; SubmitLane writes into the
+block plus a check value = the lane's transfer value behind the data; SubmitUnpackLanes: Wait
+transfer -> Signal landed -> vkQueueSubmit (wait landed, copy slot, signal copied) -> Wait copied ->
+unpack from the landing heap). Cross-adapter heaps stay allocated. **Guard** (the user's wish: make
+it noticeable): CheckDirectCopy at every frame start reads finished copies' check values through the
+Vulkan mapping; missing value (one frame's grace except the slot being reused) or a failed Vulkan
+submit -> TripDirectCopy: CRITICAL log, system memory from the next frame, and DX12SwapChain turns
+frame generation off for the session. Setup failures just fall back to system memory (FG on). Build:
+0 warnings, `fg-gpu1.patch` regenerated (now also includes the HUD MV freeze test, which had not
+been regenerated) and applies to a pristine `3e237a4`. Also fixed: Shutdown waited only for
+slots 0-1 of the unpack fence (3 slots with bExtraFrameInFlight).
+
+**To test in game** (user): bDirectGPUCopy = 1, same save/spot as the CS runs; check the log lines
+in README "Direct GPU-to-GPU copy"; compare the 10 s lines (copy on render GPU ~10 GB/s, unpack
+small, timeline after Present, render thread blocked) and fps against bDirectGPUCopy = 0. Risks not
+covered by the probe: ReShade in the process (it may hook vulkan-1.dll), sleep/resume, driver resets.
+
+## Earlier (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
 
 Logs saved in the session scratchpad (`runs/MGPUScaling-2slots.log`, `-3slots.log`). CS on
 (telemetry too), same build. Clean 10 s gameplay windows:
@@ -437,3 +480,50 @@ built and measured — see "First measured run" and "Third change" below. At 4K 
 13.3 ms: 65–70 base / 123–137 presented, 50% generated (the second session attributed this to the
 3090's render time; the third session showed it was the chain).
 
+
+## Host-memory contention: measured (2026-11-07, 21:33-21:40)
+
+Question: the bridge writes its payload into system memory and reads it back, so a 4K frame at
+38 fps is ~4.8 GB/s written + ~4.8 GB/s read of DRAM the game's own main thread is using. Does
+that cost frames, independent of PCIe?
+
+Method: `tools/bridge-load/` replays exactly that traffic on the 9060 with the same burst/idle
+shape, while the game runs alone on the 3090 (monitor cable moved to the 3090, windowed borderless
+2560x1440, no FG plugin loaded - both plugin logs predate the session). PresentMon 60 s per arm,
+five arms back to back with no analysis in between, camera untouched. D is the link saturated.
+
+| arm | load | fps | presents | p50 | p99 | 1% low | cpu | gpu |
+|---|---|---|---|---|---|---|---|---|
+| A4 | none | 93.0 | 10.76 | 10.72 | 11.77 | 85.0 | 10.69 | 8.61 |
+| B2 | 5.85 GB/s (77 MB @ 38) | 91.0 | 10.99 | 10.96 | 12.13 | 82.4 | 10.92 | 8.60 |
+| C2 | 11.7 GB/s (154 MB @ 38) | 89.3 | 11.20 | 11.16 | 12.37 | 80.8 | 11.13 | 8.55 |
+| D | 13.3 GB/s (77 MB unpaced) | 88.3 | 11.32 | 11.30 | 12.39 | 80.7 | 11.26 | 8.65 |
+| A5 | none | 92.7 | 10.78 | 10.75 | 11.72 | 85.3 | 10.72 | 8.65 |
+
+- **Drift is nil:** A4 -> A5 over 6.5 min is +0.2% (10.76 -> 10.78), and the p99 returns to 11.72.
+  The effect is the load, not the scene.
+- **It is all CPU.** GPU busy is flat across every arm (8.61 -> 8.65, +0.5%); CPU busy carries the
+  whole delta (+2.0% / +4.0% / +5.2%). More DRAM traffic does not make the frame heavier, it makes
+  the main thread slower.
+- **It is linear in GB/s:** ~0.34% of wall time per GB/s of bridge traffic (0.0034 ms of CPU time
+  per MB). At the mod's 4K operating point (126.6 MB x 2 x 38 fps = 9.6 GB/s) that is **~3.2% of
+  the frame, i.e. +0.85 ms on a 26.3 ms frame** - and still ~3% at 1440p, because the payload halves
+  while the frame rate doubles.
+- **The tail moves slightly more than the median:** p99 +3.1% at B and +5.1% at C, 1% low 85 -> 81.
+- **Threshold:** nothing breaks, but C dropped 0.4% of frames in the earlier pass and D is the only
+  arm where the load itself overran its period (29/3610 cycles, 0.8%).
+
+What it means for the mod: this cost is real but it only shows up when the game is CPU-bound. At 4K
+the 3090 is usually the limit (`render GPU: idle between frames` ~0), where ~0.85 ms of extra main
+thread time is absorbed by slack. Trimming payload for *memory-bus* reasons is not worth any image
+quality: dropping the HUD-less lane (-33 MB, 2.5 GB/s) buys ~0.23 ms, half-res depth ~0.16 ms. Trim
+payload for the **10.5 ms copy on the PCIe link**, which is a different and much larger cost.
+
+Caveats: one scene, one machine (quad-channel DDR4-3800; a dual-channel DDR4-2400 box would feel
+this several times over), CPU-bound at 93 fps rather than 38, composed presentation (1440p window on
+a 4K desktop, so no independent flip), FG not loaded.
+
+Also fixed: `presentmon-capture.ps1` used to read `AAAFrameGeneration.log` unconditionally and label
+every capture with whatever the last session wrote. It now prefers `MGPUScaling.log` and reports
+"no frame generation this session" when the log predates the game process - which is what all five
+arms above are.

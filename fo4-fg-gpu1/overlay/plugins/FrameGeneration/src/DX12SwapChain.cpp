@@ -62,7 +62,7 @@ void DX12SwapChain::CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, 
 		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 
 	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-			upscaling->settings.asyncUnpack, frameSlots))
+			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy))
 		return fallBack("cross-adapter bridge initialisation failed");
 
 	secondaryGPU = true;
@@ -464,6 +464,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			useFrameGenerationThisFrame = upscaling->settings.frameGenerationMode && main->gameActive && !menuBlock && !ui->movementToDirectionalCount;
 		}
 	}
+	// bDirectGPUCopy's guard tripped: the frames cross through system memory again, and frame generation
+	// stays off for the rest of the session so the change is impossible to miss (the log says why).
+	if (crossAdapter && bridge->DirectCopyTripped())
+		useFrameGenerationThisFrame = false;
 
 	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG) {
 		auto dlssg = StreamlineFG::GetSingleton();

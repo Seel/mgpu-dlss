@@ -180,6 +180,7 @@ void Upscaling::LoadSettings()
 	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
 	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
 	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
+	settings.directGpuCopy = ini.GetBoolValue(section, "bDirectGPUCopy", false);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -206,6 +207,9 @@ void Upscaling::LoadSettings()
 			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
 		REX::INFO("[Frame Generation] bExtraFrameInFlight: {} (second-GPU mode: 3 frames in flight instead of 2, +1 frame latency)",
 			settings.extraFrameInFlight);
+		REX::INFO("[Frame Generation] bDirectGPUCopy: {} (second-GPU mode, experimental: the render GPU writes straight into "
+				  "the display GPU's VRAM instead of through system memory)",
+			settings.directGpuCopy);
 		loggedOnce = true;
 	}
 }

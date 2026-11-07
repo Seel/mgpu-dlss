@@ -300,6 +300,15 @@
 					}
 				},
 				{
+					"id": "bDirectGPUCopy:FrameGeneration",
+					"text": "Direct GPU-to-GPU Copy (restart, experimental)",
+					"type": "switcher",
+					"help": "The render GPU writes each frame straight into the second GPU's VRAM instead of into system memory for the second GPU to read back: one PCIe trip instead of two, no system RAM traffic. Needs Resizable BAR on the second GPU and Async Unpack. Uses no documented API, so a driver update could break it. A guard checks every frame; if the data ever lands in the wrong place, frames go back through system memory and frame generation turns OFF until you restart (the log says why). Requires a game restart. (Default: Off)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
 					"text": "",
 					"type": "text"
 				},

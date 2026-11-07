@@ -313,10 +313,10 @@ index 0000000..f51b7b6
 +}
 diff --git a/package/MCM/Config/MGPUScaling/config.json b/package/MCM/Config/MGPUScaling/config.json
 new file mode 100644
-index 0000000..5532bb4
+index 0000000..eb6347a
 --- /dev/null
 +++ b/package/MCM/Config/MGPUScaling/config.json
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,415 @@
 +{
 +	"modName": "MGPUScaling",
 +	"displayName": "MGPU Scaling",
@@ -619,6 +619,15 @@ index 0000000..5532bb4
 +					}
 +				},
 +				{
++					"id": "bDirectGPUCopy:FrameGeneration",
++					"text": "Direct GPU-to-GPU Copy (restart, experimental)",
++					"type": "switcher",
++					"help": "The render GPU writes each frame straight into the second GPU's VRAM instead of into system memory for the second GPU to read back: one PCIe trip instead of two, no system RAM traffic. Needs Resizable BAR on the second GPU and Async Unpack. Uses no documented API, so a driver update could break it. A guard checks every frame; if the data ever lands in the wrong place, frames go back through system memory and frame generation turns OFF until you restart (the log says why). Requires a game restart. (Default: Off)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
 +					"text": "",
 +					"type": "text"
 +				},
@@ -725,10 +734,10 @@ index 0000000..5532bb4
 +}
 diff --git a/package/MCM/Config/MGPUScaling/settings.ini b/package/MCM/Config/MGPUScaling/settings.ini
 new file mode 100644
-index 0000000..ebfde4b
+index 0000000..ec267f1
 --- /dev/null
 +++ b/package/MCM/Config/MGPUScaling/settings.ini
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,152 @@
 +; MGPU Scaling: shipped defaults. MCM (MGPU Scaling) writes your changes to
 +; Data\MCM\Settings\MGPUScaling.ini, which overrides this file; set keys there by hand too.
 +; On the first start without that file, the plugin copies your settings from the old
@@ -847,6 +856,18 @@ index 0000000..ebfde4b
 +; waits each frame. Requires restart. Default: false
 +bExtraFrameInFlight = 0
 +
++; [FG-GPU1] EXPERIMENTAL. Direct GPU-to-GPU copy: the render GPU writes each frame straight into the
++; frame-generation GPU's VRAM over PCIe, instead of into system memory for the other GPU to read back
++; out. One PCIe trip instead of two, and no system RAM traffic. Needs Resizable BAR (Smart Access
++; Memory) on the frame-generation GPU, a Vulkan driver for it, and bAsyncUnpack = 1; if anything is
++; missing the log says why and frames go through system memory as before. Uses no documented
++; peer-to-peer API (the render GPU opens the other GPU's CPU-visible VRAM as if it were RAM), so a
++; driver update could break it. A guard checks every frame that the data landed where it should; if
++; it ever did not, frames go back through system memory and frame generation is switched OFF for the
++; rest of the session, so you notice (the log line "direct GPU copy guard" says why).
++; Requires restart. Default: false
++bDirectGPUCopy = 0
++
 +[Upscaling]
 +; Upscaling reconstructs lower resolutions to the native resolution using advanced algorithms, improving image quality and performance.
 +; AMD Robust Contrast Adaptive Sharpening improves image clarity, even when upscaling is disabled or in 3D menus.
@@ -871,16 +892,17 @@ index 0000000..ebfde4b
 +bEnableDebugLogging = 0
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..0ee5ff4
+index 0000000..0d646d7
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,1907 @@
+@@ -0,0 +1,2166 @@
 +#include "CrossAdapterBridge.h"
 +
 +#include <d3dcompiler.h>
 +
 +#include <algorithm>
 +#include <cctype>
++#include <format>
 +
 +namespace
 +{
@@ -1352,7 +1374,8 @@ index 0000000..0ee5ff4
 +// Setup
 +
 +bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-+	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots)
++	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
++	bool a_directCopy)
 +{
 +	Shutdown();
 +	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
@@ -1464,7 +1487,39 @@ index 0000000..0ee5ff4
 +	QueryPerformanceFrequency(&qpcFrequency);
 +	QueryPerformanceCounter(&statLastLog);
 +
-+	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> {}",
++	// bDirectGPUCopy: the display GPU's Vulkan side, and the check values A writes behind each lane.
++	// Lanes get their blocks in AddLane; any failure there turns the direct copy off for the session.
++	if (a_directCopy) {
++		if (!asyncUnpack) {
++			REX::WARN("[FG-GPU1] bDirectGPUCopy needs bAsyncUnpack = 1; frames cross through system memory");
++		} else if (peer.Initialize(deviceB.get(), slotCount)) {
++			D3D12_HEAP_PROPERTIES uploadProps{};
++			uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
++			D3D12_RESOURCE_DESC uploadDesc{};
++			uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++			uploadDesc.Width = kCheckStride * kMaxLanes * kSlots;
++			uploadDesc.Height = 1;
++			uploadDesc.DepthOrArraySize = 1;
++			uploadDesc.MipLevels = 1;
++			uploadDesc.SampleDesc.Count = 1;
++			uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++			HRESULT hr = deviceA->CreateCommittedResource(&uploadProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
++				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(checkUploadA.put()));
++			if (SUCCEEDED(hr))
++				hr = checkUploadA->Map(0, nullptr, reinterpret_cast<void**>(&checkCpu));
++			if (SUCCEEDED(hr)) {
++				directCopy = true;
++			} else {
++				REX::ERROR("[FG-GPU1] direct GPU copy: the check-value buffer failed (hr={:#010x}); frames cross through "
++						   "system memory instead",
++					static_cast<std::uint32_t>(hr));
++				DisableDirectCopy();
++			}
++		}
++	}
++
++	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> {} -> {}",
++		directCopy ? "the display GPU's VRAM, directly (bDirectGPUCopy=1)" : "cross-adapter heap in system memory",
 +		asyncUnpack ? "display GPU copy queue, lane by lane (bAsyncUnpack=1)" :
 +					  "display GPU direct queue, after the whole transfer (bAsyncUnpack=0)");
 +	return true;
@@ -1532,7 +1587,10 @@ index 0000000..0ee5ff4
 +	}
 +	lane.footprint = footprintA;
 +	lane.bytes = totalA;
-+	lane.slotStride = AlignUp(totalA, kHeapAlignment);
++	// bDirectGPUCopy: room for the check value behind the data. Both paths use the same layout, so a
++	// frame can cross either way.
++	lane.checkOffset = AlignUp(totalA, kCheckStride);
++	lane.slotStride = AlignUp(directCopy ? lane.checkOffset + kCheckStride : totalA, kHeapAlignment);
 +
 +	const UINT64 heapSize = lane.slotStride * slotCount;
 +	HRESULT hr = CreateSharedHeapPair(heapSize, lane.heapA, lane.heapB);
@@ -1581,14 +1639,172 @@ index 0000000..0ee5ff4
 +		}
 +	}
 +
++	// bDirectGPUCopy: the lane's block in B's VRAM. A lane that cannot have one turns the direct copy
++	// off for every lane (a frame crosses one way or the other as a whole).
++	if (directCopy && !AddDirectLane(lane, heapSize))
++		DisableDirectCopy();
++
 +	bytesPerFrame += lane.bytes;
-+	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total) timing={}{}",
++	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total) timing={}{}{}",
 +		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
 +		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
-+		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)");
++		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)",
++		lane.peerLane >= 0 ? " (direct to the display GPU's VRAM)" : "");
 +
 +	lanes.push_back(std::move(lane));
 +	return static_cast<int>(lanes.size() - 1);
++}
++
++// ---------------------------------------------------------------------------------------
++// bDirectGPUCopy
++
++bool CrossAdapterBridge::AddDirectLane(Lane& a_lane, UINT64 a_heapSize)
++{
++	const auto failed = [&](const char* a_what, HRESULT a_hr) {
++		REX::ERROR("[FG-GPU1] direct GPU copy: lane '{}': {} failed (hr={:#010x}); every lane crosses through system "
++				   "memory instead",
++			a_lane.name, a_what, static_cast<std::uint32_t>(a_hr));
++		a_lane.peerStagingA = nullptr;
++		a_lane.peerHeapA = nullptr;  // before the block it was opened on goes (DisableDirectCopy)
++		a_lane.landingB = nullptr;
++		a_lane.landingHeapB = nullptr;
++		a_lane.peerMapped = nullptr;
++		a_lane.peerLane = -1;
++		return false;
++	};
++
++	void* mapped = nullptr;
++	const int peerLane = peer.AddLane(a_lane.name.c_str(), a_heapSize, a_lane.slotStride, a_lane.bytes, mapped,
++		a_lane.landingHeapB);
++	if (peerLane < 0 || !mapped || !a_lane.landingHeapB)
++		return failed("the display GPU's VRAM block (Vulkan)", E_FAIL);
++	a_lane.peerMapped = static_cast<const volatile std::uint8_t*>(mapped);
++
++	// The render GPU opens the block's CPU address as if it were system memory; its copy engine's writes
++	// then go to the display GPU's BAR.
++	winrt::com_ptr<ID3D12Device3> deviceA3;
++	HRESULT hr = deviceA->QueryInterface(IID_PPV_ARGS(deviceA3.put()));
++	if (SUCCEEDED(hr))
++		hr = deviceA3->OpenExistingHeapFromAddress(mapped, IID_PPV_ARGS(a_lane.peerHeapA.put()));
++	if (FAILED(hr))
++		return failed("OpenExistingHeapFromAddress on the render GPU", hr);
++	const D3D12_HEAP_DESC peerDesc = a_lane.peerHeapA->GetDesc();
++	if (peerDesc.SizeInBytes < a_heapSize)
++		return failed("the render GPU's view of the block (too small)", E_FAIL);
++
++	D3D12_RESOURCE_DESC bufferDesc{};
++	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++	bufferDesc.Width = a_heapSize;
++	bufferDesc.Height = 1;
++	bufferDesc.DepthOrArraySize = 1;
++	bufferDesc.MipLevels = 1;
++	bufferDesc.SampleDesc.Count = 1;
++	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++	bufferDesc.Flags = (peerDesc.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) ? D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER :
++	                                                                             D3D12_RESOURCE_FLAG_NONE;
++	hr = deviceA->CreatePlacedResource(a_lane.peerHeapA.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(a_lane.peerStagingA.put()));
++	if (FAILED(hr))
++		return failed("the render GPU's buffer on the block", hr);
++
++	bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
++	hr = deviceB->CreatePlacedResource(a_lane.landingHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(a_lane.landingB.put()));
++	if (FAILED(hr))
++		return failed("the landing buffer on the display GPU", hr);
++
++	a_lane.peerLane = peerLane;
++	return true;
++}
++
++void CrossAdapterBridge::DisableDirectCopy()
++{
++	directCopy = false;
++	// Before any frame ran, the blocks can go now (the render GPU's heaps on them first). Once frames
++	// have used them, they stay until Shutdown: copies may still be in flight.
++	if (transferValue != 0)
++		return;
++	for (auto& lane : lanes) {
++		lane.peerStagingA = nullptr;
++		lane.peerHeapA = nullptr;
++		lane.landingB = nullptr;
++		lane.landingHeapB = nullptr;
++		lane.peerMapped = nullptr;
++		lane.peerLane = -1;
++	}
++	peer.Shutdown();
++	checkCpu = nullptr;
++	checkUploadA = nullptr;
++}
++
++void CrossAdapterBridge::TripDirectCopy(const std::string& a_why)
++{
++	if (directCopyTripped)
++		return;
++	directCopyTripped = true;
++	directCopy = false;
++	REX::CRITICAL("[FG-GPU1] direct GPU copy guard: {}. Frames cross through system memory from the next frame on and "
++				  "frame generation is OFF for the rest of the session. Restart the game; set bDirectGPUCopy = 0 if this "
++				  "happens again.",
++		a_why);
++}
++
++void CrossAdapterBridge::CheckDirectCopy(UINT a_reusedSlot)
++{
++	const UINT64 finished = transferFenceA->GetCompletedValue();
++	for (auto& lane : lanes) {
++		if (!lane.peerMapped)
++			continue;
++		for (UINT slot = 0; slot < slotCount; ++slot) {
++			const UINT64 expected = lane.checkPending[slot];
++			if (!expected || expected > finished)
++				continue;  // nothing to check, or that copy is still running
++			// An uncached read through the block's CPU mapping (~1-2 us): it reaches the block wherever the
++			// display GPU's driver keeps it now, while the render GPU wrote to where it was when opened.
++			const auto* where =
++				reinterpret_cast<const volatile UINT64*>(lane.peerMapped + lane.slotStride * slot + lane.checkOffset);
++			const UINT64 seen = *where;
++			if (seen == expected) {
++				lane.checkPending[slot] = 0;
++				++statDirectChecks;
++				continue;
++			}
++			// The p2p-probe never saw a value arrive after its fence; still, one frame's grace, except for the
++			// slot about to be overwritten, whose copy PrepareFrame has just waited for.
++			if (slot != a_reusedSlot && !lane.checkLate[slot]) {
++				lane.checkLate[slot] = true;
++				++statDirectLate;
++				continue;
++			}
++			TripDirectCopy(std::format("lane '{}' slot {}: the render GPU wrote check value {} into the display GPU's "
++									   "VRAM block, but the block holds {} - it is no longer where the render GPU writes",
++				lane.name, slot, expected, seen));
++			return;
++		}
++	}
++}
++
++HRESULT CrossAdapterBridge::QueueDirectCopy(const Lane& a_lane, UINT a_slot)
++{
++	ID3D12Fence* fence = peer.Fence();
++	const UINT64 landed = ++peerValue;
++	const UINT64 copied = ++peerValue;
++	HRESULT hr = fence ? copyQueueB->Signal(fence, landed) : E_POINTER;
++	if (FAILED(hr)) {
++		Fail("direct copy: landed Signal", hr);
++		return hr;
++	}
++	// Nothing would signal "copied" if the Vulkan submission failed: this queue does it, so it carries on
++	// (the lane shows stale data this once) and the guard sends the next frames through system memory.
++	if (directCopyTripped || !peer.SubmitCopy(a_lane.peerLane, a_slot, landed, copied)) {
++		TripDirectCopy(std::format("the display GPU's Vulkan copy of lane '{}' could not be submitted", a_lane.name));
++		hr = copyQueueB->Signal(fence, copied);
++	}
++	if (SUCCEEDED(hr))
++		hr = copyQueueB->Wait(fence, copied);
++	if (FAILED(hr))
++		Fail("direct copy: copied Signal/Wait", hr);
++	return hr;
 +}
 +
 +ID3D12Resource* CrossAdapterBridge::Mirror(int a_lane, UINT a_slot) const noexcept
@@ -1620,6 +1836,12 @@ index 0000000..0ee5ff4
 +		}
 +		CollectTimings(a_slot);
 +	}
++
++	// bDirectGPUCopy: the guard looks at what the finished copies left behind, then this frame's path
++	// is fixed. A frame never switches path half-way.
++	if (directCopy)
++		CheckDirectCopy(a_slot);
++	frameDirect = directCopy;
 +
 +	const UINT64 frame = ++transferValue;
 +	HRESULT hr = allocatorsA[a_slot]->Reset();
@@ -1657,8 +1879,12 @@ index 0000000..0ee5ff4
 +	if (a_firstInPhase)
 +		timerCopyA.Mark(listA.get(), a_slot, a_markBase);
 +
++	// bDirectGPUCopy: into the display GPU's VRAM block instead of the cross-adapter heap.
++	const bool direct = frameDirect && a_lane.peerStagingA;
++	ID3D12Resource* staging = direct ? a_lane.peerStagingA.get() : a_lane.stagingA.get();
++
 +	D3D12_TEXTURE_COPY_LOCATION dst{};
-+	dst.pResource = a_lane.stagingA.get();
++	dst.pResource = staging;
 +	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 +	dst.PlacedFootprint = a_lane.footprint;
 +	dst.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
@@ -1671,6 +1897,21 @@ index 0000000..0ee5ff4
 +	// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
 +	// COPY_SOURCE implicitly and they decay back when the list completes.
 +	listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++
++	// Values are allocated in submission order rather than per lane index: the early groups
++	// signal before the Present group, and a shared fence must never go backwards.
++	const UINT64 value = nextLaneValue + 1;
++
++	// The guard's check value: this lane's transfer value, behind the data. The upload slot was last
++	// read by this slot's previous copy, which PrepareFrame waited for.
++	if (direct) {
++		const UINT64 uploadOffset = kCheckStride * (a_laneIndex * kSlots + a_slot);
++		checkCpu[uploadOffset / sizeof(UINT64)] = value;
++		listA->CopyBufferRegion(staging, a_lane.slotStride * a_slot + a_lane.checkOffset, checkUploadA.get(),
++			uploadOffset, sizeof(UINT64));
++		a_lane.checkPending[a_slot] = value;
++		a_lane.checkLate[a_slot] = false;
++	}
 +
 +	if (a_lastInPhase) {
 +		timerCopyA.Mark(listA.get(), a_slot, a_markBase + 1);
@@ -1687,9 +1928,7 @@ index 0000000..0ee5ff4
 +	ID3D12CommandList* lists[] = { listA.get() };
 +	copyQueueA->ExecuteCommandLists(1, lists);
 +
-+	// Values are allocated in submission order rather than per lane index: the early groups
-+	// signal before the Present group, and a shared fence must never go backwards.
-+	const UINT64 value = ++nextLaneValue;
++	nextLaneValue = value;
 +	hr = copyQueueA->Signal(transferFenceA.get(), value);
 +	if (FAILED(hr)) {
 +		Fail("transfer fence Signal", hr);
@@ -1820,6 +2059,8 @@ index 0000000..0ee5ff4
 +
 +	frameStarted = false;
 +	slotPresentQpc[a_slot] = submitStart;
++	if (frameDirect)
++		++statDirectFrames;
 +
 +	LARGE_INTEGER submitEnd{};
 +	QueryPerformanceCounter(&submitEnd);
@@ -1878,7 +2119,7 @@ index 0000000..0ee5ff4
 +}
 +
 +bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot,
-+	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState)
++	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState, ID3D12Resource* a_source)
 +{
 +	const D3D12_RESOURCE_DESC destDesc = a_dest->GetDesc();
 +	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
@@ -1908,7 +2149,7 @@ index 0000000..0ee5ff4
 +	dst.SubresourceIndex = 0;
 +
 +	D3D12_TEXTURE_COPY_LOCATION src{};
-+	src.pResource = a_lane.stagingB.get();
++	src.pResource = a_source;
 +	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 +	src.PlacedFootprint = a_lane.footprint;
 +	src.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
@@ -2089,9 +2330,13 @@ index 0000000..0ee5ff4
 +		if (position == 0)
 +			timerCopyB.Mark(listB.get(), a_slot, a_markBase);
 +
++		// bDirectGPUCopy: the lane arrives in its landing heap (local VRAM) instead of the cross-adapter heap.
++		const bool direct = frameDirect && lane.landingB;
++
 +		// Mirrors are COMMON between uses; the back buffer is PRESENT, which is the same state.
 +		if (dest)
-+			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON);
++			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON,
++				direct ? lane.landingB.get() : lane.stagingB.get());
 +
 +		if (position + 1 == a_count) {
 +			timerCopyB.Mark(listB.get(), a_slot, a_markBase + 1);
@@ -2111,6 +2356,11 @@ index 0000000..0ee5ff4
 +		if (FAILED(hr)) {
 +			Fail("unpack queue Wait (transfer)", hr);
 +			return hr;
++		}
++		if (direct) {
++			hr = QueueDirectCopy(lane, a_slot);
++			if (FAILED(hr))
++				return hr;
 +		}
 +		ID3D12CommandList* lists[] = { listB.get() };
 +		copyQueueB->ExecuteCommandLists(1, lists);
@@ -2242,7 +2492,8 @@ index 0000000..0ee5ff4
 +	if (!active || !a_listB || !a_destB || a_slot >= kSlots || a_lane < 0 ||
 +		static_cast<size_t>(a_lane) >= lanes.size())
 +		return;
-+	RecordLaneCopy(a_listB, lanes[static_cast<size_t>(a_lane)], a_slot, a_destB, a_destState);
++	auto& lane = lanes[static_cast<size_t>(a_lane)];
++	RecordLaneCopy(a_listB, lane, a_slot, a_destB, a_destState, lane.stagingB.get());
 +}
 +
 +HRESULT CrossAdapterBridge::SignalConsumed(ID3D12CommandQueue* a_queueB)
@@ -2629,6 +2880,11 @@ index 0000000..0ee5ff4
 +		}
 +	}
 +
++	// bDirectGPUCopy: the display GPU's Vulkan copies of this slot's last frame (skipped while still running).
++	double peerMs = 0.0;
++	if (peer.Ready() && peer.CopyTimeMs(a_slot, peerMs))
++		statPeerCopy.Add(peerMs);
++
 +	if ((validDisplay & kListBeginEnd) == kListBeginEnd) {
 +		statDisplayList.Add((display[kMarkListEnd] - display[kMarkListBegin]) * toMs);
 +		if (timerDisplay.calibrated) {
@@ -2695,7 +2951,22 @@ index 0000000..0ee5ff4
 +		statPresentBlock.Mean(), statPresentBlock.max, statLatencyWait.Mean(), statLatencyWait.max, statGatePending,
 +		statGateCalls);
 +
++	// bDirectGPUCopy: how many frames went straight into the display GPU's VRAM, and the guard's count.
++	if (directCopyTripped) {
++		REX::INFO("[FG-GPU1] direct GPU copy: OFF since its guard tripped (see the CRITICAL line); frames cross through "
++				  "system memory, frame generation is off");
++	} else if (directCopy || statDirectFrames) {
++		REX::INFO("[FG-GPU1] direct GPU copy: {}/{} frames into the display GPU's VRAM | its Vulkan copy into the landing "
++				  "heaps ({}) avg {:.2f} ms max {:.2f} ms per frame | check values found {} (late {})",
++			statDirectFrames, statFrames, peer.QueueName(), statPeerCopy.Mean(), statPeerCopy.max, statDirectChecks,
++			statDirectLate);
++	}
++
 +	statFrames = 0;
++	statPeerCopy = {};
++	statDirectFrames = 0;
++	statDirectChecks = 0;
++	statDirectLate = 0;
 +	statCopyA = {};
 +	statUnpack = {};
 +	statDisplayList = {};
@@ -2725,7 +2996,7 @@ index 0000000..0ee5ff4
 +		// A read started at a hook whose Present never came: signal it, or the wait below times out.
 +		if (unpackStarted && copyQueueB && unpackFenceB)
 +			copyQueueB->Signal(unpackFenceB.get(), unpackFrame);
-+		const UINT64 lastUnpack = (std::max)(slotUnpack[0], slotUnpack[1]);
++		const UINT64 lastUnpack = *std::max_element(slotUnpack.begin(), slotUnpack.end());
 +		if (copyQueueB && unpackFenceB && lastUnpack)
 +			WaitCpu(unpackFenceB.get(), lastUnpack);
 +		if (displayDoneFenceB && displayDoneValue)
@@ -2734,7 +3005,16 @@ index 0000000..0ee5ff4
 +	active = false;
 +	asyncUnpack = true;
 +	ResetUpsampler();
++	// The render GPU's heaps on the display GPU's VRAM blocks go first (with the lanes), then the
++	// Vulkan side that owns the blocks.
 +	lanes.clear();
++	peer.Shutdown();
++	directCopy = false;
++	directCopyTripped = false;
++	frameDirect = false;
++	peerValue = 0;
++	checkCpu = nullptr;
++	checkUploadA = nullptr;
 +	bytesPerFrame = 0;
 +	currentSlot = 0;
 +	transferValue = 0;
@@ -2784,10 +3064,10 @@ index 0000000..0ee5ff4
 +}
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
 new file mode 100644
-index 0000000..5902ce4
+index 0000000..66e607e
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,479 @@
 +#pragma once
 +
 +// CrossAdapterBridge - frame generation on a second GPU.
@@ -2823,6 +3103,17 @@ index 0000000..5902ce4
 +//   writes the slot again, so the render GPU never waits on PCIe for the
 +//   frame it is working on.
 +//
++// Direct GPU copy (bDirectGPUCopy, async unpack only; PeerCopy.h): instead of the cross-adapter
++// heap in system memory, A's copy queue writes each lane straight into a block of B's VRAM (B's
++// Vulkan device maps it through the resizable BAR, A opens the mapping with
++// OpenExistingHeapFromAddress), plus a check value behind the data. On B's copy queue, per lane:
++// Wait(transfer), Signal(landed) -> Vulkan copies the block into a D3D12 landing heap and signals
++// copied -> Wait(copied), then the usual unpack, from the landing heap. One PCIe trip, no system RAM.
++// The cross-adapter heaps stay allocated. Guard: at every frame start the CPU reads the check values
++// of the copies that finished, through the block's mapping (which follows the block wherever the
++// driver keeps it). A value missing where A wrote it means the block moved: frames go back through
++// system memory and frame generation is off for the rest of the session (DirectCopyTripped).
++//
 +// Everything runs on the game's render thread (Present and the render hooks).
 +// No method throws; failures are logged and reported through the return value.
 +
@@ -2837,6 +3128,7 @@ index 0000000..5902ce4
 +#include <vector>
 +
 +#include "FrameSlots.h"
++#include "PeerCopy.h"
 +
 +class CrossAdapterBridge
 +{
@@ -2889,9 +3181,18 @@ index 0000000..5902ce4
 +	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).
 +	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
 +	// a_slots: frames in flight (the FFX swap chain's buffer count), 2 or 3.
++	// a_directCopy: bDirectGPUCopy (needs a_asyncUnpack); falls back to system memory, logged, if it
++	// cannot be set up.
 +	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-+		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots);
++		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
++		bool a_directCopy);
 +	[[nodiscard]] UINT SlotCount() const noexcept { return slotCount; }
++
++	// bDirectGPUCopy carries the frames (set up for every lane, guard not tripped).
++	[[nodiscard]] bool IsDirectCopy() const noexcept { return directCopy; }
++	// The guard found a VRAM block of the display GPU moved (or a Vulkan submission failed): frames cross
++	// through system memory again and frame generation stays off for the rest of the session.
++	[[nodiscard]] bool DirectCopyTripped() const noexcept { return directCopyTripped; }
 +
 +	// Once B's direct queue (the FFX game queue) exists. Enables its timestamps and the
 +	// fence that tells the unpack when the previous frame's direct-queue work is done.
@@ -3018,6 +3319,18 @@ index 0000000..5902ce4
 +		winrt::com_ptr<ID3D12Resource> stagingB;
 +		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> mirrorB;
 +		bool mismatchLogged = false;
++
++		// bDirectGPUCopy: B's VRAM block as A sees it, B's landing heap, and the block's CPU mapping.
++		// Null/-1 when the lane crosses through system memory only.
++		winrt::com_ptr<ID3D12Heap> peerHeapA;
++		winrt::com_ptr<ID3D12Resource> peerStagingA;
++		winrt::com_ptr<ID3D12Heap> landingHeapB;
++		winrt::com_ptr<ID3D12Resource> landingB;
++		const volatile std::uint8_t* peerMapped = nullptr;
++		int peerLane = -1;
++		UINT64 checkOffset = 0;                    // the check value, behind the data in each slot
++		std::array<UINT64, kSlots> checkPending{};  // value A wrote into a slot and nobody checked yet
++		std::array<bool, kSlots> checkLate{};       // ...and it was missing at the first look
 +	};
 +
 +	// GPU timestamps for one queue, kSlots x marks, converted to QPC ticks through
@@ -3087,10 +3400,26 @@ index 0000000..5902ce4
 +	HRESULT WaitCpu(ID3D12Fence* a_fence, UINT64 a_value);
 +	void Fail(const char* a_where, HRESULT a_hr);
 +
-+	// Records staging(slot) -> a_dest with a_destState <-> COPY_DEST barriers.
++	// Records a_source(slot) -> a_dest with a_destState <-> COPY_DEST barriers. a_source is the lane's
++	// staging buffer on B (cross-adapter heap) or its landing heap (direct copy).
 +	// False (logged once per lane) when a_dest does not match the lane's size/pitch.
 +	bool RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot, ID3D12Resource* a_dest,
-+		D3D12_RESOURCE_STATES a_destState);
++		D3D12_RESOURCE_STATES a_destState, ID3D12Resource* a_source);
++
++	// --- bDirectGPUCopy ---------------------------------------------------------------------
++	// The lane's VRAM block and landing heap (PeerCopy) and A's view of the block. False (logged) when
++	// any of it fails; the caller then turns the direct copy off.
++	bool AddDirectLane(Lane& a_lane, UINT64 a_heapSize);
++	// Set-up failure: system memory for the rest of the session, frame generation unaffected.
++	void DisableDirectCopy();
++	// The guard: system memory from the next frame on, frame generation off for the session.
++	void TripDirectCopy(const std::string& a_why);
++	// At a frame start: reads the check values of the copies that finished. a_reusedSlot's copies are
++	// known to be done (PrepareFrame waited), so a value missing there trips the guard; elsewhere it
++	// gets a second look one frame later.
++	void CheckDirectCopy(UINT a_reusedSlot);
++	// B's copy queue, after Wait(transfer of the lane): Signal(landed), the Vulkan copy, Wait(copied).
++	HRESULT QueueDirectCopy(const Lane& a_lane, UINT a_slot);
 +
 +	// Reads the timestamps the previous use of a_slot left behind (never blocks).
 +	void CollectTimings(UINT a_slot);
@@ -3179,6 +3508,16 @@ index 0000000..5902ce4
 +	std::vector<Lane> lanes;
 +	UINT64 bytesPerFrame = 0;
 +
++	// bDirectGPUCopy
++	static constexpr UINT64 kCheckStride = 256;  // per lane and slot in the upload buffer; also the space behind the data
++	PeerCopy peer;
++	bool directCopy = false;         // lanes cross through B's VRAM blocks (all set up, guard not tripped)
++	bool directCopyTripped = false;  // the guard tripped this session
++	bool frameDirect = false;        // the path of the frame being assembled, fixed in PrepareFrame
++	UINT64 peerValue = 0;            // PeerCopy::Fence() values: landed/copied, two per lane per frame
++	winrt::com_ptr<ID3D12Resource> checkUploadA;  // A: the check values A copies behind each lane's data
++	UINT64* checkCpu = nullptr;                   // its persistent mapping
++
 +	DepthUpsampler upsampler;
 +
 +	GpuTimer timerCopyA;    // render GPU copy queue: first lane start, last lane end
@@ -3196,6 +3535,10 @@ index 0000000..5902ce4
 +	Average statUpsampleEnd;   // ms after Present at which it finished
 +	Average statPresentBlock;  // ms the render thread sat in the FFX swap chain's Present
 +	Average statLatencyWait;   // ms in the frame-latency wait after it
++	Average statPeerCopy;      // ms, bDirectGPUCopy: B's Vulkan copies of a frame into the landing heaps
++	UINT64 statDirectFrames = 0;  // frames that crossed directly
++	UINT64 statDirectChecks = 0;  // check values found where A wrote them
++	UINT64 statDirectLate = 0;    // ...missing at the first look (found one frame later)
 +	double statCpuSubmitMs = 0.0;
 +	UINT64 statMaxLag = 0;
 +	UINT64 statCpuWaits = 0;
@@ -3314,7 +3657,7 @@ index 81be80f..b4024b8 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..0047590 100644
+index e10d528..b60f68f 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
 @@ -1,9 +1,13 @@
@@ -3365,7 +3708,7 @@ index e10d528..0047590 100644
 +		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 +
 +	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-+			upscaling->settings.asyncUnpack, frameSlots))
++			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy))
 +		return fallBack("cross-adapter bridge initialisation failed");
 +
 +	secondaryGPU = true;
@@ -3516,7 +3859,7 @@ index e10d528..0047590 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +264,23 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +264,49 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -3539,10 +3882,36 @@ index e10d528..0047590 100644
 +		else if (secondaryUpscale->OwnsPresent())
 +			secondaryUpscale->SetFinalLane(finalFrameLane);
 +	}
++}
++
++ID3D12Resource* DX12SwapChain::HudlessStandInFor(UINT a_slot)
++{
++	if (a_slot >= frameSlots || !d3d12Device || !swapChainBuffers[a_slot])
++		return nullptr;
++
++	if (!hudlessStandIn[a_slot]) {
++		D3D12_RESOURCE_DESC desc = swapChainBuffers[a_slot]->GetDesc();
++		// A plain texture: only ever a copy destination and a shader-read source.
++		desc.Flags = D3D12_RESOURCE_FLAG_NONE;
++		desc.Alignment = 0;
++		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++
++		const CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
++		const HRESULT hr = d3d12Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(hudlessStandIn[a_slot].put()));
++		if (FAILED(hr)) {
++			REX::CRITICAL("[FG-GPU1] bSendHudlessFrame=0: the stand-in colour texture could not be created (hr={:#010x})",
++				static_cast<std::uint32_t>(hr));
++			return nullptr;
++		}
++		REX::INFO("[FG-GPU1] bSendHudlessFrame=0: slot {} gets a {}x{} stand-in copy of the composed frame for FFX",
++			a_slot, desc.Width, desc.Height);
++	}
++	return hudlessStandIn[a_slot].get();
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -211,6 +311,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -211,6 +337,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  {
  	auto upscalingForUI = Upscaling::GetSingleton();
  
@@ -3553,7 +3922,7 @@ index e10d528..0047590 100644
  	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
  	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
  	// so presenting HUDLess prevents UI from being warped. UIColorAndAlpha tells DLSS-G
-@@ -239,17 +343,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +369,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -3628,7 +3997,18 @@ index e10d528..0047590 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -358,9 +514,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -282,6 +464,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 			useFrameGenerationThisFrame = upscaling->settings.frameGenerationMode && main->gameActive && !menuBlock && !ui->movementToDirectionalCount;
+ 		}
+ 	}
++	// bDirectGPUCopy's guard tripped: the frames cross through system memory again, and frame generation
++	// stays off for the rest of the session so the change is impossible to miss (the log says why).
++	if (crossAdapter && bridge->DirectCopyTripped())
++		useFrameGenerationThisFrame = false;
+ 
+ 	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG) {
+ 		auto dlssg = StreamlineFG::GetSingleton();
+@@ -358,9 +544,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			xessFrameId++;
  		}
  	} else {
@@ -3657,7 +4037,7 @@ index e10d528..0047590 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +544,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +574,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -3680,7 +4060,7 @@ index e10d528..0047590 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +627,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +657,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -3699,7 +4079,7 @@ index e10d528..0047590 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +647,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +677,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -3751,7 +4131,7 @@ index e10d528..0047590 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +700,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +730,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -3790,7 +4170,7 @@ index e10d528..0047590 100644
  	// Clear resources
  	upscaling->Reset();
  
-@@ -472,6 +743,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -472,6 +773,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (SyncInterval == 0 && !upscaling->highFPSPhysicsFixLoaded)
  		upscaling->FrameLimiter(useFrameGenerationThisFrame);
  
@@ -3800,7 +4180,7 @@ index e10d528..0047590 100644
  	return S_OK;
  }
  
-@@ -485,6 +759,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
+@@ -485,6 +789,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
  	return swapChain->GetDevice(uuid, ppDevice);
  }
  
@@ -3925,7 +4305,7 @@ index e10d528..0047590 100644
  WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)
  {
  	// Create D3D11 shared texture directly instead of wrapping D3D12 resource
-@@ -614,7 +1006,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
+@@ -614,7 +1036,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
  {
@@ -3941,7 +4321,7 @@ index e10d528..0047590 100644
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT , UINT , UINT , DXGI_FORMAT , UINT )
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.h b/plugins/FrameGeneration/src/DX12SwapChain.h
-index 692f459..262f1cb 100644
+index 692f459..722fdd4 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.h
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.h
 @@ -9,7 +9,11 @@
@@ -4033,12 +4413,18 @@ index 692f459..262f1cb 100644
  
  	winrt::com_ptr<ID3D11Device5> d3d11Device;
  	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;
-@@ -86,16 +139,36 @@ public:
+@@ -86,16 +139,42 @@ public:
  	winrt::com_ptr<ID3D11Fence> d3d11Fence;
  	winrt::com_ptr<ID3D12Fence> d3d12Fence;
  
 -	winrt::com_ptr<ID3D12Resource> swapChainBuffers[2];
 +	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kMaxFrameSlots];
++
++	// Test branch: with bSendHudlessFrame = 0 in second-GPU mode, FFX still gets a colour resource
++	// to interpolate: a copy of the composited back buffer (so the UI difference is zero and the
++	// HUD ends up inside the interpolation, as it is on one GPU). Created on first use.
++	winrt::com_ptr<ID3D12Resource> hudlessStandIn[kMaxFrameSlots];
++	ID3D12Resource* HudlessStandInFor(UINT a_slot);
  
  	UINT frameIndex = 0;
  	UINT64 fenceValue = 0;
@@ -4071,7 +4457,7 @@ index 692f459..262f1cb 100644
  	void CreateD3D12CommandQueues();
  	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC swapChainDesc);
  	void CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc);
-@@ -109,6 +182,9 @@ public:
+@@ -109,6 +188,9 @@ public:
  	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
  
  	HRESULT GetBuffer(void** ppSurface);
@@ -4082,7 +4468,7 @@ index 692f459..262f1cb 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..a1078a4 100644
+index 9fa46df..e4f6d51 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
 @@ -3,34 +3,537 @@
@@ -4431,7 +4817,7 @@ index 9fa46df..a1078a4 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation swap chain failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
- 
++
 +	std::string swapChainProvider = "3.1.4";
 +	if (sdk24) {
 +		swapChainProvider = ProviderName(swapChainContext);
@@ -4464,7 +4850,7 @@ index 9fa46df..a1078a4 100644
 +					   "frames may be wrong. Use iFSRRuntime = 1 with HDR add-ons",
 +				RuntimeName(), static_cast<int>(displayFormat));
 +	}
-+
+ 
 +	// ---- frame generation
  	ffx::CreateContextDescFrameGeneration createFg{};
 -	createFg.displaySize = { dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height };
@@ -4608,16 +4994,16 @@ index 9fa46df..a1078a4 100644
 +	LogModule(kUpscalerDll);
 +	return true;
 +}
- 
--	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
--		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
++
 +ffx::ReturnCode FidelityFX::DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch)
 +{
 +	if (!upscaleContext)
 +		return ffx::ReturnCode::Error;
 +	return ffxm::Dispatch(upscaleContext, a_dispatch);
 +}
-+
+ 
+-	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
+-		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
 +void FidelityFX::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC1* a_desc, HWND a_window,
 +	ID3D12CommandQueue* a_queue, IDXGISwapChain4** a_swapChain)
 +{
@@ -4635,7 +5021,7 @@ index 9fa46df..a1078a4 100644
  }
  
  [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
-@@ -45,13 +548,114 @@ void FidelityFX::SetupFrameGeneration()
+@@ -45,13 +548,169 @@ void FidelityFX::SetupFrameGeneration()
  	return singleton.get();
  }
  
@@ -4749,11 +5135,66 @@ index 9fa46df..a1078a4 100644
 -	auto HUDLessColor = upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
 +
 +	// FG-GPU1 upscaling: the UI-free frame is the FSR 4.1 output, not the render-resolution lane.
-+	auto HUDLessColor = a_override ? a_override->hudless : upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
++	ID3D12Resource* HUDLessColor = a_override ? a_override->hudless :
++											  upscaling->HUDLessBufferShared12[dx12SwapChain->frameIndex].get();
++
++	// Test branch (test/mv-freeze-hud-bars): bSendHudlessFrame = 0. FFX still needs a colour
++	// resource to interpolate. Handing it none left the frame generation context without its
++	// scene — the screen went black and only the UI composite survived. So give it a copy of the
++	// composited back buffer instead: the UI difference is then zero, no UI is extracted, and the
++	// HUD is interpolated together with the scene, which is what the switch means on one GPU.
++	if (a_useFrameGeneration && !upscaling->settings.sendHudlessFrame) {
++		// FFX was told the UI-free input is RGBA8 (CreateContextDescFrameGenerationHudless, when the
++		// back buffer is another format) and a plain copy can only land in a matching format, so the
++		// stand-in works while the back buffer really is RGBA8. Under an HDR add-on it does not:
++		// show the composed frame without generation rather than a black screen.
++		if (dx12SwapChain->displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM) {
++			static bool warned = false;
++			if (!warned) {
++				warned = true;
++				REX::WARN("[FSR] bSendHudlessFrame = 0 (test branch) needs an RGBA8 back buffer, this one is format {}; "
++						  "frame generation stays off while the switch is 0 (disable ReShade's AutoHDR to run the test)",
++					static_cast<int>(dx12SwapChain->displayFormat));
++			}
++			a_useFrameGeneration = false;
++		} else if (ID3D12Resource* standIn = dx12SwapChain->HudlessStandInFor(dx12SwapChain->frameIndex)) {
++			ID3D12Resource* composed = dx12SwapChain->swapChainBuffers[dx12SwapChain->frameIndex].get();
++			D3D12_RESOURCE_BARRIER toCopy[2]{};
++			for (auto& barrier : toCopy) {
++				barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++				barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++				barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++			}
++			toCopy[0].Transition.pResource = composed;
++			toCopy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++			toCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++			toCopy[1].Transition.pResource = standIn;
++			toCopy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
++			toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++			commandList->ResourceBarrier(2, toCopy);
++			commandList->CopyResource(standIn, composed);
++
++			D3D12_RESOURCE_BARRIER toPresent[2]{};
++			for (auto& barrier : toPresent) {
++				barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++				barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++				barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++			}
++			toPresent[0].Transition.pResource = composed;
++			toPresent[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++			toPresent[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++			toPresent[1].Transition.pResource = standIn;
++			toPresent[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++			toPresent[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
++			commandList->ResourceBarrier(2, toPresent);
++
++			HUDLessColor = standIn;
++		}
++	}
  	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
  	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
  
-@@ -60,9 +664,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -60,12 +719,10 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	if (a_useFrameGeneration) {
  		configParameters.frameGenerationEnabled = true;
  
@@ -4763,8 +5204,12 @@ index 9fa46df..a1078a4 100644
 +		configParameters.frameGenerationCallback = FrameGenerationCallback;
  		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
  
- 		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
-@@ -93,7 +695,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+-		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
++		configParameters.HUDLessColor = HUDLessColor ? ffxApiGetResourceDX12(HUDLessColor) : FfxApiResource({});
+ 
+ 	}
+ 	else {
+@@ -93,7 +750,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
  	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
  
@@ -4773,7 +5218,7 @@ index 9fa46df..a1078a4 100644
  		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
  	}
  
-@@ -113,49 +715,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -113,49 +770,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	QueryPerformanceCounter(&currentFrameTime);
  
  	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
@@ -5079,6 +5524,761 @@ index 0000000..9d40662
 +// until frame N-1 went through the whole chain (render GPU, PCIe copy, display GPU, frame
 +// generation and pacing); with 3 it is frame N-2, one frame time later. Costs one frame of latency.
 +inline constexpr unsigned int kMaxFrameSlots = 3;
+diff --git a/plugins/FrameGeneration/src/PeerCopy.cpp b/plugins/FrameGeneration/src/PeerCopy.cpp
+new file mode 100644
+index 0000000..ea83fac
+--- /dev/null
++++ b/plugins/FrameGeneration/src/PeerCopy.cpp
+@@ -0,0 +1,671 @@
++#include "PeerCopy.h"
++
++#define VK_NO_PROTOTYPES
++#define VK_USE_PLATFORM_WIN32_KHR
++#include <vulkan/vulkan_core.h>
++#include <vulkan/vulkan_win32.h>
++
++#include <array>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "FrameSlots.h"
++
++namespace
++{
++	constexpr UINT kMaxPeerLanes = 8;  // CrossAdapterBridge::kMaxLanes
++	constexpr UINT64 kHeapAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
++	// Without Resizable BAR (Smart Access Memory) only 256 MB of VRAM is CPU-visible, in a heap of its own.
++	constexpr VkDeviceSize kMinBarHeap = 2ull << 30;
++
++	const char* VkName(VkResult a_result)
++	{
++		switch (a_result) {
++		case VK_SUCCESS:
++			return "VK_SUCCESS";
++		case VK_NOT_READY:
++			return "VK_NOT_READY";
++		case VK_TIMEOUT:
++			return "VK_TIMEOUT";
++		case VK_ERROR_OUT_OF_HOST_MEMORY:
++			return "VK_ERROR_OUT_OF_HOST_MEMORY";
++		case VK_ERROR_OUT_OF_DEVICE_MEMORY:
++			return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
++		case VK_ERROR_INITIALIZATION_FAILED:
++			return "VK_ERROR_INITIALIZATION_FAILED";
++		case VK_ERROR_DEVICE_LOST:
++			return "VK_ERROR_DEVICE_LOST";
++		case VK_ERROR_MEMORY_MAP_FAILED:
++			return "VK_ERROR_MEMORY_MAP_FAILED";
++		case VK_ERROR_EXTENSION_NOT_PRESENT:
++			return "VK_ERROR_EXTENSION_NOT_PRESENT";
++		case VK_ERROR_FEATURE_NOT_PRESENT:
++			return "VK_ERROR_FEATURE_NOT_PRESENT";
++		case VK_ERROR_INCOMPATIBLE_DRIVER:
++			return "VK_ERROR_INCOMPATIBLE_DRIVER";
++		case VK_ERROR_INVALID_EXTERNAL_HANDLE:
++			return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
++		default:
++			return "VkResult (other)";
++		}
++	}
++
++	bool Failed(const char* a_what, VkResult a_result)
++	{
++		REX::ERROR("[FG-GPU1] direct GPU copy: {} ({}); frames cross through system memory instead", a_what,
++			VkName(a_result));
++		return false;
++	}
++
++	bool Failed(const char* a_what, HRESULT a_hr)
++	{
++		REX::ERROR("[FG-GPU1] direct GPU copy: {} (hr={:#010x}); frames cross through system memory instead", a_what,
++			static_cast<std::uint32_t>(a_hr));
++		return false;
++	}
++}
++
++#define PEER_VK_INSTANCE_FUNCTIONS(X)        \
++	X(vkDestroyInstance)                     \
++	X(vkEnumeratePhysicalDevices)            \
++	X(vkGetPhysicalDeviceProperties2)        \
++	X(vkGetPhysicalDeviceMemoryProperties)   \
++	X(vkGetPhysicalDeviceQueueFamilyProperties) \
++	X(vkEnumerateDeviceExtensionProperties)  \
++	X(vkCreateDevice)                        \
++	X(vkGetDeviceProcAddr)
++
++#define PEER_VK_DEVICE_FUNCTIONS(X)        \
++	X(vkGetDeviceQueue)                    \
++	X(vkDestroyDevice)                     \
++	X(vkDeviceWaitIdle)                    \
++	X(vkAllocateMemory)                    \
++	X(vkFreeMemory)                        \
++	X(vkMapMemory)                         \
++	X(vkUnmapMemory)                       \
++	X(vkCreateBuffer)                      \
++	X(vkDestroyBuffer)                     \
++	X(vkBindBufferMemory)                  \
++	X(vkCreateCommandPool)                 \
++	X(vkDestroyCommandPool)                \
++	X(vkAllocateCommandBuffers)            \
++	X(vkBeginCommandBuffer)                \
++	X(vkEndCommandBuffer)                  \
++	X(vkCmdCopyBuffer)                     \
++	X(vkCmdWriteTimestamp)                 \
++	X(vkCmdResetQueryPool)                 \
++	X(vkCreateQueryPool)                   \
++	X(vkDestroyQueryPool)                  \
++	X(vkGetQueryPoolResults)               \
++	X(vkQueueSubmit)                       \
++	X(vkCreateSemaphore)                   \
++	X(vkDestroySemaphore)                  \
++	X(vkGetMemoryWin32HandlePropertiesKHR) \
++	X(vkImportSemaphoreWin32HandleKHR)
++
++struct PeerCopy::State
++{
++#define PEER_DECLARE(name) PFN_##name name = nullptr;
++	PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
++	PFN_vkCreateInstance vkCreateInstance = nullptr;
++	PFN_vkEnumerateInstanceVersion vkEnumerateInstanceVersion = nullptr;
++	PEER_VK_INSTANCE_FUNCTIONS(PEER_DECLARE)
++	PEER_VK_DEVICE_FUNCTIONS(PEER_DECLARE)
++#undef PEER_DECLARE
++
++	struct Lane
++	{
++		std::string name;
++		VkDeviceMemory block = VK_NULL_HANDLE;    // CPU-mapped VRAM the render GPU writes into
++		VkBuffer blockBuffer = VK_NULL_HANDLE;
++		VkDeviceMemory landing = VK_NULL_HANDLE;  // the D3D12 landing heap, imported
++		VkBuffer landingBuffer = VK_NULL_HANDLE;
++		std::array<VkCommandBuffer, kMaxFrameSlots> copies{};
++		std::array<bool, kMaxFrameSlots> stamped{};  // timestamps written since they were last read
++	};
++
++	HMODULE loader = nullptr;
++	VkInstance instance = VK_NULL_HANDLE;
++	VkPhysicalDevice physical = VK_NULL_HANDLE;
++	VkPhysicalDeviceMemoryProperties memory{};
++	VkDevice device = VK_NULL_HANDLE;
++	VkQueue queue = VK_NULL_HANDLE;
++	uint32_t family = 0;
++	bool computeQueue = false;
++	bool memoryPriority = false;
++	double nsPerTick = 0.0;  // 0: no timestamps
++	uint64_t timestampMask = ~0ull;
++	VkCommandPool pool = VK_NULL_HANDLE;
++	VkQueryPool queries = VK_NULL_HANDLE;  // two per lane and slot
++	winrt::com_ptr<ID3D12Device> deviceB;
++	winrt::com_ptr<ID3D12Fence> fence;       // on the display GPU's D3D12 device...
++	VkSemaphore semaphore = VK_NULL_HANDLE;  // ...and the same fence in Vulkan
++	HANDLE event = nullptr;
++	UINT64 lastCopied = 0;  // the highest value Vulkan was asked to signal
++	UINT slots = 2;
++	bool submitFailed = false;
++	std::vector<Lane> lanes;
++
++	~State() { Destroy(); }
++
++	// Every function the teardown calls. A driver that failed half-way through loading them leaks instead.
++	[[nodiscard]] bool CanDestroy() const noexcept
++	{
++		return device && vkDeviceWaitIdle && vkDestroyDevice && vkDestroyBuffer && vkUnmapMemory && vkFreeMemory &&
++		       vkDestroySemaphore && vkDestroyQueryPool && vkDestroyCommandPool;
++	}
++
++	void DestroyLane(Lane& a_lane) noexcept
++	{
++		if (!CanDestroy())
++			return;
++		if (a_lane.blockBuffer)
++			vkDestroyBuffer(device, a_lane.blockBuffer, nullptr);
++		if (a_lane.landingBuffer)
++			vkDestroyBuffer(device, a_lane.landingBuffer, nullptr);
++		if (a_lane.block) {
++			vkUnmapMemory(device, a_lane.block);
++			vkFreeMemory(device, a_lane.block, nullptr);
++		}
++		if (a_lane.landing)
++			vkFreeMemory(device, a_lane.landing, nullptr);
++		a_lane = {};  // command buffers go with the pool
++	}
++
++	void Destroy() noexcept
++	{
++		if (CanDestroy()) {
++			// The Vulkan queue may wait for a "landed" that the display GPU's copy queue never signals (a
++			// transfer that never finished). Give it two seconds, then release those waits from the CPU so
++			// the device can go idle.
++			if (fence && lastCopied && fence->GetCompletedValue() < lastCopied) {
++				if (event && SUCCEEDED(fence->SetEventOnCompletion(lastCopied, event)))
++					WaitForSingleObject(event, 2000);
++				if (fence->GetCompletedValue() < lastCopied)
++					fence->Signal(lastCopied);
++			}
++			vkDeviceWaitIdle(device);
++			for (auto& lane : lanes)
++				DestroyLane(lane);
++			lanes.clear();
++			if (semaphore)
++				vkDestroySemaphore(device, semaphore, nullptr);
++			if (queries)
++				vkDestroyQueryPool(device, queries, nullptr);
++			if (pool)
++				vkDestroyCommandPool(device, pool, nullptr);
++			vkDestroyDevice(device, nullptr);
++		}
++		device = VK_NULL_HANDLE;
++		lanes.clear();
++		semaphore = VK_NULL_HANDLE;
++		queries = VK_NULL_HANDLE;
++		pool = VK_NULL_HANDLE;
++		fence = nullptr;
++		if (instance && vkDestroyInstance) {
++			vkDestroyInstance(instance, nullptr);
++		}
++		instance = VK_NULL_HANDLE;
++		if (event) {
++			CloseHandle(event);
++			event = nullptr;
++		}
++		deviceB = nullptr;
++		// vulkan-1.dll stays loaded: unloading the loader and the driver mid-session gains nothing.
++	}
++};
++
++PeerCopy::PeerCopy() = default;
++PeerCopy::~PeerCopy() = default;
++
++bool PeerCopy::Initialize(ID3D12Device* a_deviceB, UINT a_slots)
++{
++	Shutdown();
++	if (!a_deviceB)
++		return false;
++
++	auto s = std::make_unique<State>();
++	s->deviceB.copy_from(a_deviceB);
++	s->slots = (std::min)(a_slots, kMaxFrameSlots);
++
++	s->loader = LoadLibraryW(L"vulkan-1.dll");
++	if (!s->loader)
++		return Failed("vulkan-1.dll not found", VK_ERROR_INITIALIZATION_FAILED);
++	s->vkGetInstanceProcAddr =
++		reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(s->loader, "vkGetInstanceProcAddr"));
++	if (!s->vkGetInstanceProcAddr)
++		return Failed("vulkan-1.dll has no vkGetInstanceProcAddr", VK_ERROR_INITIALIZATION_FAILED);
++	s->vkCreateInstance =
++		reinterpret_cast<PFN_vkCreateInstance>(s->vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
++	s->vkEnumerateInstanceVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
++		s->vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
++	uint32_t loaderVersion = VK_API_VERSION_1_0;
++	if (s->vkEnumerateInstanceVersion)
++		s->vkEnumerateInstanceVersion(&loaderVersion);
++	if (!s->vkCreateInstance || loaderVersion < VK_API_VERSION_1_2)
++		return Failed("the Vulkan loader is older than 1.2", VK_ERROR_INCOMPATIBLE_DRIVER);
++
++	// Implicit layers (overlays, capture tools, ReShade's Vulkan layer) have no business in this device.
++	// The loader reads this while the instance is created; the previous value is put back after.
++	std::array<wchar_t, 512> previous{};
++	const DWORD previousLength = GetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", previous.data(),
++		static_cast<DWORD>(previous.size()));
++	const bool hadPrevious = previousLength > 0 && previousLength < previous.size();
++	SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
++	VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
++	app.pApplicationName = "MGPU Scaling direct GPU copy";
++	app.apiVersion = VK_API_VERSION_1_2;
++	VkInstanceCreateInfo instanceInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
++	instanceInfo.pApplicationInfo = &app;
++	VkResult result = s->vkCreateInstance(&instanceInfo, nullptr, &s->instance);
++	SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", hadPrevious ? previous.data() : nullptr);
++	if (result != VK_SUCCESS)
++		return Failed("vkCreateInstance", result);
++
++#define PEER_LOAD_INSTANCE(name) \
++	s->name = reinterpret_cast<PFN_##name>(s->vkGetInstanceProcAddr(s->instance, #name));
++	PEER_VK_INSTANCE_FUNCTIONS(PEER_LOAD_INSTANCE)
++#undef PEER_LOAD_INSTANCE
++	if (!s->vkCreateDevice || !s->vkGetDeviceProcAddr || !s->vkGetPhysicalDeviceProperties2)
++		return Failed("Vulkan instance functions missing", VK_ERROR_INITIALIZATION_FAILED);
++
++	// The display GPU, by the LUID of its D3D12 device.
++	const LUID luid = a_deviceB->GetAdapterLuid();
++	VkPhysicalDeviceProperties properties{};
++	{
++		uint32_t count = 0;
++		s->vkEnumeratePhysicalDevices(s->instance, &count, nullptr);
++		std::vector<VkPhysicalDevice> devices(count);
++		s->vkEnumeratePhysicalDevices(s->instance, &count, devices.data());
++		for (VkPhysicalDevice candidate : devices) {
++			VkPhysicalDeviceIDProperties id{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++			VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
++			properties2.pNext = &id;
++			s->vkGetPhysicalDeviceProperties2(candidate, &properties2);
++			if (id.deviceLUIDValid && std::memcmp(id.deviceLUID, &luid, sizeof(luid)) == 0) {
++				s->physical = candidate;
++				properties = properties2.properties;
++				break;
++			}
++		}
++	}
++	if (!s->physical)
++		return Failed("no Vulkan device on the display GPU's adapter", VK_ERROR_INITIALIZATION_FAILED);
++	if (properties.apiVersion < VK_API_VERSION_1_2)
++		return Failed("the display GPU's Vulkan driver is older than 1.2", VK_ERROR_INCOMPATIBLE_DRIVER);
++
++	bool memoryWin32 = false;
++	bool semaphoreWin32 = false;
++	{
++		uint32_t count = 0;
++		s->vkEnumerateDeviceExtensionProperties(s->physical, nullptr, &count, nullptr);
++		std::vector<VkExtensionProperties> extensions(count);
++		s->vkEnumerateDeviceExtensionProperties(s->physical, nullptr, &count, extensions.data());
++		for (const auto& extension : extensions) {
++			memoryWin32 |= std::strcmp(extension.extensionName, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) == 0;
++			semaphoreWin32 |= std::strcmp(extension.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME) == 0;
++			s->memoryPriority |= std::strcmp(extension.extensionName, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0;
++		}
++	}
++	if (!memoryWin32 || !semaphoreWin32)
++		return Failed("the display GPU's Vulkan driver cannot share memory and fences with D3D12",
++			VK_ERROR_EXTENSION_NOT_PRESENT);
++
++	// An async-compute queue if there is one: it copies with shaders at ~150 GB/s and does not take turns
++	// with frame generation's work on the graphics queue. Otherwise the graphics queue.
++	{
++		uint32_t count = 0;
++		s->vkGetPhysicalDeviceQueueFamilyProperties(s->physical, &count, nullptr);
++		std::vector<VkQueueFamilyProperties> families(count);
++		s->vkGetPhysicalDeviceQueueFamilyProperties(s->physical, &count, families.data());
++		uint32_t graphics = UINT32_MAX;
++		uint32_t compute = UINT32_MAX;
++		for (uint32_t index = 0; index < count; ++index) {
++			const VkQueueFlags flags = families[index].queueFlags;
++			if ((flags & VK_QUEUE_GRAPHICS_BIT) && graphics == UINT32_MAX)
++				graphics = index;
++			if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT) && compute == UINT32_MAX)
++				compute = index;
++		}
++		if (compute == UINT32_MAX && graphics == UINT32_MAX)
++			return Failed("no compute or graphics queue on the display GPU", VK_ERROR_FEATURE_NOT_PRESENT);
++		s->computeQueue = compute != UINT32_MAX;
++		s->family = s->computeQueue ? compute : graphics;
++		const uint32_t validBits = families[s->family].timestampValidBits;
++		if (validBits && properties.limits.timestampPeriod > 0.0f) {
++			s->nsPerTick = static_cast<double>(properties.limits.timestampPeriod);
++			s->timestampMask = validBits >= 64 ? ~0ull : ((1ull << validBits) - 1);
++		}
++	}
++
++	{
++		const float priority = 1.0f;
++		VkDeviceQueueCreateInfo queueInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
++		queueInfo.queueFamilyIndex = s->family;
++		queueInfo.queueCount = 1;
++		queueInfo.pQueuePriorities = &priority;
++		std::vector<const char*> extensions{ VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
++			VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME };
++		// The blocks get the highest residency priority. VK_EXT_pageable_device_local_memory is NOT
++		// enabled: it would allow the driver to page device-local memory out, the opposite of what we need.
++		VkPhysicalDeviceMemoryPriorityFeaturesEXT priorityFeatures{
++			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT
++		};
++		priorityFeatures.memoryPriority = VK_TRUE;
++		VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
++		features12.timelineSemaphore = VK_TRUE;
++		if (s->memoryPriority) {
++			extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
++			features12.pNext = &priorityFeatures;
++		}
++		VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
++		deviceInfo.pNext = &features12;
++		deviceInfo.queueCreateInfoCount = 1;
++		deviceInfo.pQueueCreateInfos = &queueInfo;
++		deviceInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
++		deviceInfo.ppEnabledExtensionNames = extensions.data();
++		result = s->vkCreateDevice(s->physical, &deviceInfo, nullptr, &s->device);
++		if (result != VK_SUCCESS)
++			return Failed("vkCreateDevice", result);
++	}
++
++#define PEER_LOAD_DEVICE(name) s->name = reinterpret_cast<PFN_##name>(s->vkGetDeviceProcAddr(s->device, #name));
++	PEER_VK_DEVICE_FUNCTIONS(PEER_LOAD_DEVICE)
++#undef PEER_LOAD_DEVICE
++#define PEER_CHECK_DEVICE(name) || !s->name
++	if (false PEER_VK_DEVICE_FUNCTIONS(PEER_CHECK_DEVICE))
++		return Failed("Vulkan device functions missing", VK_ERROR_INITIALIZATION_FAILED);
++#undef PEER_CHECK_DEVICE
++
++	s->vkGetDeviceQueue(s->device, s->family, 0, &s->queue);
++	s->vkGetPhysicalDeviceMemoryProperties(s->physical, &s->memory);
++
++	VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++	poolInfo.queueFamilyIndex = s->family;
++	result = s->vkCreateCommandPool(s->device, &poolInfo, nullptr, &s->pool);
++	if (result != VK_SUCCESS)
++		return Failed("vkCreateCommandPool", result);
++
++	if (s->nsPerTick > 0.0) {
++		VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
++		queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
++		queryInfo.queryCount = kMaxPeerLanes * kMaxFrameSlots * 2;
++		if (s->vkCreateQueryPool(s->device, &queryInfo, nullptr, &s->queries) != VK_SUCCESS) {
++			s->queries = VK_NULL_HANDLE;
++			s->nsPerTick = 0.0;
++		}
++	}
++
++	// The fence both APIs use: created on the display GPU's D3D12 device, imported as a timeline semaphore.
++	{
++		HRESULT hr = a_deviceB->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(s->fence.put()));
++		HANDLE handle = nullptr;
++		if (SUCCEEDED(hr))
++			hr = a_deviceB->CreateSharedHandle(s->fence.get(), nullptr, GENERIC_ALL, nullptr, &handle);
++		if (FAILED(hr))
++			return Failed("shared fence on the display GPU", hr);
++		VkSemaphoreTypeCreateInfo typeInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
++		typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++		VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++		semaphoreInfo.pNext = &typeInfo;
++		result = s->vkCreateSemaphore(s->device, &semaphoreInfo, nullptr, &s->semaphore);
++		if (result == VK_SUCCESS) {
++			VkImportSemaphoreWin32HandleInfoKHR import{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
++			import.semaphore = s->semaphore;
++			import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
++			import.handle = handle;
++			result = s->vkImportSemaphoreWin32HandleKHR(s->device, &import);
++		}
++		CloseHandle(handle);
++		if (result != VK_SUCCESS)
++			return Failed("importing the display GPU's D3D12 fence into Vulkan", result);
++	}
++	s->event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++
++	REX::INFO("[FG-GPU1] direct GPU copy: Vulkan {}.{}.{} on \"{}\", {} (family {}), memory priority {}, timestamps {}",
++		VK_API_VERSION_MAJOR(properties.apiVersion), VK_API_VERSION_MINOR(properties.apiVersion),
++		VK_API_VERSION_PATCH(properties.apiVersion), static_cast<const char*>(properties.deviceName),
++		s->computeQueue ? "async compute queue" : "graphics queue", s->family, s->memoryPriority ? "on" : "unavailable",
++		s->nsPerTick > 0.0 ? "on" : "off");
++	state = std::move(s);
++	return true;
++}
++
++int PeerCopy::AddLane(const char* a_name, UINT64 a_size, UINT64 a_slotStride, UINT64 a_bytes, void*& a_mapped,
++	winrt::com_ptr<ID3D12Heap>& a_landing)
++{
++	a_mapped = nullptr;
++	a_landing = nullptr;
++	if (!state || state->lanes.size() >= kMaxPeerLanes || !a_size || a_bytes > a_slotStride ||
++		a_slotStride * state->slots > a_size)
++		return -1;
++	auto& s = *state;
++	State::Lane lane;
++	lane.name = a_name;
++	const auto failed = [&](const char* a_what, auto a_code) {
++		Failed(a_what, a_code);
++		s.DestroyLane(lane);
++		a_mapped = nullptr;
++		return -1;
++	};
++
++	// The block: VRAM the CPU can map, which with Resizable BAR is the whole of VRAM.
++	uint32_t blockType = UINT32_MAX;
++	constexpr VkMemoryPropertyFlags kBlockFlags =
++		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++	for (uint32_t index = 0; index < s.memory.memoryTypeCount; ++index) {
++		const VkMemoryType& type = s.memory.memoryTypes[index];
++		if ((type.propertyFlags & kBlockFlags) == kBlockFlags &&
++			!(type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD)) {
++			blockType = index;
++			break;
++		}
++	}
++	if (blockType == UINT32_MAX)
++		return failed("the display GPU offers no CPU-visible VRAM", VK_ERROR_FEATURE_NOT_PRESENT);
++	const VkMemoryHeap& blockHeap = s.memory.memoryHeaps[s.memory.memoryTypes[blockType].heapIndex];
++	if (blockHeap.size < kMinBarHeap) {
++		REX::ERROR("[FG-GPU1] direct GPU copy: only {} MB of the display GPU's VRAM is CPU-visible; turn on Resizable BAR "
++				   "(Smart Access Memory) in the BIOS",
++			blockHeap.size >> 20);
++		return failed("Resizable BAR is off on the display GPU", VK_ERROR_FEATURE_NOT_PRESENT);
++	}
++
++	VkMemoryPriorityAllocateInfoEXT priority{ VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT };
++	priority.priority = 1.0f;
++	VkMemoryAllocateInfo blockInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++	blockInfo.pNext = s.memoryPriority ? &priority : nullptr;
++	blockInfo.allocationSize = a_size;
++	blockInfo.memoryTypeIndex = blockType;
++	VkResult result = s.vkAllocateMemory(s.device, &blockInfo, nullptr, &lane.block);
++	if (result != VK_SUCCESS)
++		return failed("allocating the CPU-visible VRAM block", result);
++	result = s.vkMapMemory(s.device, lane.block, 0, VK_WHOLE_SIZE, 0, &a_mapped);
++	if (result != VK_SUCCESS) {
++		a_mapped = nullptr;
++		return failed("mapping the VRAM block", result);
++	}
++
++	VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++	bufferInfo.size = a_size;
++	bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++	result = s.vkCreateBuffer(s.device, &bufferInfo, nullptr, &lane.blockBuffer);
++	if (result == VK_SUCCESS)
++		result = s.vkBindBufferMemory(s.device, lane.blockBuffer, lane.block, 0);
++	if (result != VK_SUCCESS)
++		return failed("the VRAM block's buffer", result);
++
++	// The landing heap: on the display GPU's D3D12 device, where the bridge's unpack reads it.
++	winrt::com_ptr<ID3D12Heap> landingHeap;
++	{
++		D3D12_HEAP_DESC heapDesc{};
++		heapDesc.SizeInBytes = a_size;
++		heapDesc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
++		heapDesc.Alignment = kHeapAlignment;
++		heapDesc.Flags = D3D12_HEAP_FLAG_SHARED;
++		HRESULT hr = s.deviceB->CreateHeap(&heapDesc, IID_PPV_ARGS(landingHeap.put()));
++		HANDLE handle = nullptr;
++		if (SUCCEEDED(hr))
++			hr = s.deviceB->CreateSharedHandle(landingHeap.get(), nullptr, GENERIC_ALL, nullptr, &handle);
++		if (FAILED(hr))
++			return failed("the D3D12 landing heap on the display GPU", hr);
++
++		VkMemoryWin32HandlePropertiesKHR handleProperties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
++		result = s.vkGetMemoryWin32HandlePropertiesKHR(s.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT, handle,
++			&handleProperties);
++		uint32_t landingType = UINT32_MAX;
++		for (uint32_t index = 0; result == VK_SUCCESS && index < s.memory.memoryTypeCount; ++index) {
++			const VkMemoryPropertyFlags flags = s.memory.memoryTypes[index].propertyFlags;
++			if ((handleProperties.memoryTypeBits & (1u << index)) && (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
++				!(flags & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD)) {
++				landingType = index;
++				break;
++			}
++		}
++		if (result == VK_SUCCESS && landingType == UINT32_MAX)
++			result = VK_ERROR_FEATURE_NOT_PRESENT;
++		if (result == VK_SUCCESS) {
++			VkImportMemoryWin32HandleInfoKHR import{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
++			import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
++			import.handle = handle;
++			VkMemoryAllocateInfo landingInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++			landingInfo.pNext = &import;
++			landingInfo.allocationSize = a_size;
++			landingInfo.memoryTypeIndex = landingType;
++			result = s.vkAllocateMemory(s.device, &landingInfo, nullptr, &lane.landing);
++		}
++		CloseHandle(handle);
++		if (result != VK_SUCCESS)
++			return failed("importing the landing heap into Vulkan", result);
++
++		VkExternalMemoryBufferCreateInfo external{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
++		external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
++		VkBufferCreateInfo landingBufferInfo = bufferInfo;
++		landingBufferInfo.pNext = &external;
++		landingBufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++		result = s.vkCreateBuffer(s.device, &landingBufferInfo, nullptr, &lane.landingBuffer);
++		if (result == VK_SUCCESS)
++			result = s.vkBindBufferMemory(s.device, lane.landingBuffer, lane.landing, 0);
++		if (result != VK_SUCCESS)
++			return failed("the landing heap's buffer", result);
++	}
++
++	// One recorded copy per slot, between two timestamps. A slot's copy is only submitted again once the
++	// previous one finished (the bridge's unpack of that slot waited for it), so they are never reused while
++	// pending; SIMULTANEOUS_USE keeps that legal even if it were not.
++	const auto laneIndex = static_cast<uint32_t>(s.lanes.size());
++	VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++	allocateInfo.commandPool = s.pool;
++	allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++	allocateInfo.commandBufferCount = s.slots;
++	result = s.vkAllocateCommandBuffers(s.device, &allocateInfo, lane.copies.data());
++	if (result != VK_SUCCESS)
++		return failed("allocating the copy command buffers", result);
++	for (UINT slot = 0; slot < s.slots; ++slot) {
++		VkCommandBuffer copy = lane.copies[slot];
++		VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
++		s.vkBeginCommandBuffer(copy, &beginInfo);
++		const uint32_t query = (laneIndex * kMaxFrameSlots + slot) * 2;
++		if (s.queries) {
++			s.vkCmdResetQueryPool(copy, s.queries, query, 2);
++			s.vkCmdWriteTimestamp(copy, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.queries, query);
++		}
++		const VkBufferCopy region{ a_slotStride * slot, a_slotStride * slot, a_bytes };
++		s.vkCmdCopyBuffer(copy, lane.blockBuffer, lane.landingBuffer, 1, &region);
++		if (s.queries)
++			s.vkCmdWriteTimestamp(copy, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.queries, query + 1);
++		result = s.vkEndCommandBuffer(copy);
++		if (result != VK_SUCCESS)
++			return failed("recording the copy", result);
++	}
++
++	REX::INFO("[FG-GPU1] direct GPU copy: lane '{}': {:.1f} MB VRAM block (CPU-visible, mapped at {}) + {:.1f} MB landing "
++			  "heap on the display GPU",
++		a_name, static_cast<double>(a_size) / (1024.0 * 1024.0), a_mapped, static_cast<double>(a_size) / (1024.0 * 1024.0));
++	a_landing = landingHeap;
++	s.lanes.push_back(std::move(lane));
++	return static_cast<int>(laneIndex);
++}
++
++bool PeerCopy::SubmitCopy(int a_lane, UINT a_slot, UINT64 a_landed, UINT64 a_copied)
++{
++	if (!state || a_lane < 0 || static_cast<size_t>(a_lane) >= state->lanes.size() || a_slot >= state->slots)
++		return false;
++	auto& s = *state;
++	auto& lane = s.lanes[static_cast<size_t>(a_lane)];
++
++	VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
++	timeline.waitSemaphoreValueCount = 1;
++	timeline.pWaitSemaphoreValues = &a_landed;
++	timeline.signalSemaphoreValueCount = 1;
++	timeline.pSignalSemaphoreValues = &a_copied;
++	const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++	VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
++	submit.pNext = &timeline;
++	submit.waitSemaphoreCount = 1;
++	submit.pWaitSemaphores = &s.semaphore;
++	submit.pWaitDstStageMask = &waitStage;
++	submit.commandBufferCount = 1;
++	submit.pCommandBuffers = &lane.copies[a_slot];
++	submit.signalSemaphoreCount = 1;
++	submit.pSignalSemaphores = &s.semaphore;
++	const VkResult result = s.vkQueueSubmit(s.queue, 1, &submit, VK_NULL_HANDLE);
++	if (result != VK_SUCCESS) {
++		if (!s.submitFailed)
++			REX::ERROR("[FG-GPU1] direct GPU copy: vkQueueSubmit for lane '{}' failed ({})", lane.name, VkName(result));
++		s.submitFailed = true;
++		return false;
++	}
++	s.lastCopied = (std::max)(s.lastCopied, a_copied);
++	lane.stamped[a_slot] = s.queries != VK_NULL_HANDLE;
++	return true;
++}
++
++ID3D12Fence* PeerCopy::Fence() const noexcept
++{
++	return state ? state->fence.get() : nullptr;
++}
++
++bool PeerCopy::CopyTimeMs(UINT a_slot, double& a_ms)
++{
++	a_ms = 0.0;
++	if (!state || !state->queries || a_slot >= state->slots)
++		return false;
++	auto& s = *state;
++	std::array<uint64_t, kMaxPeerLanes * 2> ticks{};
++	bool any = false;
++	for (size_t index = 0; index < s.lanes.size(); ++index) {
++		if (!s.lanes[index].stamped[a_slot])
++			continue;
++		const auto query = static_cast<uint32_t>((index * kMaxFrameSlots + a_slot) * 2);
++		// Without WAIT: VK_NOT_READY while that copy has not run yet; try again on the slot's next use.
++		if (s.vkGetQueryPoolResults(s.device, s.queries, query, 2, sizeof(uint64_t) * 2, &ticks[index * 2],
++				sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
++			return false;
++		any = true;
++	}
++	if (!any)
++		return false;
++	for (size_t index = 0; index < s.lanes.size(); ++index) {
++		if (!s.lanes[index].stamped[a_slot])
++			continue;
++		s.lanes[index].stamped[a_slot] = false;
++		const uint64_t elapsed = (ticks[index * 2 + 1] - ticks[index * 2]) & s.timestampMask;
++		a_ms += static_cast<double>(elapsed) * s.nsPerTick / 1e6;
++	}
++	return true;
++}
++
++const char* PeerCopy::QueueName() const noexcept
++{
++	if (!state)
++		return "none";
++	return state->computeQueue ? "async compute queue" : "graphics queue";
++}
++
++void PeerCopy::Shutdown() noexcept
++{
++	state.reset();
++}
+diff --git a/plugins/FrameGeneration/src/PeerCopy.h b/plugins/FrameGeneration/src/PeerCopy.h
+new file mode 100644
+index 0000000..b32351a
+--- /dev/null
++++ b/plugins/FrameGeneration/src/PeerCopy.h
+@@ -0,0 +1,72 @@
++#pragma once
++
++// PeerCopy - the display GPU's half of the direct GPU-to-GPU copy (bDirectGPUCopy).
++//
++// The render GPU's copy engine can write straight into the display GPU's VRAM: the display GPU maps a
++// block of its VRAM for the CPU through its resizable BAR, and the render GPU's D3D12 device opens that
++// CPU address with OpenExistingHeapFromAddress as if it were system memory. Its writes then cross PCIe
++// once, card to card, and never touch system RAM (the cross-adapter heap costs two trips through it).
++//
++// On Windows 10, D3D12 cannot create VRAM the CPU can map on a discrete GPU (GPU upload heaps need
++// Windows 11 24H2), and AMD's Vulkan driver does not export CPU-mappable VRAM to D3D12. So this class
++// keeps a small Vulkan device on the display GPU that
++//   - allocates one CPU-mappable VRAM block per lane and maps it (the render GPU writes there),
++//   - imports one D3D12 heap per lane, created on the display GPU's D3D12 device: the landing heap the
++//     bridge's unpack reads instead of the cross-adapter heap,
++//   - copies a lane's slot from the block into its landing heap when asked (~150 GB/s, local VRAM).
++// Per frame it synchronises with D3D12 through one D3D12 fence on the display GPU, imported into Vulkan
++// as a timeline semaphore: the bridge's copy queue signals "landed", Vulkan waits for that on the GPU,
++// copies and signals "copied", and the copy queue waits for "copied" before it unpacks.
++//
++// tools/p2p-probe checked each step on the RTX 3090 + RX 9060 XT this was built for (--interop, --evict,
++// --pipeline --compute: 300 frames with the Vulkan copy queued before the render GPU wrote, no wrong
++// data, vkQueueSubmit returning at once).
++//
++// Everything runs on the game's render thread. No method throws.
++
++#include <d3d12.h>
++#include <winrt/base.h>
++
++#include <cstdint>
++#include <memory>
++
++class PeerCopy
++{
++public:
++	PeerCopy();
++	~PeerCopy();
++	PeerCopy(const PeerCopy&) = delete;
++	PeerCopy& operator=(const PeerCopy&) = delete;
++
++	// Loads vulkan-1.dll and creates the Vulkan device on a_deviceB's adapter (matched by LUID) and the
++	// shared fence. False (logged) when anything is missing; nothing is left behind.
++	bool Initialize(ID3D12Device* a_deviceB, UINT a_slots);
++	[[nodiscard]] bool Ready() const noexcept { return state != nullptr; }
++
++	// One lane: a CPU-mapped VRAM block of a_size bytes (a_mapped, the address the render GPU opens) and a
++	// D3D12 heap of the same size on the display GPU (a_landing), plus one recorded copy per slot of
++	// a_bytes at a_slot * a_slotStride. Returns the lane's index here, or -1 (logged).
++	int AddLane(const char* a_name, UINT64 a_size, UINT64 a_slotStride, UINT64 a_bytes, void*& a_mapped,
++		winrt::com_ptr<ID3D12Heap>& a_landing);
++
++	// Queues on the GPU: wait until Fence() reaches a_landed, copy the lane's slot into its landing heap,
++	// signal a_copied. Returns at once; false (logged once) when the submission failed.
++	bool SubmitCopy(int a_lane, UINT a_slot, UINT64 a_landed, UINT64 a_copied);
++
++	// The display GPU's D3D12 fence that Vulkan waits on and signals.
++	[[nodiscard]] ID3D12Fence* Fence() const noexcept;
++
++	// GPU time of the last copies of a_slot, summed over the lanes. False while one is still running or
++	// when there are no timestamps.
++	bool CopyTimeMs(UINT a_slot, double& a_ms);
++
++	[[nodiscard]] const char* QueueName() const noexcept;
++
++	// Waits for the Vulkan queue (unblocking it if the D3D12 side never signalled) and frees everything.
++	// Call only after the render GPU released the heaps it opened on the blocks.
++	void Shutdown() noexcept;
++
++private:
++	struct State;
++	std::unique_ptr<State> state;
++};
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.cpp b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
 new file mode 100644
 index 0000000..e4af938
@@ -6111,11 +7311,16 @@ index 0000000..c777d1a
 +	bool loggedSizeMismatch = false;
 +};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..3276f2c 100644
+index 3483d96..b92dafe 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
-@@ -2,8 +2,12 @@
+@@ -1,9 +1,40 @@
+ #include "Upscaling.h"
  
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
  #include <d3dcompiler.h>
  
 +#include "CrossAdapterBridge.h"
@@ -6124,10 +7329,33 @@ index 3483d96..3276f2c 100644
 +#include "FidelityFX.h"
 +#include "SecondaryUpscale.h"
 +#include "MGPUScaling.h"
++
++// --- HUD motion-vector freeze test (branch test/mv-freeze-hud-bars) -----------------------
++// Rectangles in display (swap chain) pixels, measured on a 3840x2160 screen: the health bar
++// and the AP bar below it. Their motion vectors, plus a margin, are zeroed before the lane
++// crosses so frame generation has nothing to move there. The rectangles are converted with the
++// motion-vector lane's own scale against the swap chain, so they follow the render resolution
++// (4K -> 2560x1440 at Quality, i.e. 2/3: 63,2051 602x17 -> 42,1367 402x12 and
++// 63,2093 602x13 -> 42,1395 402x9).
++namespace
++{
++	struct HudFreezeRect
++	{
++		float x, y, w, h;
++	};
++
++	constexpr HudFreezeRect kHudFreezeRects[] = {
++		{ 63.0f, 2051.0f, 602.0f, 17.0f },
++		{ 63.0f, 2093.0f, 602.0f, 13.0f },
++	};
++	constexpr int kHudFreezeMargin = 2;  // motion-vector texels on every side
++	constexpr UINT kHudFreezeZeroWidth = 1024;
++	constexpr UINT kHudFreezeZeroHeight = 64;
++}
  
  enum class RenderTarget
  {
-@@ -79,7 +83,8 @@ enum class DepthStencilTarget
+@@ -79,7 +110,8 @@ enum class DepthStencilTarget
  	kCount = 13
  };
  
@@ -6137,7 +7365,7 @@ index 3483d96..3276f2c 100644
  {
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto device = reinterpret_cast<ID3D11Device*>(rendererData->device);
-@@ -99,7 +104,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
+@@ -99,7 +131,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
  		REX::ERROR("Failed to compile shader; {} does not exist", str);
  		return nullptr;
  	}
@@ -6146,7 +7374,7 @@ index 3483d96..3276f2c 100644
  		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
  		if (shaderErrors) shaderErrors->Release();
  		if (shaderBlob) shaderBlob->Release();
-@@ -120,17 +125,33 @@ void Upscaling::LoadSettings()
+@@ -120,17 +152,35 @@ void Upscaling::LoadSettings()
  {
  	CSimpleIniA ini;
  	ini.SetUnicode();
@@ -6180,6 +7408,7 @@ index 3483d96..3276f2c 100644
 +	else
 +		settings.sendHudlessFrame = ini.GetBoolValue(section, "bTransportHudLess", true);
 +	settings.asyncUnpack = ini.GetBoolValue(section, "bAsyncUnpack", true);
++	settings.freezeHudMotionVectors = ini.GetBoolValue(section, "bFreezeHudMotionVectors", true);
 +	settings.earlyTransfer = ini.GetBoolValue(section, "bEarlyTransfer", true);
 +	settings.earlyUnpack = ini.GetBoolValue(section, "bEarlyUnpack", true);
 +	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue(section, "iHalfResDepthMV", 1)), 0, 2);
@@ -6187,10 +7416,11 @@ index 3483d96..3276f2c 100644
 +	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
 +	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
 +	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
++	settings.directGpuCopy = ini.GetBoolValue(section, "bDirectGPUCopy", false);
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +159,24 @@ void Upscaling::LoadSettings()
+@@ -138,6 +188,28 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -6198,6 +7428,7 @@ index 3483d96..3276f2c 100644
 +			settings.secondaryGPU, settings.secondaryGPUName);
 +		REX::INFO("[Frame Generation] bSendHudlessFrame: {} (extra UI-free frame; off = less PCIe, HUD smears)",
 +			settings.sendHudlessFrame);
++		REX::INFO("[Frame Generation] bFreezeHudMotionVectors (test): {}", settings.freezeHudMotionVectors);
 +		REX::INFO("[Frame Generation] bAsyncUnpack: {} (secondary GPU unpacks on a copy queue as each buffer arrives)",
 +			settings.asyncUnpack);
 +		REX::INFO("[Frame Generation] bEarlyTransfer: {} (depth/MVs/HUD-less cross during the frame, not at Present)",
@@ -6212,10 +7443,13 @@ index 3483d96..3276f2c 100644
 +			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
 +		REX::INFO("[Frame Generation] bExtraFrameInFlight: {} (second-GPU mode: 3 frames in flight instead of 2, +1 frame latency)",
 +			settings.extraFrameInFlight);
++		REX::INFO("[Frame Generation] bDirectGPUCopy: {} (second-GPU mode, experimental: the render GPU writes straight into "
++				  "the display GPU's VRAM instead of through system memory)",
++			settings.directGpuCopy);
  		loggedOnce = true;
  	}
  }
-@@ -169,8 +208,32 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,8 +241,33 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
@@ -6238,7 +7472,8 @@ index 3483d96..3276f2c 100644
 +	// upscaler needs the scene, so it is always sent then.
 +	hudlessActive = settings.sendHudlessFrame || secondaryUpscaleLanes;
 +	if (secondaryUpscaleLanes && !settings.sendHudlessFrame)
-+		REX::INFO("[FSR4] bSendHudlessFrame = 0 is ignored: the second GPU upscales the UI-free scene");
++		REX::INFO("[FSR4] bSendHudlessFrame = 0 (test branch): FFX gets a copy of the composed frame as its UI-free input, "
++				  "so the HUD is interpolated with the scene unless its motion vectors are frozen");
 +	const UINT halfWidth = (laneWidth + 1) / 2;
 +	const UINT halfHeight = (laneHeight + 1) / 2;
 +	int sceneLane = -1;
@@ -6249,7 +7484,7 @@ index 3483d96..3276f2c 100644
  		D3D11_TEXTURE2D_DESC texDesc{};
  		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
  		D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
-@@ -193,6 +256,9 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -193,6 +290,9 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -6259,7 +7494,7 @@ index 3483d96..3276f2c 100644
  
  		HUDLessBufferShared[index] = new Texture2D(texDesc);
  		HUDLessBufferShared[index]->CreateSRV(srvDesc);
-@@ -204,6 +270,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -204,6 +304,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -6270,7 +7505,7 @@ index 3483d96..3276f2c 100644
  		depthBufferShared[index] = new Texture2D(texDesc);
  		depthBufferShared[index]->CreateSRV(srvDesc);
  		depthBufferShared[index]->CreateRTV(rtvDesc);
-@@ -218,6 +288,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -218,6 +322,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -6281,7 +7516,7 @@ index 3483d96..3276f2c 100644
  		motionVectorBufferShared[index] = new Texture2D(texDesc);
  		motionVectorBufferShared[index]->CreateSRV(srvDesc);
  		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
-@@ -228,14 +302,14 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -228,14 +336,14 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -6298,7 +7533,7 @@ index 3483d96..3276f2c 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +322,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +356,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -6307,7 +7542,7 @@ index 3483d96..3276f2c 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +342,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +376,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -6316,7 +7551,7 @@ index 3483d96..3276f2c 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +362,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +396,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -6325,7 +7560,7 @@ index 3483d96..3276f2c 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +382,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +416,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -6334,7 +7569,7 @@ index 3483d96..3276f2c 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,17 +391,141 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,17 +425,141 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
@@ -6479,7 +7714,7 @@ index 3483d96..3276f2c 100644
  	
  	auto& colorMain = rendererData->renderTargets[(uint)RenderTarget::kMain];
  	auto& colorPostAlpha = rendererData->renderTargets[(uint)RenderTarget::kMainTemp];
-@@ -358,10 +556,16 @@ void Upscaling::PostAlpha()
+@@ -358,10 +590,16 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
@@ -6500,7 +7735,7 @@ index 3483d96..3276f2c 100644
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +577,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +611,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -6515,17 +7750,116 @@ index 3483d96..3276f2c 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +591,9 @@ void Upscaling::PostAlpha()
+@@ -387,6 +625,108 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
 +
++	// Test: the HUD bars' motion vectors are zeroed before the lane crosses (see
++	// ZeroHudMotionVectors); this is the last write to the motion-vector lane each frame.
++	ZeroHudMotionVectors(context);
++
 +	// Depth and motion vectors are final now: start their PCIe copy instead of waiting for Present.
 +	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kWorld);
++}
++
++void Upscaling::ZeroHudMotionVectors(ID3D11DeviceContext* a_context)
++{
++	if (!settings.freezeHudMotionVectors)
++		return;
++
++	auto dx12SwapChain = DX12SwapChain::GetSingleton();
++	auto& shared = motionVectorBufferShared[dx12SwapChain->frameIndex];
++	if (!a_context || !shared || !shared->resource)
++		return;
++
++	const auto& sc = dx12SwapChain->swapChainDesc;
++	D3D11_TEXTURE2D_DESC mvDesc{};
++	shared->resource->GetDesc(&mvDesc);
++	if (!sc.Width || !sc.Height || !mvDesc.Width || !mvDesc.Height)
++		return;
++
++	if (mvDesc.Format != DXGI_FORMAT_R16G16_FLOAT) {
++		if (!mvFreezeLogged) {
++			mvFreezeLogged = true;
++			REX::WARN("[FG-GPU1] HUD motion-vector freeze: the motion-vector lane is format {}, not R16G16_FLOAT; nothing is zeroed",
++				static_cast<int>(mvDesc.Format));
++		}
++		return;
++	}
++
++	if (!mvFreezeZeroTexture) {
++		ID3D11Device* device = nullptr;
++		shared->resource->GetDevice(&device);
++		if (!device)
++			return;
++
++		D3D11_TEXTURE2D_DESC zeroDesc{};
++		zeroDesc.Width = kHudFreezeZeroWidth;
++		zeroDesc.Height = kHudFreezeZeroHeight;
++		zeroDesc.MipLevels = 1;
++		zeroDesc.ArraySize = 1;
++		zeroDesc.Format = mvDesc.Format;
++		zeroDesc.SampleDesc.Count = 1;
++		zeroDesc.Usage = D3D11_USAGE_DEFAULT;
++
++		const HRESULT hr = device->CreateTexture2D(&zeroDesc, nullptr, mvFreezeZeroTexture.put());
++		device->Release();
++		if (FAILED(hr)) {
++			REX::WARN("[FG-GPU1] HUD motion-vector freeze: the zero texture could not be created (hr={:#010x})",
++				static_cast<std::uint32_t>(hr));
++			return;
++		}
++
++		// Once, never again: R16G16_FLOAT is 4 bytes a texel.
++		const UINT rowPitch = kHudFreezeZeroWidth * 4;
++		std::vector<std::uint8_t> zeros(static_cast<size_t>(rowPitch) * kHudFreezeZeroHeight, 0);
++		a_context->UpdateSubresource(mvFreezeZeroTexture.get(), 0, nullptr, zeros.data(), rowPitch,
++			rowPitch * kHudFreezeZeroHeight);
++	}
++
++	// The lane holds the render-resolution image, so a display pixel maps by the lane's own scale
++	// (4K -> 2560x1440 is 2/3, which turns 63,2051 602x17 into 42,1367 402x12).
++	const float sx = static_cast<float>(mvDesc.Width) / static_cast<float>(sc.Width);
++	const float sy = static_cast<float>(mvDesc.Height) / static_cast<float>(sc.Height);
++
++	for (size_t i = 0; i < ARRAYSIZE(kHudFreezeRects); ++i) {
++		const auto& r = kHudFreezeRects[i];
++
++		// Outward rounding so the whole rectangle is covered, then the margin for the AA edge.
++		int x0 = static_cast<int>(std::floor(r.x * sx)) - kHudFreezeMargin;
++		int y0 = static_cast<int>(std::floor(r.y * sy)) - kHudFreezeMargin;
++		int x1 = static_cast<int>(std::ceil((r.x + r.w) * sx)) + kHudFreezeMargin;
++		int y1 = static_cast<int>(std::ceil((r.y + r.h) * sy)) + kHudFreezeMargin;
++
++		x0 = (std::max)(0, x0);
++		y0 = (std::max)(0, y0);
++		x1 = (std::min)(x1, static_cast<int>(mvDesc.Width));
++		y1 = (std::min)(y1, static_cast<int>(mvDesc.Height));
++
++		const UINT w = x1 > x0 ? static_cast<UINT>(x1 - x0) : 0;
++		const UINT h = y1 > y0 ? static_cast<UINT>(y1 - y0) : 0;
++		if (!w || !h)
++			continue;
++		if (w > kHudFreezeZeroWidth || h > kHudFreezeZeroHeight) {
++			REX::WARN("[FG-GPU1] HUD motion-vector freeze: rect {} is {}x{} lane texels, larger than the zero texture; skipped", i, w, h);
++			continue;
++		}
++
++		const D3D11_BOX srcBox{ 0, 0, 0, w, h, 1 };
++		a_context->CopySubresourceRegion(shared->resource.get(), 0, static_cast<UINT>(x0), static_cast<UINT>(y0), 0,
++			mvFreezeZeroTexture.get(), 0, &srcBox);
++
++		if (!mvFreezeLogged)
++			REX::INFO("[FG-GPU1] HUD motion-vector freeze: rect {} display ({}, {}) {}x{} -> lane ({}, {}) {}x{} of {}x{}",
++				i, r.x, r.y, r.w, r.h, x0, y0, w, h, mvDesc.Width, mvDesc.Height);
++	}
++
++	mvFreezeLogged = true;
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -401,18 +608,59 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -401,18 +741,66 @@ void Upscaling::CopyBuffersToSharedResources()
  
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -6565,6 +7899,9 @@ index 3483d96..3276f2c 100644
 +		ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
 +		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
 +		context->CSSetShader(nullptr, nullptr, 0);
++
++		// Test: zero the HUD bars' motion vectors in the shared lane.
++		ZeroHudMotionVectors(context);
 +		return;
 +	}
 +
@@ -6576,6 +7913,10 @@ index 3483d96..3276f2c 100644
 +	} else {
 +		context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
 +	}
++
++	// Test: zero the HUD bars' motion vectors in the shared lane (the path for frames whose
++	// post-alpha copy does not run).
++	ZeroHudMotionVectors(context);
 +
  	{
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
@@ -6590,7 +7931,7 @@ index 3483d96..3276f2c 100644
  
  
  			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
-@@ -558,22 +806,124 @@ void Upscaling::PostDisplay()
+@@ -558,22 +946,124 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
@@ -6721,7 +8062,7 @@ index 3483d96..3276f2c 100644
  
  void Upscaling::GenerateUIBuffer()
 diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
-index 838f927..cf75d73 100644
+index 838f927..4f90664 100644
 --- a/plugins/FrameGeneration/src/Upscaling.h
 +++ b/plugins/FrameGeneration/src/Upscaling.h
 @@ -1,6 +1,7 @@
@@ -6732,13 +8073,17 @@ index 838f927..cf75d73 100644
  
  #include "SimpleIni.h"
  
-@@ -23,29 +24,78 @@ public:
+@@ -23,29 +24,87 @@ public:
  		bool debugLogging = false;
  		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
  		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
 +		bool secondaryGPU = false;       ///< Run FSR3 FG and present on a second GPU (the one driving the monitor)
 +		std::string secondaryGPUName;    ///< Optional: substring of the secondary GPU's name, if auto-selection is ambiguous
 +		bool sendHudlessFrame = true;    ///< Send the extra UI-free frame (off = less PCIe, HUD smears)
++		// Test (branch test/mv-freeze-hud-bars): zero the motion vectors under the HUD bars so
++		// frame generation holds them still. Re-read with the other settings, so it can be
++		// flipped in the ini while the game runs.
++		bool freezeHudMotionVectors = true;
 +		bool asyncUnpack = true;         ///< Secondary GPU unpacks on a copy queue, lane by lane (off = on the direct queue)
 +		bool earlyTransfer = true;       ///< Copy depth/MVs/HUD-less at their frame hooks, not at Present
 +		bool earlyUnpack = true;         ///< ...and queue the display GPU's read of them there too
@@ -6747,6 +8092,7 @@ index 838f927..cf75d73 100644
 +		int fsrSwapChainProvider = 0;    ///< SDK 2.4 only: 0 newest offered, 1 newest 3.x (A/B against 4.0.0 pacing)
 +		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
 +		bool extraFrameInFlight = false; ///< Second-GPU mode: 3 swap-chain buffers instead of 2 (FrameSlots.h); restart
++		bool directGpuCopy = false;      ///< Second-GPU mode: the render GPU writes into the display GPU's VRAM (PeerCopy.h); restart
  	};
  
  	Settings settings;
@@ -6801,15 +8147,19 @@ index 838f927..cf75d73 100644
 +	Texture2D* depthBufferShared[kMaxFrameSlots]{};
 +	Texture2D* motionVectorBufferShared[kMaxFrameSlots]{};
 +	Texture2D* UIColorAlphaShared[kMaxFrameSlots]{};
++
++	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12Resource> depthBufferShared12[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[kMaxFrameSlots];
  
 -	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[2];
 -	winrt::com_ptr<ID3D12Resource> depthBufferShared12[2];
 -	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[2];
 -	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[2];
-+	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[kMaxFrameSlots];
-+	winrt::com_ptr<ID3D12Resource> depthBufferShared12[kMaxFrameSlots];
-+	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[kMaxFrameSlots];
-+	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[kMaxFrameSlots];
++	// Test: the all-zero texture ZeroHudMotionVectors copies from, and its one-time log flag.
++	winrt::com_ptr<ID3D11Texture2D> mvFreezeZeroTexture;
++	bool mvFreezeLogged = false;
  
  	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
  	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
@@ -6819,7 +8169,7 @@ index 838f927..cf75d73 100644
  
  	bool setupBuffers = false;
  
-@@ -57,6 +107,8 @@ public:
+@@ -57,9 +116,14 @@ public:
  	void PostPostLoad();
  
  	void CreateFrameGenerationResources();
@@ -6828,6 +8178,12 @@ index 838f927..cf75d73 100644
  	void PreAlpha();
  	void PostAlpha();
  	void CopyBuffersToSharedResources();
++	// Test (branch test/mv-freeze-hud-bars): zero the motion vectors under the HUD rectangles so
++	// frame generation holds those pixels still. Rectangles are in display (swap chain) pixels.
++	void ZeroHudMotionVectors(ID3D11DeviceContext* a_context);
+ 	void GenerateUIBuffer();
+ 
+ 	static void TimerSleepQPC(int64_t targetQPC);
 diff --git a/plugins/MGPUScaling/CMakeLists.txt b/plugins/MGPUScaling/CMakeLists.txt
 new file mode 100644
 index 0000000..5e2598c
