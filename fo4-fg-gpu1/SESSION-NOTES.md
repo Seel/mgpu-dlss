@@ -9,8 +9,11 @@ in FSR 4.1 mode (`bSendUITilesOnly`), then measure; only then
 [plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread, `bDisplayThread`).
 Parts 2 and the display thread aim at the last 3-4 fps to the 71 cap with Community Shaders on
 (66.6-68.5 now with `bExtraFrameInFlight = 1`). The user asked for all of them as optional settings.
+**First, though: re-test `bDirectGPUCopy` in game, including quitting with Alt+F4 (below).** UI tiles
+were put off by the user. The single-GPU AutoHDR fix (next section) was made on its own branch and
+merged with `test/mv-freeze-hud-bars` (bDirectGPUCopy, HUD MV freeze) at the user's request.
 
-## Latest (2026-11-08): AutoHDR in single-GPU mode (built, not yet run in game)
+## Latest (2026-11-08): AutoHDR in single-GPU mode, merged with bDirectGPUCopy (built, not yet run in game)
 
 The user hit `[E] [FG] the swap chain is format 24 but the game renders format 28 ... only
 bFrameGenOnSecondaryGPU = 1 converts between them` with `bFrameGenOnSecondaryGPU = 0`: the
@@ -28,10 +31,15 @@ buffer, which AutoHDR had made R10G10B10A2 (or R16G16B16A16_FLOAT), and copies d
   differs from the source format (RGBA8 in second-GPU mode, so unchanged there).
 - Frame generation needed nothing new: `FidelityFX::CreateContexts` already reads the real back
   buffer format in both modes, creates FG for it (SDR, HDR flag off) and declares the RGBA8 HUD-less
-  frame (SDK 2.4). New: with SDK 1.1.4 (`iFSRRuntime = 0`) under a non-RGBA8 back buffer the
-  HUD-less frame is no longer passed (`passHudless`), because 1.1.4 assumes it has the back
-  buffer's format; FSR then interpolates the back buffer with its UI (HUD may smear), logged as an
-  error. Applies to both modes.
+  frame (SDK 2.4). New: with SDK 1.1.4 (`iFSRRuntime = 0`) under a non-RGBA8 back buffer, which
+  cannot be told the HUD-less frame's format, frame generation stays off for the session
+  (`FidelityFX::hudlessFormatKnown`, gated in `DX12SwapChain::Present` so the frame limiter knows;
+  logged as an error). Applies to both modes. (A first version passed no HUD-less frame instead; the
+  merged branch had found that this leaves FFX without a scene, black screen, so it was changed.)
+- Merge with `test/mv-freeze-hud-bars`: conflicts only in FidelityFX.cpp (their
+  `HUDLessColor ? ... : {}` kept), README (both file-list lines), these notes (both sections) and
+  the patch (regenerated). Their `bSendHudlessFrame = 0` stand-in copy turns generation off under a
+  non-RGBA8 back buffer on its own; the two do not interact otherwise.
 - DLSS-G / XeSS single-GPU (not shipped) get the converted frame too, with a warning that their
   frame generation is not told the HUD-less format.
 - Logs: `[FG] the swap chain is R10G10B10A2_UNORM (HDR10) (format 24), the game renders
@@ -43,10 +51,12 @@ buffer, which AutoHDR had made R10G10B10A2 (or R16G16B16A16_FLOAT), and copies d
   session's uncommitted build (`PeerCopy.cpp`, bDirectGPUCopy, awaiting its in-game test), and the
   script resets that checkout and overwrites its zip. `D:\fgh` was seeded from `D:\fgb` (sources at
   `3e237a4`, vcpkg without buildtrees; packages restored from the vcpkg binary cache). Package:
-  **`D:\fgh\MGPU-Scaling.zip`**. Build: `/W4 /WX`, 0 warnings, exports unchanged (F4SE entry points +
-  the static FSR 3.1 SDK's); `fxc` compiles `Copy` at 3840x2160. `fg-gpu1.patch` regenerated from
-  `D:\fgh` (same 36 files; only DX12SwapChain.cpp, FidelityFX.cpp/.h, SecondaryUpscale.cpp/.h
-  changed) and applies to a pristine `3e237a4` with a result identical to the overlay.
+  **`D:\fgh\MGPU-Scaling.zip`**, the merged build (00:26). Build: `/W4 /WX`, 0 warnings, the same 47
+  exports (F4SE entry points + the static FSR 3.1 SDK's), `vulkan-1.dll` not imported (loaded at run
+  time); `fxc` compiles `Copy` at 3840x2160. `fg-gpu1.patch` regenerated from `D:\fgh` (38 files,
+  vendored FFX/Vulkan headers excluded as before; against `test/mv-freeze-hud-bars`'s patch only
+  DX12SwapChain.cpp, FidelityFX.cpp/.h, SecondaryUpscale.cpp/.h differ) and applies to a pristine
+  `3e237a4` with every plugin source identical to the overlay.
 - Two build-script traps found on the way, now fixed in `build-local.ps1`: (1) the patch
   workflow's `git add -N` leaves intent-to-add entries in the checkout's index, which the script's
   `git checkout -- .` / `git clean` did not remove, so files dropped from the overlay (or another
@@ -56,12 +66,91 @@ buffer, which AutoHDR had made R10G10B10A2 (or R16G16B16A16_FLOAT), and copies d
   was not recompiled. The script now hashes each overlay file's previous copy and stamps the changed
   ones with the current time (logs `N overlay file(s) changed since the last build`).
 
-**Next test (user, single GPU: game and monitor on one GPU; install `D:\fgh\MGPU-Scaling.zip`):** `bFrameGenOnSecondaryGPU = 0`,
-`iFSRRuntime = 1`, ReShade with AutoHDR on. Expect the two `[FG]` lines above, `[FSR] the swap chain
-was created as format 28 but is format 24`, no `[E]`, a correct HDR picture in menus and gameplay,
-FG on (~50% generated in the 10 s line) and off (menus, or `bFrameGenerationMode` off), HUD clean in
-generated frames. Then scRGB (`UseHDR10=0`, restart): format 10 in the same lines. Without AutoHDR
-nothing changes (no conversion line).
+**Next tests (user; install `D:\fgh\MGPU-Scaling.zip`, the merged build):** first the
+bDirectGPUCopy re-test in the next section (second GPU, quit with Alt+F4 and once via the main
+menu). Then single GPU (game and monitor on one GPU): `bFrameGenOnSecondaryGPU = 0`,
+`iFSRRuntime = 1`, `bSendHudlessFrame = 1`, ReShade with AutoHDR on. Expect the two `[FG]` lines
+above, `[FSR] the swap chain was created as format 28 but is format 24`, no `[E]`, a correct HDR
+picture in menus and gameplay, FG on (~50% generated in the 10 s line) and off (menus, or
+`bFrameGenerationMode` off), HUD clean in generated frames. Then scRGB (`UseHDR10=0`, restart):
+format 10 in the same lines. Without AutoHDR nothing changes (no conversion line).
+
+## Earlier the same night (2026-11-08, 00:1x): bDirectGPUCopy worked in game; Alt+F4 hung the PC; exit fixed
+
+First in-game run (00:02-00:04, log `MGPUScaling.log`): CS on, ReShade AutoHDR (HDR10), FSR 4.1
+Quality, 3 frames in flight, `bSendHudlessFrame = 0` (HUD MV freeze test). Every frame crossed
+directly (`709/709 frames`), check values never late, 70.9 game fps at the cap, copy on render GPU
+7.6 ms (~9.4 GB/s), Vulkan copy into the landing heaps 0.57 ms, timeline after Present: 3090 copy
+2.5-10.2, 9060 unpack 4.2-11.1, list end 12.2 ms. Earlier that evening AutoHDR had looked broken: not
+this code - the user's `MCM\Settings\MGPUScaling.ini` still had the second GPU and FG off from the
+host-memory A/B (20:41), and single-GPU mode cannot convert to a 10-bit swap chain (logged as an
+error); settings put back (second GPU, FG, FSR 4.1, bDirectGPUCopy on).
+
+**Alt+F4 then hung the PC**: Kernel-Power 41 with BugcheckCode 0 and a power-button timestamp, no
+dump, no WHEA, log ends at the last 10 s line. Cause (not proven, the hang left nothing to read): at
+exit the bridge's static destructor destroyed `peer` (declared after `lanes`) first, freeing the
+9060's Vulkan blocks while the 3090's heaps (`OpenExistingHeapFromAddress` on them) were still open,
+and it ran at DLL_PROCESS_DETACH, after the Vulkan and D3D12 drivers (loaded after this DLL) had been
+detached. Every probe run had closed the 3090's view first. Fix:
+- Hooks on `ntdll!RtlExitUserProcess` and `kernelbase!TerminateProcess` (Fallout4.exe imports both
+  ExitProcess and TerminateProcess) call `ReleaseDirectCopyForExit`: wait up to 2 s each for
+  `transferFenceA >= nextLaneValue` and `readFenceB >= readValue`, close the 3090's views, release the
+  landing heaps, `peer.Shutdown()` (only if idle), log it. Installed only if both entries start with
+  known non-RIP-relative prologue instructions (Nukem's detours copies them unrelocated; Win10 19045:
+  `40 53 48 83 EC 20` and `48 89 5C 24 08`); otherwise the direct copy stays off.
+- `DX12SwapChain::Present` and `TransferEarlyLanes` hold `bridge->LockFrame()` (recursive timed
+  mutex), so the release never lands mid-frame when another thread ends the process.
+- `peer` declared before `lanes` (destroyed after); `PeerCopy` makes no Vulkan call once
+  `RtlDllShutdownInProgress()`.
+- p2p-probe `--exit-hook[-terminate]` (hooks fire, exit codes kept) and `--exit-gpu[-terminate]`
+  (process ends with 40 x 64 MiB P2P copies running: hook waited 263 ms, closed the view, freed the
+  block, clean exit, no events). The order that hung is not exercised on purpose.
+
+**To test** (user): same settings, play a minute, quit with Alt+F4 and once via the main menu; the
+log's last line should be `direct GPU copy: the game is exiting; closed the render GPU's views of the
+display GPU's VRAM, then freed the blocks` (or `...terminating itself...`).
+
+## Earlier (2026-11-07, 23:xx): bDirectGPUCopy built
+
+The user asked whether the 3090 could copy to the 9060 without system RAM. No API does it across
+vendors (D3D12 cross-adapter heaps are system memory only; GPUDirect is Linux/NVIDIA-only; CUDA P2P
+needs TCC or SLI; AMD's DirectGMA was FirePro-only; ROCm issue 13715 confirms no Radeon P2P on
+Windows; D3D12 GPU upload heaps need Win11 24H2, and the user is on Win10 19045). But with
+Resizable BAR on both cards, the 3090's `OpenExistingHeapFromAddress` (and Vulkan
+`VK_EXT_external_memory_host`) accept the CPU address of a 9060 VRAM block mapped by the 9060's
+Vulkan, and the 3090's copy engine then writes card to card. `tools/p2p-probe` (new, README there)
+measured everything; the user ran nothing, the probe ran here, PC fine, no WHEA events:
+- `--dma`: 64 MiB at 10.3 GB/s, every dword verified on the 9060, the block stays in VRAM.
+- `--bench`: P2P writes 10.2 GB/s (9060->3090 9.9), P2P reads 4-6 (never pull), sysmem 13.2/13.7.
+- `--interop`: the 9060's D3D12 cannot get mappable VRAM on Win10, D3D12 heaps imported into Vulkan
+  are not mappable, mappable Vulkan memory cannot be exported (OUT_OF_DEVICE_MEMORY). Route 3 works:
+  plain Vulkan block -> 9060 Vulkan copy (150 GB/s) -> D3D12 heap imported into Vulkan, synced by a
+  D3D12 fence imported as a timeline semaphore.
+- `--evict`: 19.5 GiB of D3D12 allocations on the 16 GB 9060 did not move the block.
+- `--pipeline --compute`: the mod's exact sequence 300x with the 9060's waits queued before the 3090
+  is released: 0 wrong frames, vkQueueSubmit returns at once (no render-thread stall), the check
+  value is visible to the CPU the moment the 3090's fence completes (0/300 late).
+
+Implemented as `bDirectGPUCopy` ([FrameGeneration], MCM "Direct GPU-to-GPU Copy (restart,
+experimental)", default 0, needs bAsyncUnpack): `PeerCopy.h/.cpp` (Vulkan on the 9060, loaded at
+run time, implicit layers disabled while the instance is created, async-compute queue, memory
+priority 1.0, pageable-device-local NOT enabled), `CrossAdapterBridge` (per lane: block + landing
+heap + A's placed buffer; `frameDirect` fixed per frame in PrepareFrame; SubmitLane writes into the
+block plus a check value = the lane's transfer value behind the data; SubmitUnpackLanes: Wait
+transfer -> Signal landed -> vkQueueSubmit (wait landed, copy slot, signal copied) -> Wait copied ->
+unpack from the landing heap). Cross-adapter heaps stay allocated. **Guard** (the user's wish: make
+it noticeable): CheckDirectCopy at every frame start reads finished copies' check values through the
+Vulkan mapping; missing value (one frame's grace except the slot being reused) or a failed Vulkan
+submit -> TripDirectCopy: CRITICAL log, system memory from the next frame, and DX12SwapChain turns
+frame generation off for the session. Setup failures just fall back to system memory (FG on). Build:
+0 warnings, `fg-gpu1.patch` regenerated (now also includes the HUD MV freeze test, which had not
+been regenerated) and applies to a pristine `3e237a4`. Also fixed: Shutdown waited only for
+slots 0-1 of the unpack fence (3 slots with bExtraFrameInFlight).
+
+**To test in game** (user): bDirectGPUCopy = 1, same save/spot as the CS runs; check the log lines
+in README "Direct GPU-to-GPU copy"; compare the 10 s lines (copy on render GPU ~10 GB/s, unpack
+small, timeline after Present, render thread blocked) and fps against bDirectGPUCopy = 0. Risks not
+covered by the probe: ReShade in the process (it may hook vulkan-1.dll), sleep/resume, driver resets.
 
 ## Earlier (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
 
@@ -490,3 +579,50 @@ built and measured — see "First measured run" and "Third change" below. At 4K 
 13.3 ms: 65–70 base / 123–137 presented, 50% generated (the second session attributed this to the
 3090's render time; the third session showed it was the chain).
 
+
+## Host-memory contention: measured (2026-11-07, 21:33-21:40)
+
+Question: the bridge writes its payload into system memory and reads it back, so a 4K frame at
+38 fps is ~4.8 GB/s written + ~4.8 GB/s read of DRAM the game's own main thread is using. Does
+that cost frames, independent of PCIe?
+
+Method: `tools/bridge-load/` replays exactly that traffic on the 9060 with the same burst/idle
+shape, while the game runs alone on the 3090 (monitor cable moved to the 3090, windowed borderless
+2560x1440, no FG plugin loaded - both plugin logs predate the session). PresentMon 60 s per arm,
+five arms back to back with no analysis in between, camera untouched. D is the link saturated.
+
+| arm | load | fps | presents | p50 | p99 | 1% low | cpu | gpu |
+|---|---|---|---|---|---|---|---|---|
+| A4 | none | 93.0 | 10.76 | 10.72 | 11.77 | 85.0 | 10.69 | 8.61 |
+| B2 | 5.85 GB/s (77 MB @ 38) | 91.0 | 10.99 | 10.96 | 12.13 | 82.4 | 10.92 | 8.60 |
+| C2 | 11.7 GB/s (154 MB @ 38) | 89.3 | 11.20 | 11.16 | 12.37 | 80.8 | 11.13 | 8.55 |
+| D | 13.3 GB/s (77 MB unpaced) | 88.3 | 11.32 | 11.30 | 12.39 | 80.7 | 11.26 | 8.65 |
+| A5 | none | 92.7 | 10.78 | 10.75 | 11.72 | 85.3 | 10.72 | 8.65 |
+
+- **Drift is nil:** A4 -> A5 over 6.5 min is +0.2% (10.76 -> 10.78), and the p99 returns to 11.72.
+  The effect is the load, not the scene.
+- **It is all CPU.** GPU busy is flat across every arm (8.61 -> 8.65, +0.5%); CPU busy carries the
+  whole delta (+2.0% / +4.0% / +5.2%). More DRAM traffic does not make the frame heavier, it makes
+  the main thread slower.
+- **It is linear in GB/s:** ~0.34% of wall time per GB/s of bridge traffic (0.0034 ms of CPU time
+  per MB). At the mod's 4K operating point (126.6 MB x 2 x 38 fps = 9.6 GB/s) that is **~3.2% of
+  the frame, i.e. +0.85 ms on a 26.3 ms frame** - and still ~3% at 1440p, because the payload halves
+  while the frame rate doubles.
+- **The tail moves slightly more than the median:** p99 +3.1% at B and +5.1% at C, 1% low 85 -> 81.
+- **Threshold:** nothing breaks, but C dropped 0.4% of frames in the earlier pass and D is the only
+  arm where the load itself overran its period (29/3610 cycles, 0.8%).
+
+What it means for the mod: this cost is real but it only shows up when the game is CPU-bound. At 4K
+the 3090 is usually the limit (`render GPU: idle between frames` ~0), where ~0.85 ms of extra main
+thread time is absorbed by slack. Trimming payload for *memory-bus* reasons is not worth any image
+quality: dropping the HUD-less lane (-33 MB, 2.5 GB/s) buys ~0.23 ms, half-res depth ~0.16 ms. Trim
+payload for the **10.5 ms copy on the PCIe link**, which is a different and much larger cost.
+
+Caveats: one scene, one machine (quad-channel DDR4-3800; a dual-channel DDR4-2400 box would feel
+this several times over), CPU-bound at 93 fps rather than 38, composed presentation (1440p window on
+a 4K desktop, so no independent flip), FG not loaded.
+
+Also fixed: `presentmon-capture.ps1` used to read `AAAFrameGeneration.log` unconditionally and label
+every capture with whatever the last session wrote. It now prefers `MGPUScaling.log` and reports
+"no frame generation this session" when the log predates the game process - which is what all five
+arms above are.

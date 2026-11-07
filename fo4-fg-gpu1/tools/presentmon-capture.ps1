@@ -37,12 +37,33 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
 # What the running game really uses, from the plugin's log (truncated at every game start).
+# A log older than the game process belongs to an earlier session and describes nothing: the
+# plugin was renamed to MGPUScaling, so a stale AAAFrameGeneration.log is still on disk and
+# used to be read as if it were this run's configuration.
 function Get-FsrConfig {
-    $log = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'My Games\Fallout4\F4SE\AAAFrameGeneration.log'
-    if (-not (Test-Path $log)) { return "unknown (no AAAFrameGeneration.log)" }
+    $dir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'My Games\Fallout4\F4SE'
+    $exe = [IO.Path]::GetFileNameWithoutExtension($Process)
+    $game = Get-Process -Name $exe -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    $log = @('MGPUScaling.log', 'AAAFrameGeneration.log') |
+        ForEach-Object { Join-Path $dir $_ } |
+        Where-Object { Test-Path $_ } |
+        Sort-Object { (Get-Item $_).LastWriteTime } -Descending |
+        Select-Object -First 1
+    if (-not $log) { return "unknown (no MGPUScaling.log or AAAFrameGeneration.log)" }
+
+    $written = (Get-Item $log).LastWriteTime
+    if ($game -and $written -lt $game.StartTime) {
+        return ("no frame generation this session ({0} last written {1:HH:mm:ss}, game started {2:HH:mm:ss})" -f `
+                [IO.Path]::GetFileName($log), $written, $game.StartTime)
+    }
+
     $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
     $runtime = $lines | Where-Object { $_ -match '\[FSR\] runtime: ' } | Select-Object -Last 1
-    if (-not $runtime) { return "unknown (log has no [FSR] lines - older plugin build?)" }
+    if (-not $runtime) {
+        if ($game) { return ("no frame generation this session ({0} written {1:HH:mm:ss}, no [FSR] lines)" -f [IO.Path]::GetFileName($log), $written) }
+        return "unknown (log has no [FSR] lines - older plugin build?)"
+    }
     if ($runtime -match '1\.1\.4') { return "SDK 1.1.4: swap chain 3.1.4 + FG 3.1.4" }
     $inUse = $lines | Where-Object { $_ -match '\[FSR\] in use: swap chain (\S+) \+ frame generation (\S+)' } | Select-Object -Last 1
     if ($inUse -and $inUse -match 'swap chain (\S+) \+ frame generation (\S+)') { return "SDK 2.4: swap chain $($Matches[1]) + FG $($Matches[2])" }

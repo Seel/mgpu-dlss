@@ -62,7 +62,7 @@ void DX12SwapChain::CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, 
 		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 
 	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-			upscaling->settings.asyncUnpack, frameSlots))
+			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy))
 		return fallBack("cross-adapter bridge initialisation failed");
 
 	secondaryGPU = true;
@@ -94,6 +94,7 @@ void DX12SwapChain::TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing)
 {
 	auto upscaling = Upscaling::GetSingleton();
 	auto bridge = CrossAdapterBridge::GetSingleton();
+	const auto bridgeLock = bridge->LockFrame();  // ReleaseDirectCopyForExit waits for this
 	if (!secondaryGPU || !bridge->IsActive() || !upscaling->settings.earlyTransfer)
 		return;
 	if (!d3d11Context || !d3d11Fence || !d3d12Fence || !bridge->HasLanes(a_timing))
@@ -297,6 +298,32 @@ void DX12SwapChain::CreateInterop()
 	}
 }
 
+ID3D12Resource* DX12SwapChain::HudlessStandInFor(UINT a_slot)
+{
+	if (a_slot >= frameSlots || !d3d12Device || !swapChainBuffers[a_slot])
+		return nullptr;
+
+	if (!hudlessStandIn[a_slot]) {
+		D3D12_RESOURCE_DESC desc = swapChainBuffers[a_slot]->GetDesc();
+		// A plain texture: only ever a copy destination and a shader-read source.
+		desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+		desc.Alignment = 0;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+		const CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
+		const HRESULT hr = d3d12Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(hudlessStandIn[a_slot].put()));
+		if (FAILED(hr)) {
+			REX::CRITICAL("[FG-GPU1] bSendHudlessFrame=0: the stand-in colour texture could not be created (hr={:#010x})",
+				static_cast<std::uint32_t>(hr));
+			return nullptr;
+		}
+		REX::INFO("[FG-GPU1] bSendHudlessFrame=0: slot {} gets a {}x{} stand-in copy of the composed frame for FFX",
+			a_slot, desc.Width, desc.Height);
+	}
+	return hudlessStandIn[a_slot].get();
+}
+
 DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
 {
 	return swapChainProxy;
@@ -323,6 +350,8 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	// The whole frame's use of the bridge: ReleaseDirectCopyForExit (process exit, any thread) waits for it.
+	const auto bridgeLock = CrossAdapterBridge::GetSingleton()->LockFrame();
 	auto upscalingForUI = Upscaling::GetSingleton();
 
 	// The game's work for this frame is all recorded: timestamp its end on the render GPU.
@@ -456,6 +485,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			useFrameGenerationThisFrame = upscaling->settings.frameGenerationMode && main->gameActive && !menuBlock && !ui->movementToDirectionalCount;
 		}
 	}
+	// bDirectGPUCopy's guard tripped: the frames cross through system memory again, and frame generation
+	// stays off for the rest of the session so the change is impossible to miss (the log says why).
+	if (crossAdapter && bridge->DirectCopyTripped())
+		useFrameGenerationThisFrame = false;
+	// FSR SDK 1.1.4 under a back buffer an HDR add-on changed cannot be told the UI-free frame's
+	// format (FidelityFX::CreateContexts logged it): no frame generation, frames shown as rendered.
+	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 && !FidelityFX::GetSingleton()->hudlessFormatKnown)
+		useFrameGenerationThisFrame = false;
 
 	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG) {
 		auto dlssg = StreamlineFG::GetSingleton();

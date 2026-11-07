@@ -29,15 +29,19 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | `overlay/plugins/MGPUScaling/` | The plugin target (`AAAMGPUScaling.dll`): its entry point and settings code, and in `src/upscaler/` FO4Upscaling's Upscaling plugin in `namespace up` |
 | `overlay/plugins/FrameGeneration/src/` | The frame-generation part (changed upstream files plus the new second-GPU code); compiled into the same DLL |
 | `overlay/include/ffx2/` | FSR SDK 2.4 API, frame-generation and upscaler headers (unmodified, MIT), used for both FSR runtimes |
-| `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review (without the vendored SDK headers and licence text; the upscaler files show as copies of `plugins/Upscaling/src`) |
+| `overlay/include/vulkan/`, `overlay/include/vk_video/` | Khronos Vulkan headers 1.3.268 (unmodified, Apache-2.0 OR MIT), for `bDirectGPUCopy`; `vulkan-1.dll` is loaded at run time |
+| `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review (without the vendored SDK and Vulkan headers and licence text; the upscaler files show as copies of `plugins/Upscaling/src`) |
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
+| `tools/bridge-load/` | Standalone D3D12 load generator: replays the bridge's host-memory traffic (77 MB up + 77 MB down per frame) on one GPU, to A/B whether that traffic costs the game fps |
+| `tools/p2p-probe/` | Standalone test bed for `bDirectGPUCopy`: can the 3090 write into the 9060's VRAM, how fast in every direction, how the 9060's D3D12 can read it, does the block move under VRAM pressure, and the mod's per-frame sequence 300 times |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
 | `plans/` | Planned work not started yet: `UI-TILES.md` (freeze the HUD with a motion-vector mask, then send only the UI tiles of the finished frame), `DISPLAY-THREAD.md` (FFX Present on its own thread) |
 | `../.github/workflows/fo4-fg-gpu1.yml` | GitHub Actions build (seen from this folder) |
 
 The changes:
 - `CrossAdapterBridge.h/.cpp` are new: adapter choice, cross-adapter heaps and fences, the copy queue, unpacking, stats.
+- `PeerCopy.h/.cpp` are new: the 9060's Vulkan side of `bDirectGPUCopy` (CPU-visible VRAM blocks the 3090 writes into, the copy into D3D12 landing heaps, the shared fence).
 - `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU, and the conversion into a swap chain an HDR add-on changed (on the second GPU, or on the game's GPU in single-GPU mode).
 - `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` are small edits.
 - `plugins/MGPUScaling/src/upscaler/` is FO4Upscaling's `Upscaling` plugin, wrapped in `namespace up` (its classes have the same names as the frame-generation part's) and patched: upscale method 3 renders for the second GPU's FSR 4.1. Its entry point is `Upscaler.cpp`.
@@ -94,6 +98,7 @@ bEarlyTransfer = 1           ; 1 = depth/MVs/HUD-less cross during the frame (de
 bEarlyUnpack = 1             ; 1 = the 9060 reads them as they land, before Present (default); 0 = reads queued at Present
 iHalfResDepthMV = 1          ; 0 = full res; 1 = half-res depth, rebuilt on the 9060 (default); 2 = half-res depth + MVs
 bExtraFrameInFlight = 0      ; 1 = 3 frames in flight instead of 2: more throughput when the chain, not the 3090, limits; +1 frame latency (restart)
+bDirectGPUCopy = 0           ; 1 = EXPERIMENTAL: the 3090 writes straight into the 9060's VRAM, no system RAM; guarded (restart)
 iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
 iFSRRuntime = 1              ; 0 = FidelityFX SDK 1.1.4 (FSR 3.1.4); 1 = FSR SDK 2.4, newest provider offered (default)
 iFSRSwapChainProvider = 0    ; SDK 2.4: 0 = newest swap chain (4.0.0 on RX 9000); 1 = newest 3.x (3.1.7), for A/B
@@ -111,7 +116,10 @@ in both GPU1 and single-GPU FSR3 mode.
 `bSendHudlessFrame` is the "extra UI-free frame" switch. On (default) the 3090 sends a second copy
 of each frame with the HUD removed; FSR3 uses it so the HUD is not interpolated. Off removes that
 copy from the PCIe budget (~25% less traffic at 4K) but the HUD is then interpolated with the scene
-and smears a little during camera movement.
+and smears a little during camera movement. With FSR 4.1 on the second GPU there is no second copy
+(the upscale result is the UI-free frame), so the switch only decides what frame generation is given:
+off hands it a copy of the composed frame instead, and the HUD is interpolated with the scene — see
+[FSR 4.1 upscaling on the second GPU](#fsr-41-upscaling-on-the-second-gpu).
 
 `bAsyncUnpack` changes how the 9060 reads what arrives. On (default) it reads on its own copy
 queue and starts on each buffer (final frame, HUD-less, depth, motion vectors) as soon as that
@@ -327,9 +335,15 @@ How a frame goes:
 | Present | 9060 | the UI is composited over the FSR 4.1 result (the 9060 rebuilds the same stretch, keeps what the UI changed); frame generation gets the FSR 4.1 result as its UI-free frame |
 
 Payload at 4K Quality: 14.75 MB scene + 14.75 MB depth + 14.75 MB motion vectors + 33.2 MB finished
-frame ≈ **77 MB/frame** (126.6 MB at native 4K). `iHalfResDepthMV` and `bSendHudlessFrame = 0`
-are ignored in this mode. AMD lists FSR 4.1 at ~3.4 ms on a 9060 XT at 4K; a probe on this PC
-measured 3.3 ms.
+frame ≈ **77 MB/frame** (126.6 MB at native 4K). `iHalfResDepthMV` is ignored here (depth and motion
+vectors already cross at the render resolution). `bSendHudlessFrame = 0` is not ignored: frame
+generation is then handed a copy of the composed frame instead of the FSR 4.1 result, so the HUD is
+interpolated with the scene, and `bFreezeHudMotionVectors` zeroes the motion vectors under the HUD to
+hold it still. With the UI-free frame on, that switch only freezes the scene behind the HUD (visible
+through translucent HUD parts), because the HUD itself is composited after generation. The copy is a
+plain GPU copy into an RGBA8 texture, so it needs an RGBA8 back buffer: under an HDR add-on the
+frame is shown without frame generation instead (logged), not black. AMD lists FSR 4.1 at ~3.4 ms on
+a 9060 XT at 4K; a probe on this PC measured 3.3 ms.
 
 Menus the upscaler renders natively (Pip-Boy, containers, loading) are shown as rendered, without
 frame generation. If anything is missing (another `Upscaling.dll` installed, SDK 1.1.4, no FSR 4
@@ -387,8 +401,9 @@ second-GPU feature and is not involved; the upscaler on the game's GPU (`iUpscal
 UI-free frame's format; the log warns.
 
 Limits: this needs `iFSRRuntime = 1`. The 1.1.4 runtime cannot be told that the UI-free frame stays
-RGBA8, so under an HDR back buffer it is not given one (logged as an error) and interpolates the
-back buffer with its UI: the HUD may smear in generated frames. **Change HDR settings
+RGBA8, so under an HDR back buffer frame generation stays off for the session (logged as an error;
+the picture is right, just not doubled). Giving FFX no UI-free frame instead leaves it without a
+scene (black screen, seen while testing `bSendHudlessFrame = 0`). **Change HDR settings
 only with the game closed**: toggling HDR in the AutoHDR overlay resizes the swap chain behind FFX
 and this plugin, which cannot see it (ReShade hides the format change), so expect a wrong picture
 until a restart. ReShade
@@ -431,6 +446,94 @@ input and screen (~14 ms at 71 fps), and one more slot of every lane (~75 MB of 
 ~75 MB on each GPU at 4K Quality). Worth it when `render GPU: idle between frames` shows the 3090
 waiting several ms per frame below the frame cap; useless when the 3090 itself is at its limit.
 
+### Host-memory cost
+
+The payload is not just PCIe traffic. Every byte is written to system memory by the render GPU's
+copy engine and read back out by the display GPU's, so a 4K frame at 38 fps is ~4.8 GB/s written
+and ~4.8 GB/s read — DRAM the game's own thread is also using. D3D12's own route makes that unavoidable:
+[cross-adapter resources "are only supported in system memory"](https://learn.microsoft.com/en-us/windows/win32/direct3d12/shared-heaps),
+in `D3D12_MEMORY_POOL_L0`. No Windows API offers a peer-to-peer transfer between GPUs of different
+vendors (CUDA's peer access does not exist under WDDM, AMD's DirectGMA was workstation-only and is
+gone), but one works anyway on this PC: see [Direct GPU-to-GPU copy](#direct-gpu-to-gpu-copy-bdirectgpucopy-experimental).
+
+`tools/bridge-load/` replays exactly that traffic on one GPU with the same burst-then-gap timing,
+so the question can be answered with the mod out of the loop: run the game on the 3090, run the
+tool on the 9060, compare `msBetweenPresents`, 1% low and average fps at 77 MB and at 154 MB per
+frame. Measured on this PC it does 13.3 GB/s unpaced (5.7 ms up, 5.9 ms down per 77 MB) and 44%
+duty at 38 Hz. For other settings, payload MB × game fps × 2 ≈ GB/s of DRAM traffic.
+
+## Direct GPU-to-GPU copy (`bDirectGPUCopy`, experimental)
+
+Off by default. With it on, the 3090 writes each lane **straight into the 9060's VRAM**: one PCIe
+trip instead of two, and none of the payload touches system RAM.
+
+How: the 9060 has Resizable BAR on, so its whole VRAM can be mapped for the CPU. A small Vulkan
+device on the 9060 (`PeerCopy`) allocates one such block per lane and maps it; the 3090's D3D12
+device opens that CPU address with `OpenExistingHeapFromAddress` as if it were system memory, and
+its copy engine's writes then go over PCIe to the 9060. No driver documents this; both simply
+accept the address. The 9060's D3D12 device (FFX) cannot see Vulkan's block on Windows 10, so the
+9060's Vulkan copies each lane from the block into a D3D12 heap it imported (local VRAM, ~150 GB/s,
+~0.2 ms for the 33 MB finished frame), and the usual unpack reads from there. A D3D12 fence imported
+into Vulkan as a timeline semaphore orders the two per lane: the copy queue signals "landed" once
+the 3090's transfer fence passes, Vulkan copies and signals "copied", the copy queue unpacks.
+
+| 77 MB FSR 4.1 payload (p2p-probe `--bench`) | system memory | direct |
+|---|---|---|
+| 3090 copy engine | 5.9 ms (13.2 GB/s) | 7.6 ms (10.2 GB/s) |
+| 9060 read | 5.6 ms (across PCIe) | ~0.5 ms (local) |
+| finished frame, last on the chain | 2.52 + 2.41 = 4.9 ms | 3.24 + ~0.2 = ~3.5 ms |
+| system RAM traffic | 154 MB per frame | none |
+
+So about 1.4 ms off the end of the chain, plus the system RAM contention (~3% of frame time when
+the game is CPU-bound, see [Host-memory cost](#host-memory-cost)). The 3090's copy engine is busier
+(card-to-card writes run ~23% slower than writes to RAM on X299), but it runs beside rendering. Each
+step was tried first with `tools/p2p-probe` on this PC, including the mod's per-frame sequence 300
+times with the 9060's work queued before the 3090 writes (0 wrong frames).
+
+**Guard.** The danger is the 9060's driver moving a block while the 3090 still writes to its old
+address. Under 19.5 GB of VRAM pressure on the 16 GB card the blocks did not move (`--evict`), and
+they get Vulkan's highest memory priority; the guard covers the rest. The 3090 writes a check value
+(the lane's transfer number) behind each lane's data; at every frame start the CPU reads the values
+of the copies that finished, through the block's CPU mapping, which follows the block wherever the
+driver keeps it (one uncached read per lane, ~1–2 µs). If a value is missing where the 3090 wrote it,
+or a Vulkan submission fails, the frames go back through system memory from the next frame on
+(those heaps stay allocated for this) and **frame generation is switched off for the rest of the
+session**, so it cannot go unnoticed:
+
+```
+[FG-GPU1] direct GPU copy guard: lane 'final frame' slot 1: the render GPU wrote check value ... into the display GPU's VRAM block, but the block holds ... Frames cross through system memory from the next frame on and frame generation is OFF for the rest of the session. ...
+```
+
+**At exit.** The 3090's view of a block must close before the block is freed, and both while the
+drivers are still loaded: the first build did it the other way round in its destructors, after the
+drivers had begun unloading, and the PC hung on Alt+F4. The plugin now hooks the two ways a process
+ends, `ntdll!RtlExitUserProcess` (behind `ExitProcess` and the CRT's `exit`) and
+`kernelbase!TerminateProcess` (Fallout4.exe imports both). There it waits up to 2 s for the copies in
+flight, closes the 3090's views, then frees the blocks, and logs it. The render thread holds a lock
+for each frame's bridge work, so this never lands mid-frame. The hooks are only installed when the
+entry points start with known prologue instructions (the detour library cannot relocate RIP-relative
+ones); if they cannot be installed, the direct copy stays off. After the plugin's own DLL detach
+has begun, nothing calls into the Vulkan driver any more.
+
+Needs `bAsyncUnpack = 1`, Resizable BAR (Smart Access Memory) on the 9060 and its Vulkan driver.
+If any of it is missing, or any setup step fails, the log says which and the frames go through
+system memory as before, with frame generation unaffected. Costs ~2× the payload × frames in flight
+of extra VRAM on the 9060 (block + landing heap; ~460 MB at 4K FSR 4.1 Quality with 3 frames in
+flight). Not tested: sleep/resume or a driver reset while the game runs.
+
+```
+[Frame Generation] bDirectGPUCopy: true (...)
+[FG-GPU1] direct GPU copy: Vulkan 1.4.x on "AMD Radeon RX 9060 XT", async compute queue (family 1), memory priority on, timestamps on
+[FG-GPU1] bridge ready: render GPU copy queue -> the display GPU's VRAM, directly (bDirectGPUCopy=1) -> display GPU copy queue, lane by lane (bAsyncUnpack=1)
+[FG-GPU1] direct GPU copy: lane 'final frame': 95.1 MB VRAM block (CPU-visible, mapped at 0x...) + 95.1 MB landing heap on the display GPU
+[FG-GPU1] lane[0] 'final frame' 3840x2160 ... (direct to the display GPU's VRAM)
+...every 10 s:
+[FG-GPU1] direct GPU copy: 660/660 frames into the display GPU's VRAM | its Vulkan copy into the landing heaps (async compute queue) avg 0.5 ms ... | check values found 2640 (late 0)
+```
+
+(Expected lines, not a capture.) The 10 s line's `copy on render GPU` then shows the card-to-card
+rate (~10 GB/s), and `display GPU: unpack` the local copy out of the landing heap.
+
 ## Known risks / first things to check
 
 - **FSR SDK 2.4 has had one in-game run.** At 4K it used swap chain 4.0.0 + FSR 3.1.6, doubled
@@ -439,6 +542,7 @@ waiting several ms per frame below the frame cap; useless when the 3090 itself i
   `[FSR] generating a frame failed`, stutter, a crash), set `iFSRRuntime = 0` to go back to
   exactly the previous behaviour.
 
+- **`bDirectGPUCopy` is new.** First in-game run (2026-11-08, CS, ReShade AutoHDR, FSR 4.1 Quality, 3 frames in flight): every frame crossed directly at the 70.9 fps cap, check values never late, but **Alt+F4 hung the PC** (no bugcheck, power button). The first build freed the 9060's VRAM blocks in its destructors, after the drivers had started unloading and while the 3090 still had them open. The current build releases them in the right order before anything unloads (see "At exit" in [Direct GPU-to-GPU copy](#direct-gpu-to-gpu-copy-bdirectgpucopy-experimental)); `tools/p2p-probe --exit-gpu` checks that with copies in flight. Not yet re-tested in game: after quitting, the log should end with `direct GPU copy: the game is exiting; closed the render GPU's views ...`. If frame generation turns itself off, look for `direct GPU copy guard`; for anything else odd, set it back to 0. It creates a Vulkan instance in the game process with implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~` while it is created), so overlays' Vulkan layers stay out.
 - **Cross-adapter heap 3090 → 9060 XT.** MGPU Bridge proved AMD → NVIDIA. This direction should work the same way, and if it fails the code tries the reverse automatically. If both fail, the log shows the HRESULT and frame generation stays on the 3090.
 - **A failure after startup is not recovered.** Once the bridge is up, the first failed HRESULT — including the 2 s timeout waiting for the previous frame's copy if the secondary GPU's queue stalls — disables the transport for the rest of the session. `secondaryGPU` stays selected, so the game keeps running but no new frame reaches the screen (`CRITICAL [FG-GPU1] transport is down`). Restart the game; there is no automatic single-GPU fallback after this point.
 - **HDR add-ons are followed at startup only.** A swap-chain format set while FFX creates it is handled (previous section); one changed later (HDR toggled in game) is not seen and needs a restart. The finished-frame copy refuses formats it cannot copy into (it used to compare only size and row pitch, which 8-bit and 10-bit share), so if the conversion is not set up for some reason the screen stays black and the log has `lane 'final frame' is ... format 28 but its destination is ... format 24; skipping the copy`. In single-GPU mode a conversion that could not be set up is logged as an `[FG]` error and the plain copy stays (wrong colours, as before this version).

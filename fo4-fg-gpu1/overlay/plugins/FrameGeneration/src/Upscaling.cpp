@@ -1,5 +1,9 @@
 #include "Upscaling.h"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include <d3dcompiler.h>
 
 #include "CrossAdapterBridge.h"
@@ -8,6 +12,29 @@
 #include "FidelityFX.h"
 #include "SecondaryUpscale.h"
 #include "MGPUScaling.h"
+
+// --- HUD motion-vector freeze test (branch test/mv-freeze-hud-bars) -----------------------
+// Rectangles in display (swap chain) pixels, measured on a 3840x2160 screen: the health bar
+// and the AP bar below it. Their motion vectors, plus a margin, are zeroed before the lane
+// crosses so frame generation has nothing to move there. The rectangles are converted with the
+// motion-vector lane's own scale against the swap chain, so they follow the render resolution
+// (4K -> 2560x1440 at Quality, i.e. 2/3: 63,2051 602x17 -> 42,1367 402x12 and
+// 63,2093 602x13 -> 42,1395 402x9).
+namespace
+{
+	struct HudFreezeRect
+	{
+		float x, y, w, h;
+	};
+
+	constexpr HudFreezeRect kHudFreezeRects[] = {
+		{ 63.0f, 2051.0f, 602.0f, 17.0f },
+		{ 63.0f, 2093.0f, 602.0f, 13.0f },
+	};
+	constexpr int kHudFreezeMargin = 2;  // motion-vector texels on every side
+	constexpr UINT kHudFreezeZeroWidth = 1024;
+	constexpr UINT kHudFreezeZeroHeight = 64;
+}
 
 enum class RenderTarget
 {
@@ -145,6 +172,7 @@ void Upscaling::LoadSettings()
 	else
 		settings.sendHudlessFrame = ini.GetBoolValue(section, "bTransportHudLess", true);
 	settings.asyncUnpack = ini.GetBoolValue(section, "bAsyncUnpack", true);
+	settings.freezeHudMotionVectors = ini.GetBoolValue(section, "bFreezeHudMotionVectors", true);
 	settings.earlyTransfer = ini.GetBoolValue(section, "bEarlyTransfer", true);
 	settings.earlyUnpack = ini.GetBoolValue(section, "bEarlyUnpack", true);
 	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue(section, "iHalfResDepthMV", 1)), 0, 2);
@@ -152,6 +180,7 @@ void Upscaling::LoadSettings()
 	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
 	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
 	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
+	settings.directGpuCopy = ini.GetBoolValue(section, "bDirectGPUCopy", false);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -163,6 +192,7 @@ void Upscaling::LoadSettings()
 			settings.secondaryGPU, settings.secondaryGPUName);
 		REX::INFO("[Frame Generation] bSendHudlessFrame: {} (extra UI-free frame; off = less PCIe, HUD smears)",
 			settings.sendHudlessFrame);
+		REX::INFO("[Frame Generation] bFreezeHudMotionVectors (test): {}", settings.freezeHudMotionVectors);
 		REX::INFO("[Frame Generation] bAsyncUnpack: {} (secondary GPU unpacks on a copy queue as each buffer arrives)",
 			settings.asyncUnpack);
 		REX::INFO("[Frame Generation] bEarlyTransfer: {} (depth/MVs/HUD-less cross during the frame, not at Present)",
@@ -177,6 +207,9 @@ void Upscaling::LoadSettings()
 			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
 		REX::INFO("[Frame Generation] bExtraFrameInFlight: {} (second-GPU mode: 3 frames in flight instead of 2, +1 frame latency)",
 			settings.extraFrameInFlight);
+		REX::INFO("[Frame Generation] bDirectGPUCopy: {} (second-GPU mode, experimental: the render GPU writes straight into "
+				  "the display GPU's VRAM instead of through system memory)",
+			settings.directGpuCopy);
 		loggedOnce = true;
 	}
 }
@@ -226,7 +259,8 @@ void Upscaling::CreateFrameGenerationResources()
 	// upscaler needs the scene, so it is always sent then.
 	hudlessActive = settings.sendHudlessFrame || secondaryUpscaleLanes;
 	if (secondaryUpscaleLanes && !settings.sendHudlessFrame)
-		REX::INFO("[FSR4] bSendHudlessFrame = 0 is ignored: the second GPU upscales the UI-free scene");
+		REX::INFO("[FSR4] bSendHudlessFrame = 0 (test branch): FFX gets a copy of the composed frame as its UI-free input, "
+				  "so the HUD is interpolated with the scene unless its motion vectors are frozen");
 	const UINT halfWidth = (laneWidth + 1) / 2;
 	const UINT halfHeight = (laneHeight + 1) / 2;
 	int sceneLane = -1;
@@ -592,8 +626,107 @@ void Upscaling::PostAlpha()
 		context->CSSetShader(shader, nullptr, 0);
 	}
 
+	// Test: the HUD bars' motion vectors are zeroed before the lane crosses (see
+	// ZeroHudMotionVectors); this is the last write to the motion-vector lane each frame.
+	ZeroHudMotionVectors(context);
+
 	// Depth and motion vectors are final now: start their PCIe copy instead of waiting for Present.
 	dx12SwapChain->TransferEarlyLanes(CrossAdapterBridge::LaneTiming::kWorld);
+}
+
+void Upscaling::ZeroHudMotionVectors(ID3D11DeviceContext* a_context)
+{
+	if (!settings.freezeHudMotionVectors)
+		return;
+
+	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	auto& shared = motionVectorBufferShared[dx12SwapChain->frameIndex];
+	if (!a_context || !shared || !shared->resource)
+		return;
+
+	const auto& sc = dx12SwapChain->swapChainDesc;
+	D3D11_TEXTURE2D_DESC mvDesc{};
+	shared->resource->GetDesc(&mvDesc);
+	if (!sc.Width || !sc.Height || !mvDesc.Width || !mvDesc.Height)
+		return;
+
+	if (mvDesc.Format != DXGI_FORMAT_R16G16_FLOAT) {
+		if (!mvFreezeLogged) {
+			mvFreezeLogged = true;
+			REX::WARN("[FG-GPU1] HUD motion-vector freeze: the motion-vector lane is format {}, not R16G16_FLOAT; nothing is zeroed",
+				static_cast<int>(mvDesc.Format));
+		}
+		return;
+	}
+
+	if (!mvFreezeZeroTexture) {
+		ID3D11Device* device = nullptr;
+		shared->resource->GetDevice(&device);
+		if (!device)
+			return;
+
+		D3D11_TEXTURE2D_DESC zeroDesc{};
+		zeroDesc.Width = kHudFreezeZeroWidth;
+		zeroDesc.Height = kHudFreezeZeroHeight;
+		zeroDesc.MipLevels = 1;
+		zeroDesc.ArraySize = 1;
+		zeroDesc.Format = mvDesc.Format;
+		zeroDesc.SampleDesc.Count = 1;
+		zeroDesc.Usage = D3D11_USAGE_DEFAULT;
+
+		const HRESULT hr = device->CreateTexture2D(&zeroDesc, nullptr, mvFreezeZeroTexture.put());
+		device->Release();
+		if (FAILED(hr)) {
+			REX::WARN("[FG-GPU1] HUD motion-vector freeze: the zero texture could not be created (hr={:#010x})",
+				static_cast<std::uint32_t>(hr));
+			return;
+		}
+
+		// Once, never again: R16G16_FLOAT is 4 bytes a texel.
+		const UINT rowPitch = kHudFreezeZeroWidth * 4;
+		std::vector<std::uint8_t> zeros(static_cast<size_t>(rowPitch) * kHudFreezeZeroHeight, 0);
+		a_context->UpdateSubresource(mvFreezeZeroTexture.get(), 0, nullptr, zeros.data(), rowPitch,
+			rowPitch * kHudFreezeZeroHeight);
+	}
+
+	// The lane holds the render-resolution image, so a display pixel maps by the lane's own scale
+	// (4K -> 2560x1440 is 2/3, which turns 63,2051 602x17 into 42,1367 402x12).
+	const float sx = static_cast<float>(mvDesc.Width) / static_cast<float>(sc.Width);
+	const float sy = static_cast<float>(mvDesc.Height) / static_cast<float>(sc.Height);
+
+	for (size_t i = 0; i < ARRAYSIZE(kHudFreezeRects); ++i) {
+		const auto& r = kHudFreezeRects[i];
+
+		// Outward rounding so the whole rectangle is covered, then the margin for the AA edge.
+		int x0 = static_cast<int>(std::floor(r.x * sx)) - kHudFreezeMargin;
+		int y0 = static_cast<int>(std::floor(r.y * sy)) - kHudFreezeMargin;
+		int x1 = static_cast<int>(std::ceil((r.x + r.w) * sx)) + kHudFreezeMargin;
+		int y1 = static_cast<int>(std::ceil((r.y + r.h) * sy)) + kHudFreezeMargin;
+
+		x0 = (std::max)(0, x0);
+		y0 = (std::max)(0, y0);
+		x1 = (std::min)(x1, static_cast<int>(mvDesc.Width));
+		y1 = (std::min)(y1, static_cast<int>(mvDesc.Height));
+
+		const UINT w = x1 > x0 ? static_cast<UINT>(x1 - x0) : 0;
+		const UINT h = y1 > y0 ? static_cast<UINT>(y1 - y0) : 0;
+		if (!w || !h)
+			continue;
+		if (w > kHudFreezeZeroWidth || h > kHudFreezeZeroHeight) {
+			REX::WARN("[FG-GPU1] HUD motion-vector freeze: rect {} is {}x{} lane texels, larger than the zero texture; skipped", i, w, h);
+			continue;
+		}
+
+		const D3D11_BOX srcBox{ 0, 0, 0, w, h, 1 };
+		a_context->CopySubresourceRegion(shared->resource.get(), 0, static_cast<UINT>(x0), static_cast<UINT>(y0), 0,
+			mvFreezeZeroTexture.get(), 0, &srcBox);
+
+		if (!mvFreezeLogged)
+			REX::INFO("[FG-GPU1] HUD motion-vector freeze: rect {} display ({}, {}) {}x{} -> lane ({}, {}) {}x{} of {}x{}",
+				i, r.x, r.y, r.w, r.h, x0, y0, w, h, mvDesc.Width, mvDesc.Height);
+	}
+
+	mvFreezeLogged = true;
 }
 
 void Upscaling::CopyBuffersToSharedResources()
@@ -641,6 +774,9 @@ void Upscaling::CopyBuffersToSharedResources()
 		ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
 		context->CSSetShader(nullptr, nullptr, 0);
+
+		// Test: zero the HUD bars' motion vectors in the shared lane.
+		ZeroHudMotionVectors(context);
 		return;
 	}
 
@@ -652,6 +788,10 @@ void Upscaling::CopyBuffersToSharedResources()
 	} else {
 		context->CopyResource(motionVectorBufferShared[dx12SwapChain->frameIndex]->resource.get(), reinterpret_cast<ID3D11Texture2D*>(motionVector.texture));
 	}
+
+	// Test: zero the HUD bars' motion vectors in the shared lane (the path for frames whose
+	// post-alpha copy does not run).
+	ZeroHudMotionVectors(context);
 
 	{
 		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];

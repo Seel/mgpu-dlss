@@ -27,6 +27,10 @@ public:
 		bool secondaryGPU = false;       ///< Run FSR3 FG and present on a second GPU (the one driving the monitor)
 		std::string secondaryGPUName;    ///< Optional: substring of the secondary GPU's name, if auto-selection is ambiguous
 		bool sendHudlessFrame = true;    ///< Send the extra UI-free frame (off = less PCIe, HUD smears)
+		// Test (branch test/mv-freeze-hud-bars): zero the motion vectors under the HUD bars so
+		// frame generation holds them still. Re-read with the other settings, so it can be
+		// flipped in the ini while the game runs.
+		bool freezeHudMotionVectors = true;
 		bool asyncUnpack = true;         ///< Secondary GPU unpacks on a copy queue, lane by lane (off = on the direct queue)
 		bool earlyTransfer = true;       ///< Copy depth/MVs/HUD-less at their frame hooks, not at Present
 		bool earlyUnpack = true;         ///< ...and queue the display GPU's read of them there too
@@ -35,6 +39,7 @@ public:
 		int fsrSwapChainProvider = 0;    ///< SDK 2.4 only: 0 newest offered, 1 newest 3.x (A/B against 4.0.0 pacing)
 		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
 		bool extraFrameInFlight = false; ///< Second-GPU mode: 3 swap-chain buffers instead of 2 (FrameSlots.h); restart
+		bool directGpuCopy = false;      ///< Second-GPU mode: the render GPU writes into the display GPU's VRAM (PeerCopy.h); restart
 	};
 
 	Settings settings;
@@ -91,6 +96,10 @@ public:
 	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[kMaxFrameSlots];
 	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[kMaxFrameSlots];
 
+	// Test: the all-zero texture ZeroHudMotionVectors copies from, and its one-time log flag.
+	winrt::com_ptr<ID3D11Texture2D> mvFreezeZeroTexture;
+	bool mvFreezeLogged = false;
+
 	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
 	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
 	ID3D11ComputeShader* generateUIBufferCS = nullptr;
@@ -112,6 +121,9 @@ public:
 	void PreAlpha();
 	void PostAlpha();
 	void CopyBuffersToSharedResources();
+	// Test (branch test/mv-freeze-hud-bars): zero the motion vectors under the HUD rectangles so
+	// frame generation holds those pixels still. Rectangles are in display (swap chain) pixels.
+	void ZeroHudMotionVectors(ID3D11DeviceContext* a_context);
 	void GenerateUIBuffer();
 
 	static void TimerSleepQPC(int64_t targetQPC);

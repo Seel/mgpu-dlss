@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <format>
 
 namespace
 {
@@ -107,6 +109,105 @@ namespace
 	{
 		return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1000.0 /
 		       static_cast<double>(a_frequency.QuadPart);
+	}
+
+	// ---- bDirectGPUCopy: process-exit hooks --------------------------------------------------
+	//
+	// The render GPU's heaps on the display GPU's VRAM blocks must be closed while both drivers are still
+	// loaded and before the blocks go. At DLL_PROCESS_DETACH the drivers (loaded after this DLL) have
+	// already been detached, and TerminateProcess runs no detach at all. So the two ways a process ends
+	// are hooked: ntdll!RtlExitUserProcess (behind ExitProcess and the CRT's exit) and
+	// kernelbase!TerminateProcess. Fallout4.exe imports both.
+
+	using ExitUserProcessFn = void(NTAPI*)(LONG);
+	using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
+	ExitUserProcessFn exitUserProcessOriginal = nullptr;
+	TerminateProcessFn terminateProcessOriginal = nullptr;
+
+	void NTAPI ExitUserProcessHook(LONG a_status)
+	{
+		CrossAdapterBridge::GetSingleton()->ReleaseDirectCopyForExit("the game is exiting");
+		exitUserProcessOriginal(a_status);
+	}
+
+	BOOL WINAPI TerminateProcessHook(HANDLE a_process, UINT a_exitCode)
+	{
+		if (a_process == GetCurrentProcess() || GetProcessId(a_process) == GetCurrentProcessId())
+			CrossAdapterBridge::GetSingleton()->ReleaseDirectCopyForExit("the game is terminating itself");
+		return terminateProcessOriginal(a_process, a_exitCode);
+	}
+
+	// The detour library copies the entry's first instructions (a 5-byte jump's worth) into its trampoline
+	// without fixing RIP-relative ones. Only hook an entry whose first instructions are ones known not to
+	// be relative: the usual prologue forms. (Win10 19045: RtlExitUserProcess starts push rbx / sub rsp,
+	// TerminateProcess mov [rsp+8],rbx.) Anything else: no hook, and then no direct copy.
+	size_t PrologueInstructionLength(const std::uint8_t* a_code)
+	{
+		const std::uint8_t b0 = a_code[0];
+		const std::uint8_t b1 = a_code[1];
+		const std::uint8_t b2 = a_code[2];
+		if (b0 >= 0x50 && b0 <= 0x57)
+			return 1;  // push r64
+		if ((b0 == 0x40 || b0 == 0x41) && b1 >= 0x50 && b1 <= 0x57)
+			return 2;  // push r64 with REX
+		if (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC)
+			return 4;  // sub rsp, imm8
+		if (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC)
+			return 7;  // sub rsp, imm32
+		if ((b0 == 0x48 || b0 == 0x4C) && b1 == 0x89 && (b2 & 0xC7) == 0x44 && a_code[3] == 0x24)
+			return 5;  // mov [rsp+disp8], r64
+		if ((b0 & 0xF0) == 0x40 && (b1 == 0x8B || b1 == 0x89) && (b2 & 0xC0) == 0xC0)
+			return 3;  // mov r64, r64
+		if ((b0 == 0x8B || b0 == 0x89) && (b1 & 0xC0) == 0xC0)
+			return 2;  // mov r32, r32
+		return 0;
+	}
+
+	bool SafeToDetour(std::uintptr_t a_entry)
+	{
+		if (stl::detail::HookedEntryTarget(a_entry))
+			return true;  // another hook's jump: DetourOrChain chains behind it, nothing is copied
+		const auto* code = reinterpret_cast<const std::uint8_t*>(a_entry);
+		size_t covered = 0;
+		while (covered < 5) {
+			const size_t length = PrologueInstructionLength(code + covered);
+			if (!length)
+				return false;
+			covered += length;
+		}
+		return true;
+	}
+
+	bool InstallExitHooks()
+	{
+		static bool installed = false;
+		if (installed)
+			return true;
+		const auto exitEntry = reinterpret_cast<std::uintptr_t>(
+			GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess"));
+		const auto terminateEntry = reinterpret_cast<std::uintptr_t>(
+			GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "TerminateProcess"));
+		if (!exitEntry || !terminateEntry) {
+			REX::ERROR("[FG-GPU1] direct GPU copy: RtlExitUserProcess / TerminateProcess not found");
+			return false;
+		}
+		for (const auto entry : { exitEntry, terminateEntry }) {
+			if (!SafeToDetour(entry)) {
+				const auto* code = reinterpret_cast<const std::uint8_t*>(entry);
+				REX::ERROR("[FG-GPU1] direct GPU copy: cannot hook the process exit safely on this Windows build (entry at "
+						   "{:#x} starts {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X})",
+					entry, code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
+				return false;
+			}
+		}
+		exitUserProcessOriginal = reinterpret_cast<ExitUserProcessFn>(stl::detail::DetourOrChain(exitEntry,
+			reinterpret_cast<std::uintptr_t>(&ExitUserProcessHook), "RtlExitUserProcess"));
+		terminateProcessOriginal = reinterpret_cast<TerminateProcessFn>(stl::detail::DetourOrChain(terminateEntry,
+			reinterpret_cast<std::uintptr_t>(&TerminateProcessHook), "TerminateProcess"));
+		installed = exitUserProcessOriginal && terminateProcessOriginal;
+		if (!installed)
+			REX::ERROR("[FG-GPU1] direct GPU copy: hooking the process exit failed");
+		return installed;
 	}
 
 	const char* TimingName(CrossAdapterBridge::LaneTiming a_timing)
@@ -475,7 +576,8 @@ void CrossAdapterBridge::GpuTimer::Reset() noexcept
 // Setup
 
 bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots)
+	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
+	bool a_directCopy)
 {
 	Shutdown();
 	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
@@ -587,7 +689,44 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 	QueryPerformanceFrequency(&qpcFrequency);
 	QueryPerformanceCounter(&statLastLog);
 
-	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> {}",
+	// bDirectGPUCopy: the display GPU's Vulkan side, and the check values A writes behind each lane.
+	// Lanes get their blocks in AddLane; any failure there turns the direct copy off for the session.
+	if (a_directCopy) {
+		if (!asyncUnpack) {
+			REX::WARN("[FG-GPU1] bDirectGPUCopy needs bAsyncUnpack = 1; frames cross through system memory");
+		} else if (peer.Initialize(deviceB.get(), slotCount)) {
+			D3D12_HEAP_PROPERTIES uploadProps{};
+			uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+			D3D12_RESOURCE_DESC uploadDesc{};
+			uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			uploadDesc.Width = kCheckStride * kMaxLanes * kSlots;
+			uploadDesc.Height = 1;
+			uploadDesc.DepthOrArraySize = 1;
+			uploadDesc.MipLevels = 1;
+			uploadDesc.SampleDesc.Count = 1;
+			uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			HRESULT hr = deviceA->CreateCommittedResource(&uploadProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(checkUploadA.put()));
+			if (SUCCEEDED(hr))
+				hr = checkUploadA->Map(0, nullptr, reinterpret_cast<void**>(&checkCpu));
+			if (FAILED(hr)) {
+				REX::ERROR("[FG-GPU1] direct GPU copy: the check-value buffer failed (hr={:#010x}); frames cross through "
+						   "system memory instead",
+					static_cast<std::uint32_t>(hr));
+				DisableDirectCopy();
+			} else if (!InstallExitHooks()) {
+				// Without a clean release at exit the render GPU would still hold the blocks when Windows
+				// tears the process down; that is what hung the PC on Alt+F4 with the first build.
+				REX::ERROR("[FG-GPU1] direct GPU copy: no safe release at exit; frames cross through system memory instead");
+				DisableDirectCopy();
+			} else {
+				directCopy = true;
+			}
+		}
+	}
+
+	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> {} -> {}",
+		directCopy ? "the display GPU's VRAM, directly (bDirectGPUCopy=1)" : "cross-adapter heap in system memory",
 		asyncUnpack ? "display GPU copy queue, lane by lane (bAsyncUnpack=1)" :
 					  "display GPU direct queue, after the whole transfer (bAsyncUnpack=0)");
 	return true;
@@ -655,7 +794,10 @@ int CrossAdapterBridge::AddLane(const char* a_name, const std::array<ID3D12Resou
 	}
 	lane.footprint = footprintA;
 	lane.bytes = totalA;
-	lane.slotStride = AlignUp(totalA, kHeapAlignment);
+	// bDirectGPUCopy: room for the check value behind the data. Both paths use the same layout, so a
+	// frame can cross either way.
+	lane.checkOffset = AlignUp(totalA, kCheckStride);
+	lane.slotStride = AlignUp(directCopy ? lane.checkOffset + kCheckStride : totalA, kHeapAlignment);
 
 	const UINT64 heapSize = lane.slotStride * slotCount;
 	HRESULT hr = CreateSharedHeapPair(heapSize, lane.heapA, lane.heapB);
@@ -704,14 +846,220 @@ int CrossAdapterBridge::AddLane(const char* a_name, const std::array<ID3D12Resou
 		}
 	}
 
+	// bDirectGPUCopy: the lane's block in B's VRAM. A lane that cannot have one turns the direct copy
+	// off for every lane (a frame crosses one way or the other as a whole).
+	if (directCopy && !AddDirectLane(lane, heapSize))
+		DisableDirectCopy();
+
 	bytesPerFrame += lane.bytes;
-	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total) timing={}{}",
+	REX::INFO("[FG-GPU1] lane[{}] '{}' {}x{} format={} pitch={} bytes={} ({:.1f} MB/frame total) timing={}{}{}",
 		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
 		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
-		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)");
+		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)",
+		lane.peerLane >= 0 ? " (direct to the display GPU's VRAM)" : "");
 
 	lanes.push_back(std::move(lane));
 	return static_cast<int>(lanes.size() - 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// bDirectGPUCopy
+
+bool CrossAdapterBridge::AddDirectLane(Lane& a_lane, UINT64 a_heapSize)
+{
+	const auto failed = [&](const char* a_what, HRESULT a_hr) {
+		REX::ERROR("[FG-GPU1] direct GPU copy: lane '{}': {} failed (hr={:#010x}); every lane crosses through system "
+				   "memory instead",
+			a_lane.name, a_what, static_cast<std::uint32_t>(a_hr));
+		a_lane.peerStagingA = nullptr;
+		a_lane.peerHeapA = nullptr;  // before the block it was opened on goes (DisableDirectCopy)
+		a_lane.landingB = nullptr;
+		a_lane.landingHeapB = nullptr;
+		a_lane.peerMapped = nullptr;
+		a_lane.peerLane = -1;
+		return false;
+	};
+
+	void* mapped = nullptr;
+	const int peerLane = peer.AddLane(a_lane.name.c_str(), a_heapSize, a_lane.slotStride, a_lane.bytes, mapped,
+		a_lane.landingHeapB);
+	if (peerLane < 0 || !mapped || !a_lane.landingHeapB)
+		return failed("the display GPU's VRAM block (Vulkan)", E_FAIL);
+	a_lane.peerMapped = static_cast<const volatile std::uint8_t*>(mapped);
+
+	// The render GPU opens the block's CPU address as if it were system memory; its copy engine's writes
+	// then go to the display GPU's BAR.
+	winrt::com_ptr<ID3D12Device3> deviceA3;
+	HRESULT hr = deviceA->QueryInterface(IID_PPV_ARGS(deviceA3.put()));
+	if (SUCCEEDED(hr))
+		hr = deviceA3->OpenExistingHeapFromAddress(mapped, IID_PPV_ARGS(a_lane.peerHeapA.put()));
+	if (FAILED(hr))
+		return failed("OpenExistingHeapFromAddress on the render GPU", hr);
+	const D3D12_HEAP_DESC peerDesc = a_lane.peerHeapA->GetDesc();
+	if (peerDesc.SizeInBytes < a_heapSize)
+		return failed("the render GPU's view of the block (too small)", E_FAIL);
+
+	D3D12_RESOURCE_DESC bufferDesc{};
+	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufferDesc.Width = a_heapSize;
+	bufferDesc.Height = 1;
+	bufferDesc.DepthOrArraySize = 1;
+	bufferDesc.MipLevels = 1;
+	bufferDesc.SampleDesc.Count = 1;
+	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	bufferDesc.Flags = (peerDesc.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) ? D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER :
+	                                                                             D3D12_RESOURCE_FLAG_NONE;
+	hr = deviceA->CreatePlacedResource(a_lane.peerHeapA.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+		IID_PPV_ARGS(a_lane.peerStagingA.put()));
+	if (FAILED(hr))
+		return failed("the render GPU's buffer on the block", hr);
+
+	bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+	hr = deviceB->CreatePlacedResource(a_lane.landingHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+		IID_PPV_ARGS(a_lane.landingB.put()));
+	if (FAILED(hr))
+		return failed("the landing buffer on the display GPU", hr);
+
+	a_lane.peerLane = peerLane;
+	return true;
+}
+
+void CrossAdapterBridge::DisableDirectCopy()
+{
+	directCopy = false;
+	// Before any frame ran, the blocks can go now (the render GPU's heaps on them first). Once frames
+	// have used them, they stay until Shutdown: copies may still be in flight.
+	if (transferValue != 0)
+		return;
+	for (auto& lane : lanes) {
+		lane.peerStagingA = nullptr;
+		lane.peerHeapA = nullptr;
+		lane.landingB = nullptr;
+		lane.landingHeapB = nullptr;
+		lane.peerMapped = nullptr;
+		lane.peerLane = -1;
+	}
+	peer.Shutdown();
+	checkCpu = nullptr;
+	checkUploadA = nullptr;
+}
+
+void CrossAdapterBridge::ReleaseDirectCopyForExit(const char* a_why) noexcept
+{
+	// On the render thread (where FO4 quits) the lock is free or already ours; on another thread wait for
+	// the frame being assembled to finish. If that takes over 2 s, leave things alone rather than pull
+	// the heaps out from under it.
+	std::unique_lock<std::recursive_timed_mutex> lock(frameMutex, std::defer_lock);
+	if (!lock.try_lock_for(std::chrono::seconds(2))) {
+		REX::WARN("[FG-GPU1] direct GPU copy: {}, but the render thread kept the bridge for 2 s; not released", a_why);
+		return;
+	}
+
+	bool open = false;
+	for (const auto& lane : lanes)
+		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr;
+	if (!open && !peer.Ready())
+		return;
+	directCopy = false;
+
+	// Everything the GPUs were given: the render GPU's lane copies (each signals the transfer fence), and
+	// the display GPU's reads (each waited for its Vulkan copy before it ran, then signalled readFenceB).
+	bool idle = true;
+	if (transferFenceA && nextLaneValue)
+		idle &= SUCCEEDED(WaitCpu(transferFenceA.get(), nextLaneValue));
+	if (readFenceB && readValue)
+		idle &= SUCCEEDED(WaitCpu(readFenceB.get(), readValue));
+
+	// The render GPU's views first (this ends its lock on the blocks' pages), then the display GPU's side.
+	for (auto& lane : lanes) {
+		lane.peerStagingA = nullptr;
+		lane.peerHeapA = nullptr;
+	}
+	for (auto& lane : lanes) {
+		lane.landingB = nullptr;
+		lane.landingHeapB = nullptr;
+		lane.peerMapped = nullptr;
+		lane.peerLane = -1;
+		lane.checkPending = {};
+	}
+	// The Vulkan side (it waits for its own queue). If the GPUs were not idle its copies may still read
+	// the blocks: those are then left to Windows' teardown, which is safe now that the render GPU has let go.
+	if (idle)
+		peer.Shutdown();
+	checkCpu = nullptr;
+	checkUploadA = nullptr;
+	REX::INFO("[FG-GPU1] direct GPU copy: {}; closed the render GPU's views of the display GPU's VRAM, then {}", a_why,
+		idle ? "freed the blocks" : "left the blocks to Windows (the GPUs were still busy after 2 s)");
+}
+
+void CrossAdapterBridge::TripDirectCopy(const std::string& a_why)
+{
+	if (directCopyTripped)
+		return;
+	directCopyTripped = true;
+	directCopy = false;
+	REX::CRITICAL("[FG-GPU1] direct GPU copy guard: {}. Frames cross through system memory from the next frame on and "
+				  "frame generation is OFF for the rest of the session. Restart the game; set bDirectGPUCopy = 0 if this "
+				  "happens again.",
+		a_why);
+}
+
+void CrossAdapterBridge::CheckDirectCopy(UINT a_reusedSlot)
+{
+	const UINT64 finished = transferFenceA->GetCompletedValue();
+	for (auto& lane : lanes) {
+		if (!lane.peerMapped)
+			continue;
+		for (UINT slot = 0; slot < slotCount; ++slot) {
+			const UINT64 expected = lane.checkPending[slot];
+			if (!expected || expected > finished)
+				continue;  // nothing to check, or that copy is still running
+			// An uncached read through the block's CPU mapping (~1-2 us): it reaches the block wherever the
+			// display GPU's driver keeps it now, while the render GPU wrote to where it was when opened.
+			const auto* where =
+				reinterpret_cast<const volatile UINT64*>(lane.peerMapped + lane.slotStride * slot + lane.checkOffset);
+			const UINT64 seen = *where;
+			if (seen == expected) {
+				lane.checkPending[slot] = 0;
+				++statDirectChecks;
+				continue;
+			}
+			// The p2p-probe never saw a value arrive after its fence; still, one frame's grace, except for the
+			// slot about to be overwritten, whose copy PrepareFrame has just waited for.
+			if (slot != a_reusedSlot && !lane.checkLate[slot]) {
+				lane.checkLate[slot] = true;
+				++statDirectLate;
+				continue;
+			}
+			TripDirectCopy(std::format("lane '{}' slot {}: the render GPU wrote check value {} into the display GPU's "
+									   "VRAM block, but the block holds {} - it is no longer where the render GPU writes",
+				lane.name, slot, expected, seen));
+			return;
+		}
+	}
+}
+
+HRESULT CrossAdapterBridge::QueueDirectCopy(const Lane& a_lane, UINT a_slot)
+{
+	ID3D12Fence* fence = peer.Fence();
+	const UINT64 landed = ++peerValue;
+	const UINT64 copied = ++peerValue;
+	HRESULT hr = fence ? copyQueueB->Signal(fence, landed) : E_POINTER;
+	if (FAILED(hr)) {
+		Fail("direct copy: landed Signal", hr);
+		return hr;
+	}
+	// Nothing would signal "copied" if the Vulkan submission failed: this queue does it, so it carries on
+	// (the lane shows stale data this once) and the guard sends the next frames through system memory.
+	if (directCopyTripped || !peer.SubmitCopy(a_lane.peerLane, a_slot, landed, copied)) {
+		TripDirectCopy(std::format("the display GPU's Vulkan copy of lane '{}' could not be submitted", a_lane.name));
+		hr = copyQueueB->Signal(fence, copied);
+	}
+	if (SUCCEEDED(hr))
+		hr = copyQueueB->Wait(fence, copied);
+	if (FAILED(hr))
+		Fail("direct copy: copied Signal/Wait", hr);
+	return hr;
 }
 
 ID3D12Resource* CrossAdapterBridge::Mirror(int a_lane, UINT a_slot) const noexcept
@@ -743,6 +1091,12 @@ HRESULT CrossAdapterBridge::PrepareFrame(UINT a_slot)
 		}
 		CollectTimings(a_slot);
 	}
+
+	// bDirectGPUCopy: the guard looks at what the finished copies left behind, then this frame's path
+	// is fixed. A frame never switches path half-way.
+	if (directCopy)
+		CheckDirectCopy(a_slot);
+	frameDirect = directCopy;
 
 	const UINT64 frame = ++transferValue;
 	HRESULT hr = allocatorsA[a_slot]->Reset();
@@ -780,8 +1134,12 @@ HRESULT CrossAdapterBridge::SubmitLane(Lane& a_lane, size_t a_laneIndex, UINT a_
 	if (a_firstInPhase)
 		timerCopyA.Mark(listA.get(), a_slot, a_markBase);
 
+	// bDirectGPUCopy: into the display GPU's VRAM block instead of the cross-adapter heap.
+	const bool direct = frameDirect && a_lane.peerStagingA;
+	ID3D12Resource* staging = direct ? a_lane.peerStagingA.get() : a_lane.stagingA.get();
+
 	D3D12_TEXTURE_COPY_LOCATION dst{};
-	dst.pResource = a_lane.stagingA.get();
+	dst.pResource = staging;
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	dst.PlacedFootprint = a_lane.footprint;
 	dst.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
@@ -794,6 +1152,21 @@ HRESULT CrossAdapterBridge::SubmitLane(Lane& a_lane, size_t a_laneIndex, UINT a_
 	// Sources are D3D11-shared textures in COMMON; a copy queue promotes them to
 	// COPY_SOURCE implicitly and they decay back when the list completes.
 	listA->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	// Values are allocated in submission order rather than per lane index: the early groups
+	// signal before the Present group, and a shared fence must never go backwards.
+	const UINT64 value = nextLaneValue + 1;
+
+	// The guard's check value: this lane's transfer value, behind the data. The upload slot was last
+	// read by this slot's previous copy, which PrepareFrame waited for.
+	if (direct) {
+		const UINT64 uploadOffset = kCheckStride * (a_laneIndex * kSlots + a_slot);
+		checkCpu[uploadOffset / sizeof(UINT64)] = value;
+		listA->CopyBufferRegion(staging, a_lane.slotStride * a_slot + a_lane.checkOffset, checkUploadA.get(),
+			uploadOffset, sizeof(UINT64));
+		a_lane.checkPending[a_slot] = value;
+		a_lane.checkLate[a_slot] = false;
+	}
 
 	if (a_lastInPhase) {
 		timerCopyA.Mark(listA.get(), a_slot, a_markBase + 1);
@@ -810,9 +1183,7 @@ HRESULT CrossAdapterBridge::SubmitLane(Lane& a_lane, size_t a_laneIndex, UINT a_
 	ID3D12CommandList* lists[] = { listA.get() };
 	copyQueueA->ExecuteCommandLists(1, lists);
 
-	// Values are allocated in submission order rather than per lane index: the early groups
-	// signal before the Present group, and a shared fence must never go backwards.
-	const UINT64 value = ++nextLaneValue;
+	nextLaneValue = value;
 	hr = copyQueueA->Signal(transferFenceA.get(), value);
 	if (FAILED(hr)) {
 		Fail("transfer fence Signal", hr);
@@ -943,6 +1314,8 @@ HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_pro
 
 	frameStarted = false;
 	slotPresentQpc[a_slot] = submitStart;
+	if (frameDirect)
+		++statDirectFrames;
 
 	LARGE_INTEGER submitEnd{};
 	QueryPerformanceCounter(&submitEnd);
@@ -1001,7 +1374,7 @@ namespace
 }
 
 bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot,
-	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState)
+	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState, ID3D12Resource* a_source)
 {
 	const D3D12_RESOURCE_DESC destDesc = a_dest->GetDesc();
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
@@ -1031,7 +1404,7 @@ bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane&
 	dst.SubresourceIndex = 0;
 
 	D3D12_TEXTURE_COPY_LOCATION src{};
-	src.pResource = a_lane.stagingB.get();
+	src.pResource = a_source;
 	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	src.PlacedFootprint = a_lane.footprint;
 	src.PlacedFootprint.Offset = a_lane.slotStride * a_slot;
@@ -1212,9 +1585,13 @@ HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order
 		if (position == 0)
 			timerCopyB.Mark(listB.get(), a_slot, a_markBase);
 
+		// bDirectGPUCopy: the lane arrives in its landing heap (local VRAM) instead of the cross-adapter heap.
+		const bool direct = frameDirect && lane.landingB;
+
 		// Mirrors are COMMON between uses; the back buffer is PRESENT, which is the same state.
 		if (dest)
-			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON);
+			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON,
+				direct ? lane.landingB.get() : lane.stagingB.get());
 
 		if (position + 1 == a_count) {
 			timerCopyB.Mark(listB.get(), a_slot, a_markBase + 1);
@@ -1234,6 +1611,11 @@ HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order
 		if (FAILED(hr)) {
 			Fail("unpack queue Wait (transfer)", hr);
 			return hr;
+		}
+		if (direct) {
+			hr = QueueDirectCopy(lane, a_slot);
+			if (FAILED(hr))
+				return hr;
 		}
 		ID3D12CommandList* lists[] = { listB.get() };
 		copyQueueB->ExecuteCommandLists(1, lists);
@@ -1365,7 +1747,8 @@ void CrossAdapterBridge::RecordUnpackTo(ID3D12GraphicsCommandList* a_listB, int 
 	if (!active || !a_listB || !a_destB || a_slot >= kSlots || a_lane < 0 ||
 		static_cast<size_t>(a_lane) >= lanes.size())
 		return;
-	RecordLaneCopy(a_listB, lanes[static_cast<size_t>(a_lane)], a_slot, a_destB, a_destState);
+	auto& lane = lanes[static_cast<size_t>(a_lane)];
+	RecordLaneCopy(a_listB, lane, a_slot, a_destB, a_destState, lane.stagingB.get());
 }
 
 HRESULT CrossAdapterBridge::SignalConsumed(ID3D12CommandQueue* a_queueB)
@@ -1752,6 +2135,11 @@ void CrossAdapterBridge::CollectTimings(UINT a_slot)
 		}
 	}
 
+	// bDirectGPUCopy: the display GPU's Vulkan copies of this slot's last frame (skipped while still running).
+	double peerMs = 0.0;
+	if (peer.Ready() && peer.CopyTimeMs(a_slot, peerMs))
+		statPeerCopy.Add(peerMs);
+
 	if ((validDisplay & kListBeginEnd) == kListBeginEnd) {
 		statDisplayList.Add((display[kMarkListEnd] - display[kMarkListBegin]) * toMs);
 		if (timerDisplay.calibrated) {
@@ -1818,7 +2206,22 @@ void CrossAdapterBridge::LogStats()
 		statPresentBlock.Mean(), statPresentBlock.max, statLatencyWait.Mean(), statLatencyWait.max, statGatePending,
 		statGateCalls);
 
+	// bDirectGPUCopy: how many frames went straight into the display GPU's VRAM, and the guard's count.
+	if (directCopyTripped) {
+		REX::INFO("[FG-GPU1] direct GPU copy: OFF since its guard tripped (see the CRITICAL line); frames cross through "
+				  "system memory, frame generation is off");
+	} else if (directCopy || statDirectFrames) {
+		REX::INFO("[FG-GPU1] direct GPU copy: {}/{} frames into the display GPU's VRAM | its Vulkan copy into the landing "
+				  "heaps ({}) avg {:.2f} ms max {:.2f} ms per frame | check values found {} (late {})",
+			statDirectFrames, statFrames, peer.QueueName(), statPeerCopy.Mean(), statPeerCopy.max, statDirectChecks,
+			statDirectLate);
+	}
+
 	statFrames = 0;
+	statPeerCopy = {};
+	statDirectFrames = 0;
+	statDirectChecks = 0;
+	statDirectLate = 0;
 	statCopyA = {};
 	statUnpack = {};
 	statDisplayList = {};
@@ -1848,7 +2251,7 @@ void CrossAdapterBridge::Shutdown() noexcept
 		// A read started at a hook whose Present never came: signal it, or the wait below times out.
 		if (unpackStarted && copyQueueB && unpackFenceB)
 			copyQueueB->Signal(unpackFenceB.get(), unpackFrame);
-		const UINT64 lastUnpack = (std::max)(slotUnpack[0], slotUnpack[1]);
+		const UINT64 lastUnpack = *std::max_element(slotUnpack.begin(), slotUnpack.end());
 		if (copyQueueB && unpackFenceB && lastUnpack)
 			WaitCpu(unpackFenceB.get(), lastUnpack);
 		if (displayDoneFenceB && displayDoneValue)
@@ -1857,7 +2260,16 @@ void CrossAdapterBridge::Shutdown() noexcept
 	active = false;
 	asyncUnpack = true;
 	ResetUpsampler();
+	// The render GPU's heaps on the display GPU's VRAM blocks go first (with the lanes), then the
+	// Vulkan side that owns the blocks.
 	lanes.clear();
+	peer.Shutdown();
+	directCopy = false;
+	directCopyTripped = false;
+	frameDirect = false;
+	peerValue = 0;
+	checkCpu = nullptr;
+	checkUploadA = nullptr;
 	bytesPerFrame = 0;
 	currentSlot = 0;
 	transferValue = 0;

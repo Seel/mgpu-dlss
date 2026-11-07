@@ -33,6 +33,17 @@
 //   writes the slot again, so the render GPU never waits on PCIe for the
 //   frame it is working on.
 //
+// Direct GPU copy (bDirectGPUCopy, async unpack only; PeerCopy.h): instead of the cross-adapter
+// heap in system memory, A's copy queue writes each lane straight into a block of B's VRAM (B's
+// Vulkan device maps it through the resizable BAR, A opens the mapping with
+// OpenExistingHeapFromAddress), plus a check value behind the data. On B's copy queue, per lane:
+// Wait(transfer), Signal(landed) -> Vulkan copies the block into a D3D12 landing heap and signals
+// copied -> Wait(copied), then the usual unpack, from the landing heap. One PCIe trip, no system RAM.
+// The cross-adapter heaps stay allocated. Guard: at every frame start the CPU reads the check values
+// of the copies that finished, through the block's mapping (which follows the block wherever the
+// driver keeps it). A value missing where A wrote it means the block moved: frames go back through
+// system memory and frame generation is off for the rest of the session (DirectCopyTripped).
+//
 // Everything runs on the game's render thread (Present and the render hooks).
 // No method throws; failures are logged and reported through the return value.
 
@@ -43,10 +54,12 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "FrameSlots.h"
+#include "PeerCopy.h"
 
 class CrossAdapterBridge
 {
@@ -99,9 +112,18 @@ public:
 	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).
 	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
 	// a_slots: frames in flight (the FFX swap chain's buffer count), 2 or 3.
+	// a_directCopy: bDirectGPUCopy (needs a_asyncUnpack); falls back to system memory, logged, if it
+	// cannot be set up.
 	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots);
+		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
+		bool a_directCopy);
 	[[nodiscard]] UINT SlotCount() const noexcept { return slotCount; }
+
+	// bDirectGPUCopy carries the frames (set up for every lane, guard not tripped).
+	[[nodiscard]] bool IsDirectCopy() const noexcept { return directCopy; }
+	// The guard found a VRAM block of the display GPU moved (or a Vulkan submission failed): frames cross
+	// through system memory again and frame generation stays off for the rest of the session.
+	[[nodiscard]] bool DirectCopyTripped() const noexcept { return directCopyTripped; }
 
 	// Once B's direct queue (the FFX game queue) exists. Enables its timestamps and the
 	// fence that tells the unpack when the previous frame's direct-queue work is done.
@@ -212,6 +234,21 @@ public:
 
 	void Shutdown() noexcept;
 
+	// The render thread holds this while it uses the bridge for a frame (DX12SwapChain::Present and
+	// TransferEarlyLanes), so ReleaseDirectCopyForExit, which runs on whichever thread ends the process,
+	// never lands in the middle of one. Uncontended in normal play.
+	[[nodiscard]] std::unique_lock<std::recursive_timed_mutex> LockFrame()
+	{
+		return std::unique_lock<std::recursive_timed_mutex>(frameMutex);
+	}
+
+	// bDirectGPUCopy, at process exit (hooked ExitProcess / TerminateProcess, before any driver unloads):
+	// waits up to 2 s each for the copies in flight, closes the render GPU's views of the display GPU's
+	// VRAM blocks, then frees the blocks. The first build had no such step: the destructors freed the
+	// blocks first, while the drivers were already unloading, and the PC hung on Alt+F4 (2026-11-08).
+	// No-op without direct copy.
+	void ReleaseDirectCopyForExit(const char* a_why) noexcept;
+
 private:
 	struct Lane
 	{
@@ -228,6 +265,18 @@ private:
 		winrt::com_ptr<ID3D12Resource> stagingB;
 		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> mirrorB;
 		bool mismatchLogged = false;
+
+		// bDirectGPUCopy: B's VRAM block as A sees it, B's landing heap, and the block's CPU mapping.
+		// Null/-1 when the lane crosses through system memory only.
+		winrt::com_ptr<ID3D12Heap> peerHeapA;
+		winrt::com_ptr<ID3D12Resource> peerStagingA;
+		winrt::com_ptr<ID3D12Heap> landingHeapB;
+		winrt::com_ptr<ID3D12Resource> landingB;
+		const volatile std::uint8_t* peerMapped = nullptr;
+		int peerLane = -1;
+		UINT64 checkOffset = 0;                    // the check value, behind the data in each slot
+		std::array<UINT64, kSlots> checkPending{};  // value A wrote into a slot and nobody checked yet
+		std::array<bool, kSlots> checkLate{};       // ...and it was missing at the first look
 	};
 
 	// GPU timestamps for one queue, kSlots x marks, converted to QPC ticks through
@@ -297,10 +346,26 @@ private:
 	HRESULT WaitCpu(ID3D12Fence* a_fence, UINT64 a_value);
 	void Fail(const char* a_where, HRESULT a_hr);
 
-	// Records staging(slot) -> a_dest with a_destState <-> COPY_DEST barriers.
+	// Records a_source(slot) -> a_dest with a_destState <-> COPY_DEST barriers. a_source is the lane's
+	// staging buffer on B (cross-adapter heap) or its landing heap (direct copy).
 	// False (logged once per lane) when a_dest does not match the lane's size/pitch.
 	bool RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot, ID3D12Resource* a_dest,
-		D3D12_RESOURCE_STATES a_destState);
+		D3D12_RESOURCE_STATES a_destState, ID3D12Resource* a_source);
+
+	// --- bDirectGPUCopy ---------------------------------------------------------------------
+	// The lane's VRAM block and landing heap (PeerCopy) and A's view of the block. False (logged) when
+	// any of it fails; the caller then turns the direct copy off.
+	bool AddDirectLane(Lane& a_lane, UINT64 a_heapSize);
+	// Set-up failure: system memory for the rest of the session, frame generation unaffected.
+	void DisableDirectCopy();
+	// The guard: system memory from the next frame on, frame generation off for the session.
+	void TripDirectCopy(const std::string& a_why);
+	// At a frame start: reads the check values of the copies that finished. a_reusedSlot's copies are
+	// known to be done (PrepareFrame waited), so a value missing there trips the guard; elsewhere it
+	// gets a second look one frame later.
+	void CheckDirectCopy(UINT a_reusedSlot);
+	// B's copy queue, after Wait(transfer of the lane): Signal(landed), the Vulkan copy, Wait(copied).
+	HRESULT QueueDirectCopy(const Lane& a_lane, UINT a_slot);
 
 	// Reads the timestamps the previous use of a_slot left behind (never blocks).
 	void CollectTimings(UINT a_slot);
@@ -386,8 +451,23 @@ private:
 	std::array<UINT64, kMaxLanes> laneValue{};          // value signalled for each lane this frame
 	std::array<UINT64, kMaxLanes> laneFrame{};          // frame that last copied each lane
 
+	// bDirectGPUCopy: the Vulkan side owns the display GPU's VRAM blocks. Declared before `lanes`, so a
+	// destructor run releases the render GPU's heaps on those blocks (in `lanes`) first, and only then
+	// the blocks: never the other way round (see ReleaseDirectCopyForExit).
+	PeerCopy peer;
+
 	std::vector<Lane> lanes;
 	UINT64 bytesPerFrame = 0;
+
+	// bDirectGPUCopy
+	static constexpr UINT64 kCheckStride = 256;  // per lane and slot in the upload buffer; also the space behind the data
+	std::recursive_timed_mutex frameMutex;  // LockFrame / ReleaseDirectCopyForExit
+	bool directCopy = false;         // lanes cross through B's VRAM blocks (all set up, guard not tripped)
+	bool directCopyTripped = false;  // the guard tripped this session
+	bool frameDirect = false;        // the path of the frame being assembled, fixed in PrepareFrame
+	UINT64 peerValue = 0;            // PeerCopy::Fence() values: landed/copied, two per lane per frame
+	winrt::com_ptr<ID3D12Resource> checkUploadA;  // A: the check values A copies behind each lane's data
+	UINT64* checkCpu = nullptr;                   // its persistent mapping
 
 	DepthUpsampler upsampler;
 
@@ -406,6 +486,10 @@ private:
 	Average statUpsampleEnd;   // ms after Present at which it finished
 	Average statPresentBlock;  // ms the render thread sat in the FFX swap chain's Present
 	Average statLatencyWait;   // ms in the frame-latency wait after it
+	Average statPeerCopy;      // ms, bDirectGPUCopy: B's Vulkan copies of a frame into the landing heaps
+	UINT64 statDirectFrames = 0;  // frames that crossed directly
+	UINT64 statDirectChecks = 0;  // check values found where A wrote them
+	UINT64 statDirectLate = 0;    // ...missing at the first look (found one frame later)
 	double statCpuSubmitMs = 0.0;
 	UINT64 statMaxLag = 0;
 	UINT64 statCpuWaits = 0;

@@ -3,8 +3,8 @@
 Status: planned 2026-11-07, not started. Two parts, in this order, both before
 [DISPLAY-THREAD.md](DISPLAY-THREAD.md):
 
-1. **Freeze the HUD in generated frames with a motion-vector mask** (for second-GPU frame
-   generation *without* FSR 4.1, as a cheap alternative to sending the UI-free frame). Smaller and
+1. **Freeze the HUD in generated frames with a motion-vector mask** (second-GPU frame generation,
+   with or without FSR 4.1: a cheap alternative to sending the UI-free frame). Smaller and
    self-contained; do it first. New setting: `iHudMode` in `[FrameGeneration]`.
 2. **Send only the UI tiles of the finished frame** (FSR 4.1 mode, the user's setup). New setting
    `bSendUITilesOnly`.
@@ -17,10 +17,10 @@ is about the cost of getting the UI to the 9060 at all in FSR 4.1 mode, where no
 
 ### Why
 
-Without FSR 4.1 on the second GPU (the render GPU upscales with DLSS/FSR 3.1 or renders natively,
-e.g. a second GPU that cannot run FSR 4.1), the HUD has two options today:
-- `bSendHudlessFrame = 1`: a UI-free copy of every frame crosses PCIe (33.2 MB at 4K, ~25% of the
-  traffic, ~2.7 ms copy + read); FSR 3 interpolates the scene only, the HUD stays clean.
+The HUD has two options today, in second-GPU mode with or without FSR 4.1:
+- `bSendHudlessFrame = 1`, or FSR 4.1 (whose upscale result is the UI-free frame): the HUD never
+  enters the interpolation — it is composited after generation — so it stays clean, at the cost of
+  the copy that carries it;
 - `bSendHudlessFrame = 0`: no extra copy; FSR 3 interpolates the finished frame, HUD included, with
   the scene's motion vectors under it, so the HUD smears during camera movement.
 
@@ -32,6 +32,13 @@ limits: where the scene shows through thin text or translucent UI, that scene is
 generated frames: a faint halo/ghosting at UI edges instead of smeared text. Not as clean as the
 UI-free frame; costs well under 1 MB per frame instead of 33 MB. Whether it looks good enough has
 to be judged in game.
+
+**Measured 2026-11-07** (FSR 4.1, `bSendHudlessFrame = 0`, two hand-placed rectangles over the
+health and AP bars, `test/mv-freeze-hud-bars`): without the mask each bar shows **two** after-images
+while walking, one travelling with the camera motion and one against it; with the motion vectors
+zeroed **one** remains, travelling with the motion. The leftover is FSR 3's optical-flow candidate,
+which still wins where a flat bar reprojects equally well either way. So the mask halves the
+artefact rather than removing it, and the user judged the result liveable for those HUD elements.
 
 ### Design
 
@@ -66,9 +73,10 @@ Settings: `iHudMode` in `[FrameGeneration]` (restart; it decides the lanes), rep
 - `1` send the UI-free frame (today's `bSendHudlessFrame = 1`, default);
 - `2` freeze the HUD (motion-vector mask).
 Keep reading `bSendHudlessFrame` when `iHudMode` is absent (0 → 0, 1 → 1), as `LoadSettings`
-already does for the older `bTransportHudLess`. Ignored in FSR 4.1 mode (logged once), where the
-UI-free frame is the FSR 4.1 output. MCM: replace the "Send UI-free Frame" switch on the Second GPU
-page with a 3-way stepper.
+already does for the older `bTransportHudLess`. It is not ignored in FSR 4.1 mode: with `0`, frame
+generation is given a copy of the composed frame instead of the FSR 4.1 result, so the HUD is
+interpolated there and the mask applies to it too. MCM: replace the "Send UI-free Frame" switch on
+the Second GPU page with a 3-way stepper.
 
 ### Steps
 
