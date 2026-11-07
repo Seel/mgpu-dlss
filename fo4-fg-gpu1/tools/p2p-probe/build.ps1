@@ -4,9 +4,13 @@
 #
 # Vulkan headers come from the overlay (overlay\include\vulkan, vendored); the probe loads
 # vulkan-1.dll at run time, so no Vulkan SDK is needed.
+#
+# The --exit-hook / --exit-gpu modes use the mod's detour library from the pinned build tree
+# (-DetoursDir, default D:\fgb\FO4Upscaling\include\detours, present after one build-local.ps1 run);
+# without it the probe builds without those modes.
 
 [CmdletBinding()]
-param([switch]$Clean)
+param([switch]$Clean, [string]$DetoursDir = 'D:\fgb\FO4Upscaling\include\detours')
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -28,7 +32,16 @@ if ($Clean -and (Test-Path $exe)) { Remove-Item -Force $exe }
 
 Push-Location $here
 try {
-    & cl /nologo /std:c++20 /O2 /EHsc /W4 /WX /DUNICODE /D_UNICODE /I $include main.cpp /Fe:p2p-probe.exe
+    $extra = @()
+    $detoursLib = Join-Path $DetoursDir 'Release\detours.lib'
+    if ((Test-Path (Join-Path $DetoursDir 'Detours.h')) -and (Test-Path $detoursLib)) {
+        $extra = @('/DP2P_EXIT_HOOK', '/I', $DetoursDir, $detoursLib)
+        Write-Host "with --exit-hook / --exit-gpu ($DetoursDir)"
+    } else {
+        Write-Host "without --exit-hook / --exit-gpu ($DetoursDir not found)"
+    }
+    # /MD: the detour library is built against the DLL runtime.
+    & cl /nologo /std:c++20 /O2 /MD /EHsc /W4 /WX /DUNICODE /D_UNICODE /I $include main.cpp @extra /Fe:p2p-probe.exe
     if ($LASTEXITCODE -ne 0) { throw "cl failed with exit code $LASTEXITCODE" }
 }
 finally { Pop-Location }

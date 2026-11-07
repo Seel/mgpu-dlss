@@ -28,6 +28,12 @@ pwsh -ExecutionPolicy Bypass -File D:\projects\mgpu-dlss\fo4-fg-gpu1\tools\p2p-p
 | `--interop` | how the AMD D3D12 device can use the block (three routes) | P2P writes |
 | `--evict` | `--interop`, then 19.5 GiB of VRAM pressure on the AMD GPU: does the block move? | reads only across PCIe; the desktop may stutter for a few seconds |
 | `--pipeline [--compute]` | the mod's per-frame sequence 300 times, the AMD side queued before the NVIDIA write; `--compute` uses an async-compute queue as the mod does | P2P writes |
+| `--exit-hook`, `--exit-hook-terminate` | installs the mod's exit hooks (same detour library, same prologue check) and ends the process through ExitProcess / TerminateProcess: do the hooks fire and pass the exit code on? | none, no GPU work |
+| `--exit-gpu`, `--exit-gpu-terminate` | ends the process while 40 x 64 MiB P2P copies are still running; the hook waits for them, closes the NVIDIA view, then frees the AMD block (the mod's `ReleaseDirectCopyForExit`) | P2P writes; the order that hung the PC is NOT exercised |
+
+The exit modes need the detour library from the mod's build tree (`build.ps1 -DetoursDir`, default
+`D:\fgb\FO4Upscaling\include\detours`); without it the probe builds without them. The probe is built
+with `/MD` because that library is.
 
 Anything unsupported by the root complex could in principle hang or crash Windows; on X299 none
 of it did, and the System log showed no WHEA/PCIe events.
@@ -64,6 +70,11 @@ patterns read correctly on the AMD D3D12 copy and direct queues (no stale caches
 
 `--evict`: with 19.5 GiB allocated on the 16 GB card (and the block untouched), the block kept its
 address at default and at maximum priority.
+
+Exit (2026-11-08, after the mod's first build hung the PC on Alt+F4): `--exit-hook` and
+`--exit-hook-terminate` both reach the hook and keep their exit codes; `--exit-gpu` and
+`--exit-gpu-terminate` waited 263 ms for the copies in flight, closed the NVIDIA view, freed the AMD
+block and exited cleanly, no WHEA/GPU events.
 
 `--pipeline --compute`: 300 frames of 33.2 MB, the AMD side (D3D12 wait, Vulkan copy) queued 2 ms
 before the NVIDIA copy was released: 0 frames wrong, `vkQueueSubmit` returned at once (avg 18 us, it

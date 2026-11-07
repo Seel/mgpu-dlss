@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <format>
 
 namespace
@@ -108,6 +109,105 @@ namespace
 	{
 		return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1000.0 /
 		       static_cast<double>(a_frequency.QuadPart);
+	}
+
+	// ---- bDirectGPUCopy: process-exit hooks --------------------------------------------------
+	//
+	// The render GPU's heaps on the display GPU's VRAM blocks must be closed while both drivers are still
+	// loaded and before the blocks go. At DLL_PROCESS_DETACH the drivers (loaded after this DLL) have
+	// already been detached, and TerminateProcess runs no detach at all. So the two ways a process ends
+	// are hooked: ntdll!RtlExitUserProcess (behind ExitProcess and the CRT's exit) and
+	// kernelbase!TerminateProcess. Fallout4.exe imports both.
+
+	using ExitUserProcessFn = void(NTAPI*)(LONG);
+	using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
+	ExitUserProcessFn exitUserProcessOriginal = nullptr;
+	TerminateProcessFn terminateProcessOriginal = nullptr;
+
+	void NTAPI ExitUserProcessHook(LONG a_status)
+	{
+		CrossAdapterBridge::GetSingleton()->ReleaseDirectCopyForExit("the game is exiting");
+		exitUserProcessOriginal(a_status);
+	}
+
+	BOOL WINAPI TerminateProcessHook(HANDLE a_process, UINT a_exitCode)
+	{
+		if (a_process == GetCurrentProcess() || GetProcessId(a_process) == GetCurrentProcessId())
+			CrossAdapterBridge::GetSingleton()->ReleaseDirectCopyForExit("the game is terminating itself");
+		return terminateProcessOriginal(a_process, a_exitCode);
+	}
+
+	// The detour library copies the entry's first instructions (a 5-byte jump's worth) into its trampoline
+	// without fixing RIP-relative ones. Only hook an entry whose first instructions are ones known not to
+	// be relative: the usual prologue forms. (Win10 19045: RtlExitUserProcess starts push rbx / sub rsp,
+	// TerminateProcess mov [rsp+8],rbx.) Anything else: no hook, and then no direct copy.
+	size_t PrologueInstructionLength(const std::uint8_t* a_code)
+	{
+		const std::uint8_t b0 = a_code[0];
+		const std::uint8_t b1 = a_code[1];
+		const std::uint8_t b2 = a_code[2];
+		if (b0 >= 0x50 && b0 <= 0x57)
+			return 1;  // push r64
+		if ((b0 == 0x40 || b0 == 0x41) && b1 >= 0x50 && b1 <= 0x57)
+			return 2;  // push r64 with REX
+		if (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC)
+			return 4;  // sub rsp, imm8
+		if (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC)
+			return 7;  // sub rsp, imm32
+		if ((b0 == 0x48 || b0 == 0x4C) && b1 == 0x89 && (b2 & 0xC7) == 0x44 && a_code[3] == 0x24)
+			return 5;  // mov [rsp+disp8], r64
+		if ((b0 & 0xF0) == 0x40 && (b1 == 0x8B || b1 == 0x89) && (b2 & 0xC0) == 0xC0)
+			return 3;  // mov r64, r64
+		if ((b0 == 0x8B || b0 == 0x89) && (b1 & 0xC0) == 0xC0)
+			return 2;  // mov r32, r32
+		return 0;
+	}
+
+	bool SafeToDetour(std::uintptr_t a_entry)
+	{
+		if (stl::detail::HookedEntryTarget(a_entry))
+			return true;  // another hook's jump: DetourOrChain chains behind it, nothing is copied
+		const auto* code = reinterpret_cast<const std::uint8_t*>(a_entry);
+		size_t covered = 0;
+		while (covered < 5) {
+			const size_t length = PrologueInstructionLength(code + covered);
+			if (!length)
+				return false;
+			covered += length;
+		}
+		return true;
+	}
+
+	bool InstallExitHooks()
+	{
+		static bool installed = false;
+		if (installed)
+			return true;
+		const auto exitEntry = reinterpret_cast<std::uintptr_t>(
+			GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess"));
+		const auto terminateEntry = reinterpret_cast<std::uintptr_t>(
+			GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "TerminateProcess"));
+		if (!exitEntry || !terminateEntry) {
+			REX::ERROR("[FG-GPU1] direct GPU copy: RtlExitUserProcess / TerminateProcess not found");
+			return false;
+		}
+		for (const auto entry : { exitEntry, terminateEntry }) {
+			if (!SafeToDetour(entry)) {
+				const auto* code = reinterpret_cast<const std::uint8_t*>(entry);
+				REX::ERROR("[FG-GPU1] direct GPU copy: cannot hook the process exit safely on this Windows build (entry at "
+						   "{:#x} starts {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X})",
+					entry, code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
+				return false;
+			}
+		}
+		exitUserProcessOriginal = reinterpret_cast<ExitUserProcessFn>(stl::detail::DetourOrChain(exitEntry,
+			reinterpret_cast<std::uintptr_t>(&ExitUserProcessHook), "RtlExitUserProcess"));
+		terminateProcessOriginal = reinterpret_cast<TerminateProcessFn>(stl::detail::DetourOrChain(terminateEntry,
+			reinterpret_cast<std::uintptr_t>(&TerminateProcessHook), "TerminateProcess"));
+		installed = exitUserProcessOriginal && terminateProcessOriginal;
+		if (!installed)
+			REX::ERROR("[FG-GPU1] direct GPU copy: hooking the process exit failed");
+		return installed;
 	}
 
 	const char* TimingName(CrossAdapterBridge::LaneTiming a_timing)
@@ -609,13 +709,18 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(checkUploadA.put()));
 			if (SUCCEEDED(hr))
 				hr = checkUploadA->Map(0, nullptr, reinterpret_cast<void**>(&checkCpu));
-			if (SUCCEEDED(hr)) {
-				directCopy = true;
-			} else {
+			if (FAILED(hr)) {
 				REX::ERROR("[FG-GPU1] direct GPU copy: the check-value buffer failed (hr={:#010x}); frames cross through "
 						   "system memory instead",
 					static_cast<std::uint32_t>(hr));
 				DisableDirectCopy();
+			} else if (!InstallExitHooks()) {
+				// Without a clean release at exit the render GPU would still hold the blocks when Windows
+				// tears the process down; that is what hung the PC on Alt+F4 with the first build.
+				REX::ERROR("[FG-GPU1] direct GPU copy: no safe release at exit; frames cross through system memory instead");
+				DisableDirectCopy();
+			} else {
+				directCopy = true;
 			}
 		}
 	}
@@ -837,6 +942,54 @@ void CrossAdapterBridge::DisableDirectCopy()
 	peer.Shutdown();
 	checkCpu = nullptr;
 	checkUploadA = nullptr;
+}
+
+void CrossAdapterBridge::ReleaseDirectCopyForExit(const char* a_why) noexcept
+{
+	// On the render thread (where FO4 quits) the lock is free or already ours; on another thread wait for
+	// the frame being assembled to finish. If that takes over 2 s, leave things alone rather than pull
+	// the heaps out from under it.
+	std::unique_lock<std::recursive_timed_mutex> lock(frameMutex, std::defer_lock);
+	if (!lock.try_lock_for(std::chrono::seconds(2))) {
+		REX::WARN("[FG-GPU1] direct GPU copy: {}, but the render thread kept the bridge for 2 s; not released", a_why);
+		return;
+	}
+
+	bool open = false;
+	for (const auto& lane : lanes)
+		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr;
+	if (!open && !peer.Ready())
+		return;
+	directCopy = false;
+
+	// Everything the GPUs were given: the render GPU's lane copies (each signals the transfer fence), and
+	// the display GPU's reads (each waited for its Vulkan copy before it ran, then signalled readFenceB).
+	bool idle = true;
+	if (transferFenceA && nextLaneValue)
+		idle &= SUCCEEDED(WaitCpu(transferFenceA.get(), nextLaneValue));
+	if (readFenceB && readValue)
+		idle &= SUCCEEDED(WaitCpu(readFenceB.get(), readValue));
+
+	// The render GPU's views first (this ends its lock on the blocks' pages), then the display GPU's side.
+	for (auto& lane : lanes) {
+		lane.peerStagingA = nullptr;
+		lane.peerHeapA = nullptr;
+	}
+	for (auto& lane : lanes) {
+		lane.landingB = nullptr;
+		lane.landingHeapB = nullptr;
+		lane.peerMapped = nullptr;
+		lane.peerLane = -1;
+		lane.checkPending = {};
+	}
+	// The Vulkan side (it waits for its own queue). If the GPUs were not idle its copies may still read
+	// the blocks: those are then left to Windows' teardown, which is safe now that the render GPU has let go.
+	if (idle)
+		peer.Shutdown();
+	checkCpu = nullptr;
+	checkUploadA = nullptr;
+	REX::INFO("[FG-GPU1] direct GPU copy: {}; closed the render GPU's views of the display GPU's VRAM, then {}", a_why,
+		idle ? "freed the blocks" : "left the blocks to Windows (the GPUs were still busy after 2 s)");
 }
 
 void CrossAdapterBridge::TripDirectCopy(const std::string& a_why)

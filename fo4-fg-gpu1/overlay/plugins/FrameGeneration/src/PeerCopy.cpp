@@ -8,6 +8,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "FrameSlots.h"
@@ -56,6 +57,15 @@ namespace
 		REX::ERROR("[FG-GPU1] direct GPU copy: {} ({}); frames cross through system memory instead", a_what,
 			VkName(a_result));
 		return false;
+	}
+
+	// True during the DLL detach phase of a process that is ending (ntdll!RtlDllShutdownInProgress).
+	bool ProcessIsEnding() noexcept
+	{
+		using ShutdownInProgressFn = BOOLEAN(NTAPI*)();
+		static const auto shutdownInProgress = reinterpret_cast<ShutdownInProgressFn>(
+			GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
+		return shutdownInProgress && shutdownInProgress();
 	}
 
 	bool Failed(const char* a_what, HRESULT a_hr)
@@ -175,6 +185,17 @@ struct PeerCopy::State
 
 	void Destroy() noexcept
 	{
+		// At DLL_PROCESS_DETACH of a process that is ending, the Vulkan driver and the D3D12 drivers (loaded
+		// after this DLL) have already been detached: calling into them is unsafe. Leave everything to
+		// Windows' process teardown; the bridge's exit hook has normally released it all before this.
+		if (ProcessIsEnding()) {
+			std::ignore = fence.detach();
+			std::ignore = deviceB.detach();
+			device = VK_NULL_HANDLE;
+			instance = VK_NULL_HANDLE;
+			lanes.clear();
+			return;
+		}
 		if (CanDestroy()) {
 			// The Vulkan queue may wait for a "landed" that the display GPU's copy queue never signals (a
 			// transfer that never finished). Give it two seconds, then release those waits from the CPU so

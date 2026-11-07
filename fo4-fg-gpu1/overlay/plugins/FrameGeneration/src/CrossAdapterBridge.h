@@ -54,6 +54,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -232,6 +233,21 @@ public:
 	void LogStats();
 
 	void Shutdown() noexcept;
+
+	// The render thread holds this while it uses the bridge for a frame (DX12SwapChain::Present and
+	// TransferEarlyLanes), so ReleaseDirectCopyForExit, which runs on whichever thread ends the process,
+	// never lands in the middle of one. Uncontended in normal play.
+	[[nodiscard]] std::unique_lock<std::recursive_timed_mutex> LockFrame()
+	{
+		return std::unique_lock<std::recursive_timed_mutex>(frameMutex);
+	}
+
+	// bDirectGPUCopy, at process exit (hooked ExitProcess / TerminateProcess, before any driver unloads):
+	// waits up to 2 s each for the copies in flight, closes the render GPU's views of the display GPU's
+	// VRAM blocks, then frees the blocks. The first build had no such step: the destructors freed the
+	// blocks first, while the drivers were already unloading, and the PC hung on Alt+F4 (2026-11-08).
+	// No-op without direct copy.
+	void ReleaseDirectCopyForExit(const char* a_why) noexcept;
 
 private:
 	struct Lane
@@ -435,12 +451,17 @@ private:
 	std::array<UINT64, kMaxLanes> laneValue{};          // value signalled for each lane this frame
 	std::array<UINT64, kMaxLanes> laneFrame{};          // frame that last copied each lane
 
+	// bDirectGPUCopy: the Vulkan side owns the display GPU's VRAM blocks. Declared before `lanes`, so a
+	// destructor run releases the render GPU's heaps on those blocks (in `lanes`) first, and only then
+	// the blocks: never the other way round (see ReleaseDirectCopyForExit).
+	PeerCopy peer;
+
 	std::vector<Lane> lanes;
 	UINT64 bytesPerFrame = 0;
 
 	// bDirectGPUCopy
 	static constexpr UINT64 kCheckStride = 256;  // per lane and slot in the upload buffer; also the space behind the data
-	PeerCopy peer;
+	std::recursive_timed_mutex frameMutex;  // LockFrame / ReleaseDirectCopyForExit
 	bool directCopy = false;         // lanes cross through B's VRAM blocks (all set up, guard not tripped)
 	bool directCopyTripped = false;  // the guard tripped this session
 	bool frameDirect = false;        // the path of the frame being assembled, fixed in PrepareFrame

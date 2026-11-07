@@ -94,6 +94,7 @@ void DX12SwapChain::TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing)
 {
 	auto upscaling = Upscaling::GetSingleton();
 	auto bridge = CrossAdapterBridge::GetSingleton();
+	const auto bridgeLock = bridge->LockFrame();  // ReleaseDirectCopyForExit waits for this
 	if (!secondaryGPU || !bridge->IsActive() || !upscaling->settings.earlyTransfer)
 		return;
 	if (!d3d11Context || !d3d11Fence || !d3d12Fence || !bridge->HasLanes(a_timing))
@@ -335,6 +336,8 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	// The whole frame's use of the bridge: ReleaseDirectCopyForExit (process exit, any thread) waits for it.
+	const auto bridgeLock = CrossAdapterBridge::GetSingleton()->LockFrame();
 	auto upscalingForUI = Upscaling::GetSingleton();
 
 	// The game's work for this frame is all recorded: timestamp its end on the render GPU.

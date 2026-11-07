@@ -1629,8 +1629,161 @@ namespace
 	}
 }
 
+#ifdef P2P_EXIT_HOOK
+// ---- --exit-hook, --exit-gpu: the mod's release at process exit (CrossAdapterBridge::ReleaseDirectCopyForExit) --
+//
+// The first build of bDirectGPUCopy hung the PC on Alt+F4: at process exit the Vulkan blocks were freed while the
+// render GPU still had them open, during the drivers' own unload. The fix hooks ntdll!RtlExitUserProcess and
+// kernelbase!TerminateProcess with the same detour library and the same prologue check as the mod, and closes the
+// render GPU's view first. --exit-hook checks the hooks fire (no GPU work at all); --exit-gpu exits with 40 P2P
+// copies still running and lets the hook wait for them, close the NVIDIA heap, then free the AMD block.
+#include "Detours.h"
+
+namespace
+{
+	using ExitUserProcessFn = void(NTAPI*)(LONG);
+	using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
+	ExitUserProcessFn exitOriginal = nullptr;
+	TerminateProcessFn terminateOriginal = nullptr;
+	std::function<void(const char*)> exitRelease;  // what the hook does before the process ends
+
+	void NTAPI ExitHook(LONG a_status)
+	{
+		std::printf("  [hook] RtlExitUserProcess(%ld) reached the hook\n", a_status);
+		if (exitRelease) exitRelease("RtlExitUserProcess");
+		exitOriginal(a_status);
+	}
+
+	BOOL WINAPI TerminateHook(HANDLE a_process, UINT a_code)
+	{
+		if (a_process == GetCurrentProcess() || GetProcessId(a_process) == GetCurrentProcessId()) {
+			std::printf("  [hook] TerminateProcess(self, %u) reached the hook\n", a_code);
+			if (exitRelease) exitRelease("TerminateProcess");
+		}
+		return terminateOriginal(a_process, a_code);
+	}
+
+	// Same check as the mod: the first 5 bytes must be whole prologue instructions that are not RIP-relative.
+	size_t PrologueLength(const uint8_t* a_code)
+	{
+		const uint8_t b0 = a_code[0], b1 = a_code[1], b2 = a_code[2];
+		if (b0 >= 0x50 && b0 <= 0x57) return 1;
+		if ((b0 == 0x40 || b0 == 0x41) && b1 >= 0x50 && b1 <= 0x57) return 2;
+		if (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC) return 4;
+		if (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC) return 7;
+		if ((b0 == 0x48 || b0 == 0x4C) && b1 == 0x89 && (b2 & 0xC7) == 0x44 && a_code[3] == 0x24) return 5;
+		if ((b0 & 0xF0) == 0x40 && (b1 == 0x8B || b1 == 0x89) && (b2 & 0xC0) == 0xC0) return 3;
+		if ((b0 == 0x8B || b0 == 0x89) && (b1 & 0xC0) == 0xC0) return 2;
+		return 0;
+	}
+
+	bool InstallExitHooks()
+	{
+		const auto exitEntry =
+			reinterpret_cast<uintptr_t>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess"));
+		const auto terminateEntry =
+			reinterpret_cast<uintptr_t>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "TerminateProcess"));
+		for (const uintptr_t entry : { exitEntry, terminateEntry }) {
+			const auto* code = reinterpret_cast<const uint8_t*>(entry);
+			size_t covered = 0;
+			while (entry && covered < 5) {
+				const size_t length = PrologueLength(code + covered);
+				if (!length) break;
+				covered += length;
+			}
+			if (!entry || covered < 5) {
+				std::printf("  entry %p is not a known prologue; no hook\n", code);
+				return false;
+			}
+		}
+		exitOriginal = reinterpret_cast<ExitUserProcessFn>(
+			Detours::X64::DetourFunction(exitEntry, reinterpret_cast<uintptr_t>(&ExitHook)));
+		terminateOriginal = reinterpret_cast<TerminateProcessFn>(
+			Detours::X64::DetourFunction(terminateEntry, reinterpret_cast<uintptr_t>(&TerminateHook)));
+		const bool patched = *reinterpret_cast<const uint8_t*>(exitEntry) == 0xE9 &&
+		                     *reinterpret_cast<const uint8_t*>(terminateEntry) == 0xE9;
+		std::printf("  hooks: RtlExitUserProcess %s, TerminateProcess %s, entries patched: %s\n",
+			exitOriginal ? "ok" : "FAILED", terminateOriginal ? "ok" : "FAILED", patched ? "yes" : "NO");
+		return exitOriginal && terminateOriginal && patched;
+	}
+
+	// The realistic case: the NVIDIA GPU still writing into the AMD block when the process ends.
+	int RunExitGpu(Gpu& a_amd, uint32_t a_amdType, bool a_terminate)
+	{
+		static Dx a;
+		static Dx b;
+		static Route3 r3;
+		static ComPtr<ID3D12Heap> heapA;
+		static ComPtr<ID3D12Resource> peerOnA;
+		static ComPtr<ID3D12Resource> src;
+		if (!a.Create(kVendorNvidia) || !b.Create(kVendorAmd) || !SetUpRoute3(a_amd, a_amdType, b, r3)) return 1;
+		if (FAILED(a.dev->OpenExistingHeapFromAddress(r3.ptr, IID_PPV_ARGS(&heapA)))) return 1;
+		peerOnA = a.Placed(heapA.Get());
+		src = a.Buffer(D3D12_HEAP_TYPE_DEFAULT, kSize, D3D12_RESOURCE_STATE_COMMON);
+		if (!peerOnA || !src || !a.Fill(src.Get(), 0xE817E817u)) return 1;
+		if (!InstallExitHooks()) {
+			std::printf("  hooks not installed: cleaning up by hand instead of exiting with the block open\n");
+			peerOnA.Reset();
+			heapA.Reset();
+			return 1;
+		}
+
+		static Gpu* amd = &a_amd;
+		exitRelease = [](const char* a_why) {
+			LARGE_INTEGER f, t0, t1;
+			QueryPerformanceFrequency(&f);
+			QueryPerformanceCounter(&t0);
+			// 1. wait for the NVIDIA copies (2 s at most), 2. close the NVIDIA view, 3. free the AMD block.
+			bool idle = a.fence->GetCompletedValue() >= a.value;
+			if (!idle && SUCCEEDED(a.fence->SetEventOnCompletion(a.value, a.event)))
+				idle = WaitForSingleObject(a.event, 2000) == WAIT_OBJECT_0;
+			peerOnA.Reset();
+			heapA.Reset();
+			if (idle) {
+				vkDeviceWaitIdle(amd->dev);
+				vkDestroyBuffer(amd->dev, r3.blockBuf, nullptr);
+				vkUnmapMemory(amd->dev, r3.blockMem);
+				vkFreeMemory(amd->dev, r3.blockMem, nullptr);
+			}
+			QueryPerformanceCounter(&t1);
+			std::printf("  [hook] %s: NVIDIA copies %s, NVIDIA view closed, AMD block %s (%.1f ms)\n", a_why,
+				idle ? "finished" : "STILL RUNNING after 2 s", idle ? "freed" : "left to Windows",
+				static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart));
+		};
+
+		// ~260 ms of P2P writes, not waited for.
+		a.copy.allocator->Reset();
+		a.copy.list->Reset(a.copy.allocator.Get(), nullptr);
+		for (int i = 0; i < 40; ++i) a.copy.list->CopyBufferRegion(peerOnA.Get(), 0, src.Get(), 0, kSize);
+		a.copy.list->Close();
+		ID3D12CommandList* lists[] = { a.copy.list.Get() };
+		a.copy.queue->ExecuteCommandLists(1, lists);
+		a.copy.queue->Signal(a.fence.Get(), ++a.value);
+		std::printf("  40 x 64 MiB P2P copies queued; NVIDIA fence at %llu of %llu; ending the process now (%s)\n",
+			static_cast<unsigned long long>(a.fence->GetCompletedValue()), static_cast<unsigned long long>(a.value),
+			a_terminate ? "TerminateProcess" : "ExitProcess");
+		if (a_terminate) TerminateProcess(GetCurrentProcess(), 0);
+		ExitProcess(0);
+	}
+}
+#endif
+
 int wmain(int argc, wchar_t** argv)
 {
+#ifdef P2P_EXIT_HOOK
+	for (int i = 1; i < argc; ++i) {
+		const bool viaTerminate = std::wcscmp(argv[i], L"--exit-hook-terminate") == 0;
+		if (viaTerminate || std::wcscmp(argv[i], L"--exit-hook") == 0) {
+			std::setvbuf(stdout, nullptr, _IONBF, 0);
+			std::printf("p2p-probe: exit hooks only, no GPU work (%s)\n",
+				viaTerminate ? "TerminateProcess" : "ExitProcess");
+			if (!InstallExitHooks()) return 1;
+			exitRelease = [](const char* a_why) { std::printf("  [hook] release would run here (%s)\n", a_why); };
+			if (viaTerminate) TerminateProcess(GetCurrentProcess(), 3);
+			ExitProcess(2);
+		}
+	}
+#endif
 	bool dma = false;
 	bool bench = false;
 	bool interop = false;
@@ -1872,6 +2025,16 @@ int wmain(int argc, wchar_t** argv)
 			now >= usageAfter - 1.0 ? "allocation still in VRAM" : "DROPPED - evicted?");
 	};
 	printUsage("after the imports");
+
+#ifdef P2P_EXIT_HOOK
+	for (int i = 1; i < argc; ++i) {
+		const bool viaTerminate = std::wcscmp(argv[i], L"--exit-gpu-terminate") == 0;
+		if (viaTerminate || std::wcscmp(argv[i], L"--exit-gpu") == 0) {
+			std::printf("\n[exit-gpu] the process ends while the 3090 still writes into the 9060's block\n");
+			return RunExitGpu(amd, amdType, viaTerminate);
+		}
+	}
+#endif
 
 	if (pipeline) {
 		std::printf("\n[pipeline] the mod's per-frame sequence, with the 9060's work queued before the 3090 writes\n");

@@ -9,9 +9,45 @@ in FSR 4.1 mode (`bSendUITilesOnly`), then measure; only then
 [plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread, `bDisplayThread`).
 Parts 2 and the display thread aim at the last 3-4 fps to the 71 cap with Community Shaders on
 (66.6-68.5 now with `bExtraFrameInFlight = 1`). The user asked for all of them as optional settings.
-**First, though: the in-game test of `bDirectGPUCopy` (below).** UI tiles were put off by the user.
+**First, though: re-test `bDirectGPUCopy` in game, including quitting with Alt+F4 (below).** UI tiles
+were put off by the user. A single-GPU AutoHDR fix was split into its own session/branch.
 
-## Latest (2026-11-07, 23:xx): bDirectGPUCopy built, not yet run in game
+## Latest (2026-11-08, 00:1x): bDirectGPUCopy worked in game; Alt+F4 hung the PC; exit fixed
+
+First in-game run (00:02-00:04, log `MGPUScaling.log`): CS on, ReShade AutoHDR (HDR10), FSR 4.1
+Quality, 3 frames in flight, `bSendHudlessFrame = 0` (HUD MV freeze test). Every frame crossed
+directly (`709/709 frames`), check values never late, 70.9 game fps at the cap, copy on render GPU
+7.6 ms (~9.4 GB/s), Vulkan copy into the landing heaps 0.57 ms, timeline after Present: 3090 copy
+2.5-10.2, 9060 unpack 4.2-11.1, list end 12.2 ms. Earlier that evening AutoHDR had looked broken: not
+this code - the user's `MCM\Settings\MGPUScaling.ini` still had the second GPU and FG off from the
+host-memory A/B (20:41), and single-GPU mode cannot convert to a 10-bit swap chain (logged as an
+error); settings put back (second GPU, FG, FSR 4.1, bDirectGPUCopy on).
+
+**Alt+F4 then hung the PC**: Kernel-Power 41 with BugcheckCode 0 and a power-button timestamp, no
+dump, no WHEA, log ends at the last 10 s line. Cause (not proven, the hang left nothing to read): at
+exit the bridge's static destructor destroyed `peer` (declared after `lanes`) first, freeing the
+9060's Vulkan blocks while the 3090's heaps (`OpenExistingHeapFromAddress` on them) were still open,
+and it ran at DLL_PROCESS_DETACH, after the Vulkan and D3D12 drivers (loaded after this DLL) had been
+detached. Every probe run had closed the 3090's view first. Fix:
+- Hooks on `ntdll!RtlExitUserProcess` and `kernelbase!TerminateProcess` (Fallout4.exe imports both
+  ExitProcess and TerminateProcess) call `ReleaseDirectCopyForExit`: wait up to 2 s each for
+  `transferFenceA >= nextLaneValue` and `readFenceB >= readValue`, close the 3090's views, release the
+  landing heaps, `peer.Shutdown()` (only if idle), log it. Installed only if both entries start with
+  known non-RIP-relative prologue instructions (Nukem's detours copies them unrelocated; Win10 19045:
+  `40 53 48 83 EC 20` and `48 89 5C 24 08`); otherwise the direct copy stays off.
+- `DX12SwapChain::Present` and `TransferEarlyLanes` hold `bridge->LockFrame()` (recursive timed
+  mutex), so the release never lands mid-frame when another thread ends the process.
+- `peer` declared before `lanes` (destroyed after); `PeerCopy` makes no Vulkan call once
+  `RtlDllShutdownInProgress()`.
+- p2p-probe `--exit-hook[-terminate]` (hooks fire, exit codes kept) and `--exit-gpu[-terminate]`
+  (process ends with 40 x 64 MiB P2P copies running: hook waited 263 ms, closed the view, freed the
+  block, clean exit, no events). The order that hung is not exercised on purpose.
+
+**To test** (user): same settings, play a minute, quit with Alt+F4 and once via the main menu; the
+log's last line should be `direct GPU copy: the game is exiting; closed the render GPU's views of the
+display GPU's VRAM, then freed the blocks` (or `...terminating itself...`).
+
+## Earlier (2026-11-07, 23:xx): bDirectGPUCopy built
 
 The user asked whether the 3090 could copy to the 9060 without system RAM. No API does it across
 vendors (D3D12 cross-adapter heaps are system memory only; GPUDirect is Linux/NVIDIA-only; CUDA P2P

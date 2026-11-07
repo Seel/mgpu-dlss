@@ -892,16 +892,17 @@ index 0000000..ec267f1
 +bEnableDebugLogging = 0
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..0d646d7
+index 0000000..fe84188
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,2166 @@
+@@ -0,0 +1,2319 @@
 +#include "CrossAdapterBridge.h"
 +
 +#include <d3dcompiler.h>
 +
 +#include <algorithm>
 +#include <cctype>
++#include <chrono>
 +#include <format>
 +
 +namespace
@@ -1006,6 +1007,105 @@ index 0000000..0d646d7
 +	{
 +		return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1000.0 /
 +		       static_cast<double>(a_frequency.QuadPart);
++	}
++
++	// ---- bDirectGPUCopy: process-exit hooks --------------------------------------------------
++	//
++	// The render GPU's heaps on the display GPU's VRAM blocks must be closed while both drivers are still
++	// loaded and before the blocks go. At DLL_PROCESS_DETACH the drivers (loaded after this DLL) have
++	// already been detached, and TerminateProcess runs no detach at all. So the two ways a process ends
++	// are hooked: ntdll!RtlExitUserProcess (behind ExitProcess and the CRT's exit) and
++	// kernelbase!TerminateProcess. Fallout4.exe imports both.
++
++	using ExitUserProcessFn = void(NTAPI*)(LONG);
++	using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
++	ExitUserProcessFn exitUserProcessOriginal = nullptr;
++	TerminateProcessFn terminateProcessOriginal = nullptr;
++
++	void NTAPI ExitUserProcessHook(LONG a_status)
++	{
++		CrossAdapterBridge::GetSingleton()->ReleaseDirectCopyForExit("the game is exiting");
++		exitUserProcessOriginal(a_status);
++	}
++
++	BOOL WINAPI TerminateProcessHook(HANDLE a_process, UINT a_exitCode)
++	{
++		if (a_process == GetCurrentProcess() || GetProcessId(a_process) == GetCurrentProcessId())
++			CrossAdapterBridge::GetSingleton()->ReleaseDirectCopyForExit("the game is terminating itself");
++		return terminateProcessOriginal(a_process, a_exitCode);
++	}
++
++	// The detour library copies the entry's first instructions (a 5-byte jump's worth) into its trampoline
++	// without fixing RIP-relative ones. Only hook an entry whose first instructions are ones known not to
++	// be relative: the usual prologue forms. (Win10 19045: RtlExitUserProcess starts push rbx / sub rsp,
++	// TerminateProcess mov [rsp+8],rbx.) Anything else: no hook, and then no direct copy.
++	size_t PrologueInstructionLength(const std::uint8_t* a_code)
++	{
++		const std::uint8_t b0 = a_code[0];
++		const std::uint8_t b1 = a_code[1];
++		const std::uint8_t b2 = a_code[2];
++		if (b0 >= 0x50 && b0 <= 0x57)
++			return 1;  // push r64
++		if ((b0 == 0x40 || b0 == 0x41) && b1 >= 0x50 && b1 <= 0x57)
++			return 2;  // push r64 with REX
++		if (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC)
++			return 4;  // sub rsp, imm8
++		if (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC)
++			return 7;  // sub rsp, imm32
++		if ((b0 == 0x48 || b0 == 0x4C) && b1 == 0x89 && (b2 & 0xC7) == 0x44 && a_code[3] == 0x24)
++			return 5;  // mov [rsp+disp8], r64
++		if ((b0 & 0xF0) == 0x40 && (b1 == 0x8B || b1 == 0x89) && (b2 & 0xC0) == 0xC0)
++			return 3;  // mov r64, r64
++		if ((b0 == 0x8B || b0 == 0x89) && (b1 & 0xC0) == 0xC0)
++			return 2;  // mov r32, r32
++		return 0;
++	}
++
++	bool SafeToDetour(std::uintptr_t a_entry)
++	{
++		if (stl::detail::HookedEntryTarget(a_entry))
++			return true;  // another hook's jump: DetourOrChain chains behind it, nothing is copied
++		const auto* code = reinterpret_cast<const std::uint8_t*>(a_entry);
++		size_t covered = 0;
++		while (covered < 5) {
++			const size_t length = PrologueInstructionLength(code + covered);
++			if (!length)
++				return false;
++			covered += length;
++		}
++		return true;
++	}
++
++	bool InstallExitHooks()
++	{
++		static bool installed = false;
++		if (installed)
++			return true;
++		const auto exitEntry = reinterpret_cast<std::uintptr_t>(
++			GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess"));
++		const auto terminateEntry = reinterpret_cast<std::uintptr_t>(
++			GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "TerminateProcess"));
++		if (!exitEntry || !terminateEntry) {
++			REX::ERROR("[FG-GPU1] direct GPU copy: RtlExitUserProcess / TerminateProcess not found");
++			return false;
++		}
++		for (const auto entry : { exitEntry, terminateEntry }) {
++			if (!SafeToDetour(entry)) {
++				const auto* code = reinterpret_cast<const std::uint8_t*>(entry);
++				REX::ERROR("[FG-GPU1] direct GPU copy: cannot hook the process exit safely on this Windows build (entry at "
++						   "{:#x} starts {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X})",
++					entry, code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
++				return false;
++			}
++		}
++		exitUserProcessOriginal = reinterpret_cast<ExitUserProcessFn>(stl::detail::DetourOrChain(exitEntry,
++			reinterpret_cast<std::uintptr_t>(&ExitUserProcessHook), "RtlExitUserProcess"));
++		terminateProcessOriginal = reinterpret_cast<TerminateProcessFn>(stl::detail::DetourOrChain(terminateEntry,
++			reinterpret_cast<std::uintptr_t>(&TerminateProcessHook), "TerminateProcess"));
++		installed = exitUserProcessOriginal && terminateProcessOriginal;
++		if (!installed)
++			REX::ERROR("[FG-GPU1] direct GPU copy: hooking the process exit failed");
++		return installed;
 +	}
 +
 +	const char* TimingName(CrossAdapterBridge::LaneTiming a_timing)
@@ -1507,13 +1607,18 @@ index 0000000..0d646d7
 +				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(checkUploadA.put()));
 +			if (SUCCEEDED(hr))
 +				hr = checkUploadA->Map(0, nullptr, reinterpret_cast<void**>(&checkCpu));
-+			if (SUCCEEDED(hr)) {
-+				directCopy = true;
-+			} else {
++			if (FAILED(hr)) {
 +				REX::ERROR("[FG-GPU1] direct GPU copy: the check-value buffer failed (hr={:#010x}); frames cross through "
 +						   "system memory instead",
 +					static_cast<std::uint32_t>(hr));
 +				DisableDirectCopy();
++			} else if (!InstallExitHooks()) {
++				// Without a clean release at exit the render GPU would still hold the blocks when Windows
++				// tears the process down; that is what hung the PC on Alt+F4 with the first build.
++				REX::ERROR("[FG-GPU1] direct GPU copy: no safe release at exit; frames cross through system memory instead");
++				DisableDirectCopy();
++			} else {
++				directCopy = true;
 +			}
 +		}
 +	}
@@ -1735,6 +1840,54 @@ index 0000000..0d646d7
 +	peer.Shutdown();
 +	checkCpu = nullptr;
 +	checkUploadA = nullptr;
++}
++
++void CrossAdapterBridge::ReleaseDirectCopyForExit(const char* a_why) noexcept
++{
++	// On the render thread (where FO4 quits) the lock is free or already ours; on another thread wait for
++	// the frame being assembled to finish. If that takes over 2 s, leave things alone rather than pull
++	// the heaps out from under it.
++	std::unique_lock<std::recursive_timed_mutex> lock(frameMutex, std::defer_lock);
++	if (!lock.try_lock_for(std::chrono::seconds(2))) {
++		REX::WARN("[FG-GPU1] direct GPU copy: {}, but the render thread kept the bridge for 2 s; not released", a_why);
++		return;
++	}
++
++	bool open = false;
++	for (const auto& lane : lanes)
++		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr;
++	if (!open && !peer.Ready())
++		return;
++	directCopy = false;
++
++	// Everything the GPUs were given: the render GPU's lane copies (each signals the transfer fence), and
++	// the display GPU's reads (each waited for its Vulkan copy before it ran, then signalled readFenceB).
++	bool idle = true;
++	if (transferFenceA && nextLaneValue)
++		idle &= SUCCEEDED(WaitCpu(transferFenceA.get(), nextLaneValue));
++	if (readFenceB && readValue)
++		idle &= SUCCEEDED(WaitCpu(readFenceB.get(), readValue));
++
++	// The render GPU's views first (this ends its lock on the blocks' pages), then the display GPU's side.
++	for (auto& lane : lanes) {
++		lane.peerStagingA = nullptr;
++		lane.peerHeapA = nullptr;
++	}
++	for (auto& lane : lanes) {
++		lane.landingB = nullptr;
++		lane.landingHeapB = nullptr;
++		lane.peerMapped = nullptr;
++		lane.peerLane = -1;
++		lane.checkPending = {};
++	}
++	// The Vulkan side (it waits for its own queue). If the GPUs were not idle its copies may still read
++	// the blocks: those are then left to Windows' teardown, which is safe now that the render GPU has let go.
++	if (idle)
++		peer.Shutdown();
++	checkCpu = nullptr;
++	checkUploadA = nullptr;
++	REX::INFO("[FG-GPU1] direct GPU copy: {}; closed the render GPU's views of the display GPU's VRAM, then {}", a_why,
++		idle ? "freed the blocks" : "left the blocks to Windows (the GPUs were still busy after 2 s)");
 +}
 +
 +void CrossAdapterBridge::TripDirectCopy(const std::string& a_why)
@@ -3064,10 +3217,10 @@ index 0000000..0d646d7
 +}
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
 new file mode 100644
-index 0000000..66e607e
+index 0000000..2641718
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,500 @@
 +#pragma once
 +
 +// CrossAdapterBridge - frame generation on a second GPU.
@@ -3124,6 +3277,7 @@ index 0000000..66e607e
 +
 +#include <array>
 +#include <cstdint>
++#include <mutex>
 +#include <string>
 +#include <vector>
 +
@@ -3302,6 +3456,21 @@ index 0000000..66e607e
 +	void LogStats();
 +
 +	void Shutdown() noexcept;
++
++	// The render thread holds this while it uses the bridge for a frame (DX12SwapChain::Present and
++	// TransferEarlyLanes), so ReleaseDirectCopyForExit, which runs on whichever thread ends the process,
++	// never lands in the middle of one. Uncontended in normal play.
++	[[nodiscard]] std::unique_lock<std::recursive_timed_mutex> LockFrame()
++	{
++		return std::unique_lock<std::recursive_timed_mutex>(frameMutex);
++	}
++
++	// bDirectGPUCopy, at process exit (hooked ExitProcess / TerminateProcess, before any driver unloads):
++	// waits up to 2 s each for the copies in flight, closes the render GPU's views of the display GPU's
++	// VRAM blocks, then frees the blocks. The first build had no such step: the destructors freed the
++	// blocks first, while the drivers were already unloading, and the PC hung on Alt+F4 (2026-11-08).
++	// No-op without direct copy.
++	void ReleaseDirectCopyForExit(const char* a_why) noexcept;
 +
 +private:
 +	struct Lane
@@ -3505,12 +3674,17 @@ index 0000000..66e607e
 +	std::array<UINT64, kMaxLanes> laneValue{};          // value signalled for each lane this frame
 +	std::array<UINT64, kMaxLanes> laneFrame{};          // frame that last copied each lane
 +
++	// bDirectGPUCopy: the Vulkan side owns the display GPU's VRAM blocks. Declared before `lanes`, so a
++	// destructor run releases the render GPU's heaps on those blocks (in `lanes`) first, and only then
++	// the blocks: never the other way round (see ReleaseDirectCopyForExit).
++	PeerCopy peer;
++
 +	std::vector<Lane> lanes;
 +	UINT64 bytesPerFrame = 0;
 +
 +	// bDirectGPUCopy
 +	static constexpr UINT64 kCheckStride = 256;  // per lane and slot in the upload buffer; also the space behind the data
-+	PeerCopy peer;
++	std::recursive_timed_mutex frameMutex;  // LockFrame / ReleaseDirectCopyForExit
 +	bool directCopy = false;         // lanes cross through B's VRAM blocks (all set up, guard not tripped)
 +	bool directCopyTripped = false;  // the guard tripped this session
 +	bool frameDirect = false;        // the path of the frame being assembled, fixed in PrepareFrame
@@ -3657,7 +3831,7 @@ index 81be80f..b4024b8 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..b60f68f 100644
+index e10d528..f3e2d10 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
 @@ -1,9 +1,13 @@
@@ -3719,7 +3893,7 @@ index e10d528..b60f68f 100644
  void DX12SwapChain::CreateD3D12CommandQueues()
  {
  	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-@@ -39,18 +80,41 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+@@ -39,18 +80,42 @@ void DX12SwapChain::CreateD3D12CommandQueues()
  
  	DX::ThrowIfFailed(d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue)));
  
@@ -3738,6 +3912,7 @@ index e10d528..b60f68f 100644
 +{
 +	auto upscaling = Upscaling::GetSingleton();
 +	auto bridge = CrossAdapterBridge::GetSingleton();
++	const auto bridgeLock = bridge->LockFrame();  // ReleaseDirectCopyForExit waits for this
 +	if (!secondaryGPU || !bridge->IsActive() || !upscaling->settings.earlyTransfer)
 +		return;
 +	if (!d3d11Context || !d3d11Fence || !d3d12Fence || !bridge->HasLanes(a_timing))
@@ -3763,7 +3938,7 @@ index e10d528..b60f68f 100644
  	swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
  	swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
  	swapChainDesc.Format = a_swapChainDesc.BufferDesc.Format;
-@@ -81,34 +145,51 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+@@ -81,34 +146,51 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
  		CreateSwapChainFSR3(a_dxgiFactory, a_swapChainDesc);
  	}
  
@@ -3834,7 +4009,7 @@ index e10d528..b60f68f 100644
  }
  
  void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
-@@ -145,9 +226,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -145,9 +227,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -3850,7 +4025,7 @@ index e10d528..b60f68f 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +251,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +252,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -3859,7 +4034,7 @@ index e10d528..b60f68f 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +264,49 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +265,49 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -3911,8 +4086,12 @@ index e10d528..b60f68f 100644
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -211,6 +337,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -209,8 +336,14 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
+ 
+ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  {
++	// The whole frame's use of the bridge: ReleaseDirectCopyForExit (process exit, any thread) waits for it.
++	const auto bridgeLock = CrossAdapterBridge::GetSingleton()->LockFrame();
  	auto upscalingForUI = Upscaling::GetSingleton();
  
 +	// The game's work for this frame is all recorded: timestamp its end on the render GPU.
@@ -3922,7 +4101,7 @@ index e10d528..b60f68f 100644
  	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
  	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
  	// so presenting HUDLess prevents UI from being warped. UIColorAndAlpha tells DLSS-G
-@@ -239,17 +369,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +372,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -3997,7 +4176,7 @@ index e10d528..b60f68f 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -282,6 +464,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -282,6 +467,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			useFrameGenerationThisFrame = upscaling->settings.frameGenerationMode && main->gameActive && !menuBlock && !ui->movementToDirectionalCount;
  		}
  	}
@@ -4008,7 +4187,7 @@ index e10d528..b60f68f 100644
  
  	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG) {
  		auto dlssg = StreamlineFG::GetSingleton();
-@@ -358,9 +544,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -358,9 +547,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			xessFrameId++;
  		}
  	} else {
@@ -4037,7 +4216,7 @@ index e10d528..b60f68f 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +574,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +577,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -4060,7 +4239,7 @@ index e10d528..b60f68f 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +657,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +660,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -4079,7 +4258,7 @@ index e10d528..b60f68f 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +677,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +680,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -4131,7 +4310,7 @@ index e10d528..b60f68f 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +730,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +733,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -4170,7 +4349,7 @@ index e10d528..b60f68f 100644
  	// Clear resources
  	upscaling->Reset();
  
-@@ -472,6 +773,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -472,6 +776,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (SyncInterval == 0 && !upscaling->highFPSPhysicsFixLoaded)
  		upscaling->FrameLimiter(useFrameGenerationThisFrame);
  
@@ -4180,7 +4359,7 @@ index e10d528..b60f68f 100644
  	return S_OK;
  }
  
-@@ -485,6 +789,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
+@@ -485,6 +792,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
  	return swapChain->GetDevice(uuid, ppDevice);
  }
  
@@ -4305,7 +4484,7 @@ index e10d528..b60f68f 100644
  WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)
  {
  	// Create D3D11 shared texture directly instead of wrapping D3D12 resource
-@@ -614,7 +1036,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
+@@ -614,7 +1039,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
  {
@@ -5526,10 +5705,10 @@ index 0000000..9d40662
 +inline constexpr unsigned int kMaxFrameSlots = 3;
 diff --git a/plugins/FrameGeneration/src/PeerCopy.cpp b/plugins/FrameGeneration/src/PeerCopy.cpp
 new file mode 100644
-index 0000000..ea83fac
+index 0000000..0f9e801
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/PeerCopy.cpp
-@@ -0,0 +1,671 @@
+@@ -0,0 +1,692 @@
 +#include "PeerCopy.h"
 +
 +#define VK_NO_PROTOTYPES
@@ -5540,6 +5719,7 @@ index 0000000..ea83fac
 +#include <array>
 +#include <cstring>
 +#include <string>
++#include <tuple>
 +#include <vector>
 +
 +#include "FrameSlots.h"
@@ -5588,6 +5768,15 @@ index 0000000..ea83fac
 +		REX::ERROR("[FG-GPU1] direct GPU copy: {} ({}); frames cross through system memory instead", a_what,
 +			VkName(a_result));
 +		return false;
++	}
++
++	// True during the DLL detach phase of a process that is ending (ntdll!RtlDllShutdownInProgress).
++	bool ProcessIsEnding() noexcept
++	{
++		using ShutdownInProgressFn = BOOLEAN(NTAPI*)();
++		static const auto shutdownInProgress = reinterpret_cast<ShutdownInProgressFn>(
++			GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlDllShutdownInProgress"));
++		return shutdownInProgress && shutdownInProgress();
 +	}
 +
 +	bool Failed(const char* a_what, HRESULT a_hr)
@@ -5707,6 +5896,17 @@ index 0000000..ea83fac
 +
 +	void Destroy() noexcept
 +	{
++		// At DLL_PROCESS_DETACH of a process that is ending, the Vulkan driver and the D3D12 drivers (loaded
++		// after this DLL) have already been detached: calling into them is unsafe. Leave everything to
++		// Windows' process teardown; the bridge's exit hook has normally released it all before this.
++		if (ProcessIsEnding()) {
++			std::ignore = fence.detach();
++			std::ignore = deviceB.detach();
++			device = VK_NULL_HANDLE;
++			instance = VK_NULL_HANDLE;
++			lanes.clear();
++			return;
++		}
 +		if (CanDestroy()) {
 +			// The Vulkan queue may wait for a "landed" that the display GPU's copy queue never signals (a
 +			// transfer that never finished). Give it two seconds, then release those waits from the CPU so

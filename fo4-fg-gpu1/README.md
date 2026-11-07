@@ -486,6 +486,17 @@ session**, so it cannot go unnoticed:
 [FG-GPU1] direct GPU copy guard: lane 'final frame' slot 1: the render GPU wrote check value ... into the display GPU's VRAM block, but the block holds ... Frames cross through system memory from the next frame on and frame generation is OFF for the rest of the session. ...
 ```
 
+**At exit.** The 3090's view of a block must close before the block is freed, and both while the
+drivers are still loaded: the first build did it the other way round in its destructors, after the
+drivers had begun unloading, and the PC hung on Alt+F4. The plugin now hooks the two ways a process
+ends, `ntdll!RtlExitUserProcess` (behind `ExitProcess` and the CRT's `exit`) and
+`kernelbase!TerminateProcess` (Fallout4.exe imports both). There it waits up to 2 s for the copies in
+flight, closes the 3090's views, then frees the blocks, and logs it. The render thread holds a lock
+for each frame's bridge work, so this never lands mid-frame. The hooks are only installed when the
+entry points start with known prologue instructions (the detour library cannot relocate RIP-relative
+ones); if they cannot be installed, the direct copy stays off. After the plugin's own DLL detach
+has begun, nothing calls into the Vulkan driver any more.
+
 Needs `bAsyncUnpack = 1`, Resizable BAR (Smart Access Memory) on the 9060 and its Vulkan driver.
 If any of it is missing, or any setup step fails, the log says which and the frames go through
 system memory as before, with frame generation unaffected. Costs ~2× the payload × frames in flight
@@ -513,7 +524,7 @@ rate (~10 GB/s), and `display GPU: unpack` the local copy out of the landing hea
   `[FSR] generating a frame failed`, stutter, a crash), set `iFSRRuntime = 0` to go back to
   exactly the previous behaviour.
 
-- **`bDirectGPUCopy` has had no in-game run yet.** Everything it does was verified outside the game with `tools/p2p-probe`, not inside FO4 with ReShade loaded. If frame generation turns itself off, look for `direct GPU copy guard` in the log; for anything else odd (no picture, stutter, a crash at start), set it back to 0. It creates a Vulkan instance in the game process with implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~` while it is created), so overlays' Vulkan layers stay out.
+- **`bDirectGPUCopy` is new.** First in-game run (2026-11-08, CS, ReShade AutoHDR, FSR 4.1 Quality, 3 frames in flight): every frame crossed directly at the 70.9 fps cap, check values never late, but **Alt+F4 hung the PC** (no bugcheck, power button). The first build freed the 9060's VRAM blocks in its destructors, after the drivers had started unloading and while the 3090 still had them open. The current build releases them in the right order before anything unloads (see "At exit" in [Direct GPU-to-GPU copy](#direct-gpu-to-gpu-copy-bdirectgpucopy-experimental)); `tools/p2p-probe --exit-gpu` checks that with copies in flight. Not yet re-tested in game: after quitting, the log should end with `direct GPU copy: the game is exiting; closed the render GPU's views ...`. If frame generation turns itself off, look for `direct GPU copy guard`; for anything else odd, set it back to 0. It creates a Vulkan instance in the game process with implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~` while it is created), so overlays' Vulkan layers stay out.
 - **Cross-adapter heap 3090 → 9060 XT.** MGPU Bridge proved AMD → NVIDIA. This direction should work the same way, and if it fails the code tries the reverse automatically. If both fail, the log shows the HRESULT and frame generation stays on the 3090.
 - **A failure after startup is not recovered.** Once the bridge is up, the first failed HRESULT — including the 2 s timeout waiting for the previous frame's copy if the secondary GPU's queue stalls — disables the transport for the rest of the session. `secondaryGPU` stays selected, so the game keeps running but no new frame reaches the screen (`CRITICAL [FG-GPU1] transport is down`). Restart the game; there is no automatic single-GPU fallback after this point.
 - **HDR add-ons are followed at startup only.** A swap-chain format set while FFX creates it is handled (previous section); one changed later (HDR toggled in game) is not seen and needs a restart. The finished-frame copy refuses formats it cannot copy into (it used to compare only size and row pitch, which 8-bit and 10-bit share), so if the conversion is not set up for some reason the screen stays black and the log has `lane 'final frame' is ... format 28 but its destination is ... format 24; skipping the copy`.
