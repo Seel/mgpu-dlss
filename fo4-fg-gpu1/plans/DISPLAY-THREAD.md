@@ -1,7 +1,7 @@
 # Plan: run the display GPU's side of each frame on its own thread
 
-Status: planned 2026-11-07, not started. Do [UI-TILES.md](UI-TILES.md) first and measure again:
-if the tiles bring the game to the 71 cap with CS on, this may not be needed.
+Status: planned 2026-11-07, not started. Do both parts of [UI-TILES.md](UI-TILES.md) first and
+measure again: if the tiles bring the game to the 71 cap with CS on, this may not be needed.
 New setting, off by default: `bDisplayThread` in `[FrameGeneration]` (restart).
 
 ## Why

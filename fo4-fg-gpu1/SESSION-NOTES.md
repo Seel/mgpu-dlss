@@ -2,11 +2,13 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
-**Next session: start with [plans/UI-TILES.md](plans/UI-TILES.md)** (send only the finished frame's
-UI tiles in FSR 4.1 mode, new setting `bSendUITilesOnly`), then measure; only then
+**Next session: start with [plans/UI-TILES.md](plans/UI-TILES.md)**, in its order: part 1, freeze
+the HUD in generated frames with a motion-vector mask (for second-GPU frame generation without FSR
+4.1; new setting `iHudMode`, the user's idea), then part 2, send only the finished frame's UI tiles
+in FSR 4.1 mode (`bSendUITilesOnly`), then measure; only then
 [plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread, `bDisplayThread`).
-Both aim at the last 3-4 fps to the 71 cap with Community Shaders on (66.6-68.5 now with
-`bExtraFrameInFlight = 1`). The user asked for both as optional settings.
+Parts 2 and the display thread aim at the last 3-4 fps to the 71 cap with Community Shaders on
+(66.6-68.5 now with `bExtraFrameInFlight = 1`). The user asked for all of them as optional settings.
 
 ## Latest (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
 

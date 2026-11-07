@@ -33,7 +33,7 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
-| `plans/` | Planned work not started yet: `UI-TILES.md` (send only the UI tiles of the finished frame), `DISPLAY-THREAD.md` (FFX Present on its own thread) |
+| `plans/` | Planned work not started yet: `UI-TILES.md` (freeze the HUD with a motion-vector mask, then send only the UI tiles of the finished frame), `DISPLAY-THREAD.md` (FFX Present on its own thread) |
 | `../.github/workflows/fo4-fg-gpu1.yml` | GitHub Actions build (seen from this folder) |
 
 The changes:

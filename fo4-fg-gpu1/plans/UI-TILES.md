@@ -1,9 +1,95 @@
-# Plan: send only the UI tiles of the finished frame (FSR 4.1 mode)
+# Plan: UI handling in second-GPU mode
 
-Status: planned 2026-11-07, not started. Do this before [DISPLAY-THREAD.md](DISPLAY-THREAD.md).
+Status: planned 2026-11-07, not started. Two parts, in this order, both before
+[DISPLAY-THREAD.md](DISPLAY-THREAD.md):
+
+1. **Freeze the HUD in generated frames with a motion-vector mask** (for second-GPU frame
+   generation *without* FSR 4.1, as a cheap alternative to sending the UI-free frame). Smaller and
+   self-contained; do it first. New setting: `iHudMode` in `[FrameGeneration]`.
+2. **Send only the UI tiles of the finished frame** (FSR 4.1 mode, the user's setup). New setting
+   `bSendUITilesOnly`.
+
+They solve different problems: part 1 is about HUD smearing when no UI-free frame is sent; part 2
+is about the cost of getting the UI to the 9060 at all in FSR 4.1 mode, where nothing smears. Part
+1's UI mask pass (3090) and part 2's tile pass compare the same two images and can share code.
+
+## Part 1: freeze the HUD with a motion-vector mask (do first)
+
+### Why
+
+Without FSR 4.1 on the second GPU (the render GPU upscales with DLSS/FSR 3.1 or renders natively,
+e.g. a second GPU that cannot run FSR 4.1), the HUD has two options today:
+- `bSendHudlessFrame = 1`: a UI-free copy of every frame crosses PCIe (33.2 MB at 4K, ~25% of the
+  traffic, ~2.7 ms copy + read); FSR 3 interpolates the scene only, the HUD stays clean.
+- `bSendHudlessFrame = 0`: no extra copy; FSR 3 interpolates the finished frame, HUD included, with
+  the scene's motion vectors under it, so the HUD smears during camera movement.
+
+Middle option (user's idea): send only a small mask of where the UI is and set the motion vectors
+to zero there before frame generation. FSR 3 then sees "nothing moves here"; its own optical flow,
+computed from the frames, also finds ~0 for a static HUD, so both inputs agree and static, solid
+HUD elements (compass, health/AP bars, ammo counter, crosshair) should stop smearing. Expected
+limits: where the scene shows through thin text or translucent UI, that scene is held still in
+generated frames: a faint halo/ghosting at UI edges instead of smeared text. Not as clean as the
+UI-free frame; costs well under 1 MB per frame instead of 33 MB. Whether it looks good enough has
+to be judged in game.
+
+### Design
+
+Render GPU (3090, D3D11):
+- At PostDisplay keep a local (not shared, never transferred) copy of the frame buffer before the
+  UI. Today `Upscaling::PostDisplay` returns early when `!hudlessActive` ("nothing reads the
+  HUD-less buffer"); in mask mode it copies into a local texture instead (a 4K GPU copy, ~0.1 ms).
+- At the top of `DX12SwapChain::Present`, a compute pass compares the finished frame
+  (`swapChainBufferProxy`) with that copy and writes a mask at the motion-vector lane's resolution
+  (full, or half with `iHalfResDepthMV = 2`): a mask texel is set if any finished-frame pixel it
+  covers differs, then the mask is dilated by a few texels (setting `iHudMaskDilate`, default 2) so
+  text outlines and anti-aliased edges are covered. R8_UINT; at 4K full res 8.3 MB, so store it at
+  quarter resolution of the MV lane (one texel per 4x4 MV texels, ~0.5 MB at 4K) and expand on the
+  9060. `GenerateUIBufferCS.hlsl` (the DLSS-G path's UI extraction: finished vs HUD-less) is the
+  reference for the comparison.
+- New lane `'HUD mask'`, timing `kPresent` (it is only known once the UI is drawn). The motion
+  vectors keep crossing early at the world pass; only the tiny mask waits for Present.
+
+Display GPU (9060, D3D12), on the frame's direct list before `FidelityFX::Present` records the
+prepare dispatch:
+- A compute pass writes zero into the motion-vector mirror (`motionVectorBufferShared12[slot]`)
+  wherever the (expanded) mask is set. Writing in place needs a UAV on the mirror; the D3D11
+  source texture is created with `D3D11_BIND_UNORDERED_ACCESS`, so the mirror's desc should carry
+  `ALLOW_UNORDERED_ACCESS` — verify; otherwise zero into a second per-slot MV texture and hand that
+  to FFX. Barriers: mirror COMMON → UAV → COMMON (the mirrors are COMMON between uses).
+- FFX keeps getting an empty `HUDLessColor` (it then uses the back buffer for optical flow) and
+  the masked motion vectors.
+
+Settings: `iHudMode` in `[FrameGeneration]` (restart; it decides the lanes), replacing what
+`bSendHudlessFrame` selects in second-GPU mode without FSR 4.1:
+- `0` interpolate the HUD (today's `bSendHudlessFrame = 0`);
+- `1` send the UI-free frame (today's `bSendHudlessFrame = 1`, default);
+- `2` freeze the HUD (motion-vector mask).
+Keep reading `bSendHudlessFrame` when `iHudMode` is absent (0 → 0, 1 → 1), as `LoadSettings`
+already does for the older `bTransportHudLess`. Ignored in FSR 4.1 mode (logged once), where the
+UI-free frame is the FSR 4.1 output. MCM: replace the "Send UI-free Frame" switch on the Second GPU
+page with a 3-way stepper.
+
+### Steps
+
+1. Mask pass on the 3090 only, plus a log line (masked fraction of the screen, avg/max per 10 s);
+   no lane yet. Check with the HUD hidden (`tm`) that the mask is empty.
+2. Mask lane + the 9060 zeroing pass + `iHudMode`.
+3. Test in game with FSR 4.1 off (`[Upscaling] iUpscaleMethodPreference = 0`, or `2`/`1` to
+   upscale on the 3090) at the same spot, `iHudMode` 0 / 1 / 2: HUD smear during fast camera turns,
+   text crispness, halo around UI over moving scenery, subtitles, notifications, scopes, power
+   armor HUD; PCIe payload and the `timeline` line (mode 2 should be close to mode 0's payload).
+
+### Acceptance
+
+- Mode 2 visibly reduces HUD smearing against mode 0, at ~mode 0's PCIe cost.
+- No change in modes 0 and 1 against today, and none in FSR 4.1 mode.
+
+## Part 2: send only the UI tiles of the finished frame (FSR 4.1 mode)
+
 New setting, off by default until measured: `bSendUITilesOnly` in `[FrameGeneration]`.
 
-## Why
+### Why
 
 With FSR 4.1 on the second GPU, the 9060 only needs the finished 4K frame for its UI: the composite
 (`SecondaryUpscaleCS.hlsl`, `Composite`) keeps the FSR 4.1 result wherever the finished frame equals
@@ -25,9 +111,9 @@ sending only the 32x32 tiles that contain UI (plus a small tile map) should cut 
 chain, which is about what separates 67-68 fps from the 71 cap. Expected side effect: less PCIe
 and less 9060 read bandwidth every frame; no change in latency or image (exact, not lossy).
 
-## Design
+### Design
 
-### Render GPU (3090, D3D11, at the top of `DX12SwapChain::Present`)
+#### Render GPU (3090, D3D11, at the top of `DX12SwapChain::Present`)
 
 The clean background still exists at Present: `Upscaling::FillFrameBufferFromScene` writes the
 bilinear stretch into `sceneBlitTarget` and copies it into the frame buffer; the UI is then drawn
@@ -58,7 +144,7 @@ skipped too (saves a 33 MB copy on the 3090).
 Anything drawn after PostDisplay that is not UI (the README's known risk: effects after the UI
 boundary) simply produces more tiles: the method is exact for any change, it only costs bytes.
 
-### Which lanes cross each frame
+#### Which lanes cross each frame
 
 - Upscaled frame (`frameUpscaled[fi]`), tiles on, fallback not active → `tileMap` + `atlas` lanes.
 - Native frame (menus, loading, Pip-Boy: rendered at full resolution) or fallback → the existing
@@ -70,7 +156,7 @@ If a tile frame still overflows (sudden full-screen UI), the overflowed tiles sh
 result without their UI for that frame; count and log it (`overflow frames`). If that shows up in
 practice, raise the budget or make overflow frames native (not upscaled) instead.
 
-### Bridge (`CrossAdapterBridge`)
+#### Bridge (`CrossAdapterBridge`)
 
 Today every lane crosses every frame and `Unpack` fails if one did not
 (`"Unpack (a lane was not transferred for this frame)"`). Add a per-frame lane selection:
@@ -82,7 +168,7 @@ Today every lane crosses every frame and `Unpack` fails if one did not
 - Stats: `MB/frame` from the bytes actually sent this frame, and a per-10 s line with tiles sent
   (avg/max), tile frames vs full frames, fallbacks, overflows.
 
-### Display GPU (9060, `SecondaryUpscale`)
+#### Display GPU (9060, `SecondaryUpscale`)
 
 - Mirrors of `tileMap` and `atlas` per slot (normal `AddLane(..., createMirror=true)`).
 - New shader entry `CompositeTiles` in `SecondaryUpscaleCS.hlsl`: per pixel, `slot =
@@ -93,14 +179,14 @@ Today every lane crosses every frame and `Unpack` fails if one did not
   `kDescriptorsPerSlot` 4 → 6. `RecordPresent(..., bool a_tiles)` picks the PSO.
 - Writes the display format (HDR-aware as now): no change to the conversion logic.
 
-### Settings / MCM
+#### Settings / MCM
 
 `[FrameGeneration]` `bSendUITilesOnly = 0` (restart: the lanes are created at startup) and
 `iUITileBudgetPercent = 15` (restart). MCM: Second GPU page, next to `bExtraFrameInFlight`.
 Only meaningful with FSR 4.1 on the second GPU (`iUpscaleMethodPreference = 3`); log once and
 ignore otherwise.
 
-## Steps
+### Steps
 
 1. **Measure first (cheap):** add only the 3090 tile pass + counter readback, no lane changes, and
    log tiles with UI per frame (avg, p95, max) in normal play, menus excluded. Confirms the budget
@@ -113,7 +199,7 @@ ignore otherwise.
 4. Test in game (below), PresentMon A/B (`tools/presentmon-capture.ps1`) at the same spot, tiles
    on/off, with and without `bExtraFrameInFlight`.
 
-## Tests and acceptance
+### Tests and acceptance
 
 - Log: `tiles sent avg/max`, payload MB/frame drops from 73.8 to ~45 at 4K Quality on tile frames,
   `3090 copy` end and `9060 unpack` end move ~2-5 ms earlier, `render thread blocked` and
@@ -126,7 +212,7 @@ ignore otherwise.
   1% to force it; must switch to full frames without artifacts and back.
 - Off: `bSendUITilesOnly = 0` must behave exactly as today.
 
-## Risks / open questions
+### Risks / open questions
 
 - Exactness relies on the frame buffer being a straight copy of `sceneBlitTarget` until the UI;
   verify in step 1. If some engine pass writes the frame buffer between PostDisplay and the UI in
