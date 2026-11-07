@@ -70,12 +70,7 @@ bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_
 	// created it) needs a shader pass, because copies do not convert.
 	const bool convert = a_displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM;
 	if (convert) {
-		D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
-		support.Format = a_displayFormat;
-		const bool storable = SUCCEEDED(a_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
-		                      (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
-		                      (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
-		if (!storable) {
+		if (!Storable(a_device, a_displayFormat)) {
 			REX::CRITICAL("[FG-GPU1] the swap chain is format {} ({}), which the display GPU cannot write from a shader; "
 						  "frames cannot be shown. Disable the add-on that changes it (e.g. ReShade's AutoHDR)",
 				static_cast<int>(a_displayFormat), FormatName(a_displayFormat));
@@ -115,6 +110,91 @@ bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_
 		}
 	}
 	return false;
+}
+
+bool SecondaryUpscale::Storable(ID3D12Device* a_device, DXGI_FORMAT a_format)
+{
+	D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+	support.Format = a_format;
+	return SUCCEEDED(a_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+	       (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+	       (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+}
+
+bool SecondaryUpscale::InitializeLocalConversion(ID3D12Device* a_device, UINT a_width, UINT a_height,
+	DXGI_FORMAT a_displayFormat, DXGI_FORMAT a_sourceFormat, UINT a_slots)
+{
+	if (planned || converting || !a_device)
+		return false;
+
+	// Single-GPU mode: no upscaling here, only the pass second-GPU mode uses for frames it does not
+	// upscale. The game's frame is read as it is (t1) and stored in the swap chain's format; the
+	// copy engine moves the result into the back buffer.
+	if (!Storable(a_device, a_displayFormat)) {
+		REX::ERROR("[FG] the swap chain is format {} ({}), which this GPU cannot write from a shader; frames are copied "
+				   "into it unconverted, so the picture will be wrong. Disable the add-on that changes it (e.g. ReShade's "
+				   "AutoHDR)",
+			static_cast<int>(a_displayFormat), FormatName(a_displayFormat));
+		return false;
+	}
+
+	displayWidth = renderWidth = a_width;
+	displayHeight = renderHeight = a_height;
+	displayFormat = a_displayFormat;
+	sourceFormat = a_sourceFormat;
+	localSlots = std::clamp(a_slots, 1u, kSlots);
+	device.copy_from(a_device);
+	if (!CreatePipeline(false)) {
+		REX::ERROR("[FG] the conversion pass for the {} swap chain could not be set up; frames are copied into it "
+				   "unconverted, so the picture will be wrong. Disable the add-on that changes the format (e.g. ReShade's "
+				   "AutoHDR)",
+			FormatName(a_displayFormat));
+		return false;
+	}
+	local = true;
+	converting = true;
+	REX::INFO("[FG] the swap chain is {} (format {}), the game renders {} (format {}): every frame is converted on the "
+			  "game's GPU on its way into the back buffer (single-GPU mode)",
+		FormatName(a_displayFormat), static_cast<int>(a_displayFormat), FormatName(a_sourceFormat),
+		static_cast<int>(a_sourceFormat));
+	return true;
+}
+
+bool SecondaryUpscale::SetLocalFrames(const std::array<ID3D12Resource*, kSlots>& a_frames)
+{
+	if (!local || !converting)
+		return false;
+	const auto refuse = [this](const char* a_reason) {
+		REX::ERROR("[FG] {}; frames are copied into the {} swap chain unconverted, so the picture will be wrong", a_reason,
+			FormatName(displayFormat));
+		return false;
+	};
+	for (UINT slot = 0; slot < localSlots; ++slot) {
+		if (!a_frames[slot])
+			return refuse("a finished-frame buffer is missing");
+		const auto desc = a_frames[slot]->GetDesc();
+		if (desc.Width != displayWidth || desc.Height != displayHeight || desc.Format != sourceFormat)
+			return refuse("the finished-frame buffers do not match the swap chain's size or the game's format");
+		if (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+			return refuse("the finished-frame buffers cannot be read by a shader");
+	}
+	localFrames = a_frames;
+	if (!WriteCopyDescriptors(localFrames, sourceFormat))
+		return refuse("the conversion pass's descriptors could not be written");
+	localBound = true;
+	return true;
+}
+
+void SecondaryUpscale::RecordLocalConversion(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_backBuffer)
+{
+	if (!ConvertsLocally() || !a_list || !a_backBuffer || a_slot >= localSlots)
+		return;
+	RecordCopyThroughComposite(a_list, a_slot, localFrames[a_slot], a_backBuffer);
+	if (!loggedLocalFrame) {
+		REX::INFO("[FG] first frame converted into the {} back buffer on the game's GPU (frame slot {})",
+			FormatName(displayFormat), a_slot);
+		loggedLocalFrame = true;
+	}
 }
 
 bool SecondaryUpscale::PlanUpscale()
@@ -185,8 +265,9 @@ bool SecondaryUpscale::CreateComputePipeline(const char* a_entry, winrt::com_ptr
 
 bool SecondaryUpscale::CreatePipeline(bool a_upscale)
 {
-	const auto fail = [](const char* a_what, HRESULT a_hr) {
-		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
+	const auto fail = [a_upscale](const char* a_what, HRESULT a_hr) {
+		REX::ERROR("[FSR4] {} failed (hr={:#010x}); {}", a_what, static_cast<std::uint32_t>(a_hr),
+			a_upscale ? "upscaling on the display GPU is off" : "the format conversion is off");
 		return false;
 	};
 
@@ -232,8 +313,9 @@ bool SecondaryUpscale::CreatePipeline(bool a_upscale)
 
 	if (a_upscale && !CreateComputePipeline("Composite", pipeline))
 		return false;
-	// Native frames into a back buffer the copy engine cannot convert to.
-	if (displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM && !CreateComputePipeline("Copy", copyPipeline))
+	// Native frames into a back buffer the copy engine cannot convert to. (sourceFormat is the game's
+	// RGBA8 except in single-GPU mode, which comes here only when the two formats differ.)
+	if (displayFormat != sourceFormat && !CreateComputePipeline("Copy", copyPipeline))
 		return false;
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
@@ -338,7 +420,7 @@ bool SecondaryUpscale::ReadyFor(uint32_t a_width, uint32_t a_height)
 
 UINT SecondaryUpscale::Slots() const noexcept
 {
-	return CrossAdapterBridge::GetSingleton()->SlotCount();
+	return local ? localSlots : CrossAdapterBridge::GetSingleton()->SlotCount();
 }
 
 bool SecondaryUpscale::HasFinalMirror() const noexcept
@@ -368,14 +450,26 @@ bool SecondaryUpscale::WriteFinishedDescriptors()
 	auto bridge = CrossAdapterBridge::GetSingleton();
 	if (!HasFinalMirror())
 		return false;
+	std::array<ID3D12Resource*, kSlots> finished{};
+	for (UINT slot = 0; slot < Slots(); ++slot)
+		finished[slot] = bridge->Mirror(finalLane, slot);
+	return WriteCopyDescriptors(finished, DXGI_FORMAT_R8G8B8A8_UNORM);
+}
+
+bool SecondaryUpscale::WriteCopyDescriptors(const std::array<ID3D12Resource*, kSlots>& a_finished, DXGI_FORMAT a_format)
+{
+	if (!descriptors || !composite)
+		return false;
 	for (UINT slot = 0; slot < Slots(); ++slot) {
+		if (!a_finished[slot])
+			return false;
 		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
 		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
 		// t0 and t2 are not read by Copy; null descriptors keep the table fully initialised.
-		ID3D12Resource* sources[3] = { nullptr, bridge->Mirror(finalLane, slot), nullptr };
+		ID3D12Resource* sources[3] = { nullptr, a_finished[slot], nullptr };
 		for (auto* source : sources) {
 			D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-			srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			srv.Format = a_format;
 			srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			srv.Texture2D.MipLevels = 1;

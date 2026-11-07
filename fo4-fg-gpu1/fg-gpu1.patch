@@ -3314,7 +3314,7 @@ index 81be80f..b4024b8 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..0047590 100644
+index e10d528..53bcdd7 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
 @@ -1,9 +1,13 @@
@@ -3420,7 +3420,7 @@ index e10d528..0047590 100644
  	swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
  	swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
  	swapChainDesc.Format = a_swapChainDesc.BufferDesc.Format;
-@@ -81,34 +145,51 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+@@ -81,34 +145,58 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
  		CreateSwapChainFSR3(a_dxgiFactory, a_swapChainDesc);
  	}
  
@@ -3442,11 +3442,18 @@ index e10d528..0047590 100644
 +	if (displayFormat != swapChainDesc.Format)
 +		REX::INFO("[FG] back buffers: format {}, the game renders format {}", static_cast<int>(displayFormat),
 +			static_cast<int>(swapChainDesc.Format));
-+	if (displayFormat != swapChainDesc.Format && !secondaryGPU)
-+		REX::ERROR("[FG] the swap chain is format {} but the game renders format {} (an HDR add-on changed it); only "
-+				   "bFrameGenOnSecondaryGPU = 1 converts between them, so the picture will be wrong. Disable the add-on "
-+				   "(e.g. ReShade's AutoHDR) or use the second-GPU mode",
-+			static_cast<int>(displayFormat), static_cast<int>(swapChainDesc.Format));
++	// Single-GPU mode: the game's finished frame cannot be copied into back buffers of another format
++	// (an HDR add-on changed them); the conversion pass second-GPU mode uses runs on this GPU instead.
++	// Its frames are bound in CreateInterop. Without it the plain copy stays, and the picture is wrong.
++	if (displayFormat != swapChainDesc.Format && !secondaryGPU && swapChain) {
++		const bool converting = SecondaryUpscale::GetSingleton()->InitializeLocalConversion(d3d12Device.get(),
++			swapChainDesc.Width, swapChainDesc.Height, displayFormat, swapChainDesc.Format, frameSlots);
++		if (converting && upscaling->activeFrameGenType != Upscaling::FrameGenType::kFSR3)
++			REX::WARN("[FG] {} frame generation is not told that its UI-free frame stays format {} under the format {} "
++					  "back buffers; generated frames may be wrong. Use iFrameGenType = 0 (FSR3) with HDR add-ons",
++				upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG ? "DLSS-G" : "XeSS",
++				static_cast<int>(swapChainDesc.Format), static_cast<int>(displayFormat));
++	}
 +
 +	// FG-GPU1: FSR 4.1 upscaling on this GPU when the upscaler is set to it, and/or the conversion
 +	// into back buffers whose format an HDR add-on changed. Decided here, before the lanes exist,
@@ -3491,7 +3498,7 @@ index e10d528..0047590 100644
  }
  
  void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
-@@ -145,9 +226,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -145,9 +233,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -3507,7 +3514,7 @@ index e10d528..0047590 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +251,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +258,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -3516,7 +3523,7 @@ index e10d528..0047590 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +264,23 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +271,30 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -3538,11 +3545,18 @@ index e10d528..0047590 100644
 +			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
 +		else if (secondaryUpscale->OwnsPresent())
 +			secondaryUpscale->SetFinalLane(finalFrameLane);
++	} else if (SecondaryUpscale::GetSingleton()->Converting()) {
++		// Single GPU, back buffers in another format (HDR add-on): Present converts the finished frame
++		// from these into the back buffer instead of copying it.
++		std::array<ID3D12Resource*, SecondaryUpscale::kSlots> frames{};
++		for (UINT slot = 0; slot < frameSlots; ++slot)
++			frames[slot] = swapChainBufferWrapped[slot]->resource.get();
++		SecondaryUpscale::GetSingleton()->SetLocalFrames(frames);
 +	}
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -211,6 +311,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -211,6 +325,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  {
  	auto upscalingForUI = Upscaling::GetSingleton();
  
@@ -3553,7 +3567,7 @@ index e10d528..0047590 100644
  	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
  	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
  	// so presenting HUDLess prevents UI from being warped. UIColorAndAlpha tells DLSS-G
-@@ -239,17 +343,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +357,73 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -3623,12 +3637,16 @@ index e10d528..0047590 100644
 +			swapChainBuffers[frameIndex].get());
 +	}
 +
-+	// Transfer frame to swap chain buffer (single-GPU path)
-+	if (!secondaryGPU) {
++	// Transfer frame to swap chain buffer (single-GPU path). Back buffers in another format than the
++	// game's (an HDR add-on such as ReShade's AutoHDR changed them) get it through the conversion
++	// pass; the content stays SDR, frame generation reads its RGBA8 HUD-less copy as before.
++	if (!secondaryGPU && secondaryUpscale->ConvertsLocally()) {
++		secondaryUpscale->RecordLocalConversion(commandLists[frameIndex].get(), frameIndex, swapChainBuffers[frameIndex].get());
++	} else if (!secondaryGPU) {
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -358,9 +514,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -358,9 +532,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			xessFrameId++;
  		}
  	} else {
@@ -3657,7 +3675,7 @@ index e10d528..0047590 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +544,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +562,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -3680,7 +3698,7 @@ index e10d528..0047590 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +627,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +645,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -3699,7 +3717,7 @@ index e10d528..0047590 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +647,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +665,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -3751,7 +3769,7 @@ index e10d528..0047590 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +700,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +718,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -3790,7 +3808,7 @@ index e10d528..0047590 100644
  	// Clear resources
  	upscaling->Reset();
  
-@@ -472,6 +743,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -472,6 +761,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (SyncInterval == 0 && !upscaling->highFPSPhysicsFixLoaded)
  		upscaling->FrameLimiter(useFrameGenerationThisFrame);
  
@@ -3800,7 +3818,7 @@ index e10d528..0047590 100644
  	return S_OK;
  }
  
-@@ -485,6 +759,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
+@@ -485,6 +777,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
  	return swapChain->GetDevice(uuid, ppDevice);
  }
  
@@ -3925,7 +3943,7 @@ index e10d528..0047590 100644
  WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)
  {
  	// Create D3D11 shared texture directly instead of wrapping D3D12 resource
-@@ -614,7 +1006,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
+@@ -614,7 +1024,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
  {
@@ -4082,10 +4100,10 @@ index 692f459..262f1cb 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..a1078a4 100644
+index 9fa46df..f94d250 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
-@@ -3,34 +3,537 @@
+@@ -3,34 +3,540 @@
  #include "Upscaling.h"
  
  #include "DX12SwapChain.h"
@@ -4431,7 +4449,7 @@ index 9fa46df..a1078a4 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation swap chain failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
- 
++
 +	std::string swapChainProvider = "3.1.4";
 +	if (sdk24) {
 +		swapChainProvider = ProviderName(swapChainContext);
@@ -4454,17 +4472,20 @@ index 9fa46df..a1078a4 100644
 +	} else {
 +		REX::WARN("[FSR] could not read the swap chain's back buffer; assuming format {}", static_cast<int>(displayFormat));
 +	}
++	// The HUD-less copy is RGBA8 (see the hudless descriptor below); only SDK 2.4 can be told so.
++	passHudless = sdk24 || displayFormat == DXGI_FORMAT_R8G8B8A8_UNORM;
 +	if (displayFormat != a_desc->Format) {
 +		REX::WARN("[FSR] the swap chain was created as format {} but is format {} (an HDR add-on such as ReShade's AutoHDR "
-+				  "changed it); frame generation and the display GPU's output follow it. Change HDR settings only with the "
-+				  "game closed",
++				  "changed it); frame generation and everything this plugin writes into the back buffers follow it. Change "
++				  "HDR settings only with the game closed",
 +			static_cast<int>(a_desc->Format), static_cast<int>(displayFormat));
-+		if (!sdk24)
-+			REX::ERROR("[FSR] {} cannot be told that the UI-free frame stays RGBA8 under a {} back buffer; generated "
-+					   "frames may be wrong. Use iFSRRuntime = 1 with HDR add-ons",
++		if (!passHudless)
++			REX::ERROR("[FSR] {} cannot be told that the UI-free frame stays RGBA8 under a format {} back buffer, so frame "
++					   "generation is not given it and interpolates the back buffer with its UI (the HUD may smear in "
++					   "generated frames). Use iFSRRuntime = 1 with HDR add-ons",
 +				RuntimeName(), static_cast<int>(displayFormat));
 +	}
-+
+ 
 +	// ---- frame generation
  	ffx::CreateContextDescFrameGeneration createFg{};
 -	createFg.displaySize = { dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height };
@@ -4635,7 +4656,7 @@ index 9fa46df..a1078a4 100644
  }
  
  [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
-@@ -45,13 +548,114 @@ void FidelityFX::SetupFrameGeneration()
+@@ -45,13 +551,114 @@ void FidelityFX::SetupFrameGeneration()
  	return singleton.get();
  }
  
@@ -4753,7 +4774,7 @@ index 9fa46df..a1078a4 100644
  	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
  	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
  
-@@ -60,9 +664,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -60,13 +667,10 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	if (a_useFrameGeneration) {
  		configParameters.frameGenerationEnabled = true;
  
@@ -4763,8 +4784,13 @@ index 9fa46df..a1078a4 100644
 +		configParameters.frameGenerationCallback = FrameGenerationCallback;
  		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
  
- 		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
-@@ -93,7 +695,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+-		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
+-
++		configParameters.HUDLessColor = passHudless ? ffxApiGetResourceDX12(HUDLessColor) : FfxApiResource({});
+ 	}
+ 	else {
+ 		configParameters.frameGenerationEnabled = false;
+@@ -93,7 +697,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
  	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
  
@@ -4773,7 +4799,7 @@ index 9fa46df..a1078a4 100644
  		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
  	}
  
-@@ -113,49 +715,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -113,49 +717,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	QueryPerformanceCounter(&currentFrameTime);
  
  	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
@@ -4925,7 +4951,7 @@ index 9fa46df..a1078a4 100644
 +	}
  }
 diff --git a/plugins/FrameGeneration/src/FidelityFX.h b/plugins/FrameGeneration/src/FidelityFX.h
-index 78bb041..0de7d01 100644
+index 78bb041..39fd486 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.h
 +++ b/plugins/FrameGeneration/src/FidelityFX.h
 @@ -1,13 +1,60 @@
@@ -4994,7 +5020,7 @@ index 78bb041..0de7d01 100644
  class FidelityFX
  {
  public:
-@@ -17,12 +64,63 @@ public:
+@@ -17,12 +64,67 @@ public:
  		return &singleton;
  	}
  
@@ -5015,6 +5041,10 @@ index 78bb041..0de7d01 100644
 +	// The swap chain's real format, read from its back buffer after creation (an HDR add-on may have
 +	// changed it from the game's RGBA8). Frame generation is created with it.
 +	DXGI_FORMAT displayFormat = DXGI_FORMAT_UNKNOWN;
++	// The RGBA8 HUD-less frame is handed to frame generation: SDK 2.4 is told its format, and SDK
++	// 1.1.4 assumes the back buffer's, so with 1.1.4 under a back buffer of another format (HDR
++	// add-on) it is left out and FSR interpolates the back buffer itself, UI included.
++	bool passHudless = true;
 +
 +	// FG-GPU1: FSR 4.1 upscaling on the display GPU (SDK 2.4 only; see SecondaryUpscale).
 +	ffx::Context upscaleContext{};
@@ -5081,10 +5111,10 @@ index 0000000..9d40662
 +inline constexpr unsigned int kMaxFrameSlots = 3;
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.cpp b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
 new file mode 100644
-index 0000000..e4af938
+index 0000000..14419ef
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,912 @@
 +#include "SecondaryUpscale.h"
 +
 +#include <d3dcompiler.h>
@@ -5157,12 +5187,7 @@ index 0000000..e4af938
 +	// created it) needs a shader pass, because copies do not convert.
 +	const bool convert = a_displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM;
 +	if (convert) {
-+		D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
-+		support.Format = a_displayFormat;
-+		const bool storable = SUCCEEDED(a_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
-+		                      (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
-+		                      (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
-+		if (!storable) {
++		if (!Storable(a_device, a_displayFormat)) {
 +			REX::CRITICAL("[FG-GPU1] the swap chain is format {} ({}), which the display GPU cannot write from a shader; "
 +						  "frames cannot be shown. Disable the add-on that changes it (e.g. ReShade's AutoHDR)",
 +				static_cast<int>(a_displayFormat), FormatName(a_displayFormat));
@@ -5202,6 +5227,91 @@ index 0000000..e4af938
 +		}
 +	}
 +	return false;
++}
++
++bool SecondaryUpscale::Storable(ID3D12Device* a_device, DXGI_FORMAT a_format)
++{
++	D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
++	support.Format = a_format;
++	return SUCCEEDED(a_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
++	       (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
++	       (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
++}
++
++bool SecondaryUpscale::InitializeLocalConversion(ID3D12Device* a_device, UINT a_width, UINT a_height,
++	DXGI_FORMAT a_displayFormat, DXGI_FORMAT a_sourceFormat, UINT a_slots)
++{
++	if (planned || converting || !a_device)
++		return false;
++
++	// Single-GPU mode: no upscaling here, only the pass second-GPU mode uses for frames it does not
++	// upscale. The game's frame is read as it is (t1) and stored in the swap chain's format; the
++	// copy engine moves the result into the back buffer.
++	if (!Storable(a_device, a_displayFormat)) {
++		REX::ERROR("[FG] the swap chain is format {} ({}), which this GPU cannot write from a shader; frames are copied "
++				   "into it unconverted, so the picture will be wrong. Disable the add-on that changes it (e.g. ReShade's "
++				   "AutoHDR)",
++			static_cast<int>(a_displayFormat), FormatName(a_displayFormat));
++		return false;
++	}
++
++	displayWidth = renderWidth = a_width;
++	displayHeight = renderHeight = a_height;
++	displayFormat = a_displayFormat;
++	sourceFormat = a_sourceFormat;
++	localSlots = std::clamp(a_slots, 1u, kSlots);
++	device.copy_from(a_device);
++	if (!CreatePipeline(false)) {
++		REX::ERROR("[FG] the conversion pass for the {} swap chain could not be set up; frames are copied into it "
++				   "unconverted, so the picture will be wrong. Disable the add-on that changes the format (e.g. ReShade's "
++				   "AutoHDR)",
++			FormatName(a_displayFormat));
++		return false;
++	}
++	local = true;
++	converting = true;
++	REX::INFO("[FG] the swap chain is {} (format {}), the game renders {} (format {}): every frame is converted on the "
++			  "game's GPU on its way into the back buffer (single-GPU mode)",
++		FormatName(a_displayFormat), static_cast<int>(a_displayFormat), FormatName(a_sourceFormat),
++		static_cast<int>(a_sourceFormat));
++	return true;
++}
++
++bool SecondaryUpscale::SetLocalFrames(const std::array<ID3D12Resource*, kSlots>& a_frames)
++{
++	if (!local || !converting)
++		return false;
++	const auto refuse = [this](const char* a_reason) {
++		REX::ERROR("[FG] {}; frames are copied into the {} swap chain unconverted, so the picture will be wrong", a_reason,
++			FormatName(displayFormat));
++		return false;
++	};
++	for (UINT slot = 0; slot < localSlots; ++slot) {
++		if (!a_frames[slot])
++			return refuse("a finished-frame buffer is missing");
++		const auto desc = a_frames[slot]->GetDesc();
++		if (desc.Width != displayWidth || desc.Height != displayHeight || desc.Format != sourceFormat)
++			return refuse("the finished-frame buffers do not match the swap chain's size or the game's format");
++		if (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
++			return refuse("the finished-frame buffers cannot be read by a shader");
++	}
++	localFrames = a_frames;
++	if (!WriteCopyDescriptors(localFrames, sourceFormat))
++		return refuse("the conversion pass's descriptors could not be written");
++	localBound = true;
++	return true;
++}
++
++void SecondaryUpscale::RecordLocalConversion(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_backBuffer)
++{
++	if (!ConvertsLocally() || !a_list || !a_backBuffer || a_slot >= localSlots)
++		return;
++	RecordCopyThroughComposite(a_list, a_slot, localFrames[a_slot], a_backBuffer);
++	if (!loggedLocalFrame) {
++		REX::INFO("[FG] first frame converted into the {} back buffer on the game's GPU (frame slot {})",
++			FormatName(displayFormat), a_slot);
++		loggedLocalFrame = true;
++	}
 +}
 +
 +bool SecondaryUpscale::PlanUpscale()
@@ -5272,8 +5382,9 @@ index 0000000..e4af938
 +
 +bool SecondaryUpscale::CreatePipeline(bool a_upscale)
 +{
-+	const auto fail = [](const char* a_what, HRESULT a_hr) {
-+		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
++	const auto fail = [a_upscale](const char* a_what, HRESULT a_hr) {
++		REX::ERROR("[FSR4] {} failed (hr={:#010x}); {}", a_what, static_cast<std::uint32_t>(a_hr),
++			a_upscale ? "upscaling on the display GPU is off" : "the format conversion is off");
 +		return false;
 +	};
 +
@@ -5319,8 +5430,9 @@ index 0000000..e4af938
 +
 +	if (a_upscale && !CreateComputePipeline("Composite", pipeline))
 +		return false;
-+	// Native frames into a back buffer the copy engine cannot convert to.
-+	if (displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM && !CreateComputePipeline("Copy", copyPipeline))
++	// Native frames into a back buffer the copy engine cannot convert to. (sourceFormat is the game's
++	// RGBA8 except in single-GPU mode, which comes here only when the two formats differ.)
++	if (displayFormat != sourceFormat && !CreateComputePipeline("Copy", copyPipeline))
 +		return false;
 +
 +	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
@@ -5425,7 +5537,7 @@ index 0000000..e4af938
 +
 +UINT SecondaryUpscale::Slots() const noexcept
 +{
-+	return CrossAdapterBridge::GetSingleton()->SlotCount();
++	return local ? localSlots : CrossAdapterBridge::GetSingleton()->SlotCount();
 +}
 +
 +bool SecondaryUpscale::HasFinalMirror() const noexcept
@@ -5455,14 +5567,26 @@ index 0000000..e4af938
 +	auto bridge = CrossAdapterBridge::GetSingleton();
 +	if (!HasFinalMirror())
 +		return false;
++	std::array<ID3D12Resource*, kSlots> finished{};
++	for (UINT slot = 0; slot < Slots(); ++slot)
++		finished[slot] = bridge->Mirror(finalLane, slot);
++	return WriteCopyDescriptors(finished, DXGI_FORMAT_R8G8B8A8_UNORM);
++}
++
++bool SecondaryUpscale::WriteCopyDescriptors(const std::array<ID3D12Resource*, kSlots>& a_finished, DXGI_FORMAT a_format)
++{
++	if (!descriptors || !composite)
++		return false;
 +	for (UINT slot = 0; slot < Slots(); ++slot) {
++		if (!a_finished[slot])
++			return false;
 +		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
 +		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
 +		// t0 and t2 are not read by Copy; null descriptors keep the table fully initialised.
-+		ID3D12Resource* sources[3] = { nullptr, bridge->Mirror(finalLane, slot), nullptr };
++		ID3D12Resource* sources[3] = { nullptr, a_finished[slot], nullptr };
 +		for (auto* source : sources) {
 +			D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-+			srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++			srv.Format = a_format;
 +			srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 +			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 +			srv.Texture2D.MipLevels = 1;
@@ -5905,10 +6029,10 @@ index 0000000..e4af938
 +}
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.h b/plugins/FrameGeneration/src/SecondaryUpscale.h
 new file mode 100644
-index 0000000..c777d1a
+index 0000000..d7d7d80
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/SecondaryUpscale.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,231 @@
 +#pragma once
 +
 +// SecondaryUpscale - FG-GPU1: FSR 4.1 upscaling on the display GPU.
@@ -5936,6 +6060,10 @@ index 0000000..c777d1a
 +// the swap chain's format and native frames go through it too (Copy). Without FSR 4.1 upscaling
 +// the same pass is set up on its own ("conversion only"): the finished frame gets a mirror and is
 +// copied into the back buffer through the composite. With an RGBA8 swap chain nothing changes.
++//
++// Single-GPU mode (bFrameGenOnSecondaryGPU = 0) uses only that conversion pass, on the game's GPU:
++// InitializeLocalConversion at swap-chain creation, SetLocalFrames with the D3D12 side of the game's
++// finished frames, then RecordLocalConversion instead of the plain copy into the back buffer.
 +
 +#include <d3d12.h>
 +#include <dxgi.h>
@@ -5965,6 +6093,20 @@ index 0000000..c777d1a
 +	// pass is set up on its own (Converting()).
 +	bool Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth, UINT a_displayHeight,
 +		DXGI_FORMAT a_displayFormat);
++
++	// Single-GPU mode, at swap-chain creation, when the back buffers (a_displayFormat) are not the
++	// format the game renders (a_sourceFormat): sets up the conversion pass on the game's GPU for
++	// a_slots frames in flight. False (logged): nothing is set up, the caller keeps its plain copy.
++	bool InitializeLocalConversion(ID3D12Device* a_device, UINT a_width, UINT a_height, DXGI_FORMAT a_displayFormat,
++		DXGI_FORMAT a_sourceFormat, UINT a_slots);
++	// The D3D12 side of the game's finished frame per slot (CreateInterop). False (logged) when the
++	// conversion cannot read them.
++	bool SetLocalFrames(const std::array<ID3D12Resource*, kSlots>& a_frames);
++	// Single-GPU conversion set up and bound: RecordLocalConversion replaces the plain copy.
++	[[nodiscard]] bool ConvertsLocally() const noexcept { return local && converting && localBound; }
++	// On the frame's direct list: the game's finished frame of a_slot converted into a_backBuffer
++	// (PRESENT before and after).
++	void RecordLocalConversion(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_backBuffer);
 +
 +	// Set up for it: the lanes are sized for the render resolution and the finished frame is
 +	// unpacked into a mirror. Fixed for the session.
@@ -6035,7 +6177,11 @@ index 0000000..c777d1a
 +	// signature, descriptors and the display-format composite; Copy when the swap chain is not RGBA8.
 +	bool CreatePipeline(bool a_upscale);
 +	bool CreateComputePipeline(const char* a_entry, winrt::com_ptr<ID3D12PipelineState>& a_pipeline);
++	// a_format can be written from a shader (typed UAV store) on a_device.
++	static bool Storable(ID3D12Device* a_device, DXGI_FORMAT a_format);
 +	bool WriteFinishedDescriptors();
++	// Copy's table per slot: t1 = a_finished[slot] (read as a_format), u0 = the composite.
++	bool WriteCopyDescriptors(const std::array<ID3D12Resource*, kSlots>& a_finished, DXGI_FORMAT a_format);
 +	void RecordCopyThroughComposite(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_finished,
 +		ID3D12Resource* a_backBuffer);
 +	bool TrySubmit(UINT a_slot);
@@ -6046,6 +6192,14 @@ index 0000000..c777d1a
 +	bool bound = false;
 +	bool failed = false;
 +	DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
++
++	// Single-GPU conversion: the game's finished frames on the same device, bound by SetLocalFrames.
++	bool local = false;
++	bool localBound = false;
++	bool loggedLocalFrame = false;
++	UINT localSlots = 2;
++	DXGI_FORMAT sourceFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
++	std::array<ID3D12Resource*, kSlots> localFrames{};  // not owned (DX12SwapChain's WrappedResources)
 +
 +	UINT renderWidth = 0;
 +	UINT renderHeight = 0;

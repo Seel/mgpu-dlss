@@ -10,7 +10,60 @@ in FSR 4.1 mode (`bSendUITilesOnly`), then measure; only then
 Parts 2 and the display thread aim at the last 3-4 fps to the 71 cap with Community Shaders on
 (66.6-68.5 now with `bExtraFrameInFlight = 1`). The user asked for all of them as optional settings.
 
-## Latest (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
+## Latest (2026-11-08): AutoHDR in single-GPU mode (built, not yet run in game)
+
+The user hit `[E] [FG] the swap chain is format 24 but the game renders format 28 ... only
+bFrameGenOnSecondaryGPU = 1 converts between them` with `bFrameGenOnSecondaryGPU = 0`: the
+single-GPU path in `DX12SwapChain::Present` `CopyResource`d the game's RGBA8 frame into FFX's back
+buffer, which AutoHDR had made R10G10B10A2 (or R16G16B16A16_FLOAT), and copies do not convert.
+
+- `SecondaryUpscale` got a single-GPU, conversion-only mode that reuses the second-GPU `Copy` pass
+  (same root signature, descriptor layout, display-format composite, `RecordCopyThroughComposite`):
+  `InitializeLocalConversion` (from `DX12SwapChain::CreateSwapChain` when `displayFormat !=
+  swapChainDesc.Format` and not second-GPU), `SetLocalFrames` (from `CreateInterop`, with the D3D12
+  side of `swapChainBufferWrapped[slot]`, the D3D11-shared RGBA8 finished frames, read through an
+  SRV of their own format), `RecordLocalConversion` in `Present` instead of the copy. `Slots()` is
+  the local slot count in that mode (the bridge is not initialised). `WriteFinishedDescriptors` now
+  goes through a shared `WriteCopyDescriptors`; the `Copy` pipeline is built when the display format
+  differs from the source format (RGBA8 in second-GPU mode, so unchanged there).
+- Frame generation needed nothing new: `FidelityFX::CreateContexts` already reads the real back
+  buffer format in both modes, creates FG for it (SDR, HDR flag off) and declares the RGBA8 HUD-less
+  frame (SDK 2.4). New: with SDK 1.1.4 (`iFSRRuntime = 0`) under a non-RGBA8 back buffer the
+  HUD-less frame is no longer passed (`passHudless`), because 1.1.4 assumes it has the back
+  buffer's format; FSR then interpolates the back buffer with its UI (HUD may smear), logged as an
+  error. Applies to both modes.
+- DLSS-G / XeSS single-GPU (not shipped) get the converted frame too, with a warning that their
+  frame generation is not told the HUD-less format.
+- Logs: `[FG] the swap chain is R10G10B10A2_UNORM (HDR10) (format 24), the game renders
+  R8G8B8A8_UNORM (format 28): every frame is converted on the game's GPU on its way into the back
+  buffer (single-GPU mode)` at startup, `[FG] first frame converted into the ... back buffer on the
+  game's GPU (frame slot N)` once. The old `only bFrameGenOnSecondaryGPU = 1 converts` error is gone;
+  setup failures log `[FG] ... frames are copied into it unconverted` and keep the old copy.
+- Built in **`D:\fgh`** (`build-local.ps1 -WorkDir D:\fgh`), not `D:\fgb`: `D:\fgb` held another
+  session's uncommitted build (`PeerCopy.cpp`, bDirectGPUCopy, awaiting its in-game test), and the
+  script resets that checkout and overwrites its zip. `D:\fgh` was seeded from `D:\fgb` (sources at
+  `3e237a4`, vcpkg without buildtrees; packages restored from the vcpkg binary cache). Package:
+  **`D:\fgh\MGPU-Scaling.zip`**. Build: `/W4 /WX`, 0 warnings, exports unchanged (F4SE entry points +
+  the static FSR 3.1 SDK's); `fxc` compiles `Copy` at 3840x2160. `fg-gpu1.patch` regenerated from
+  `D:\fgh` (same 36 files; only DX12SwapChain.cpp, FidelityFX.cpp/.h, SecondaryUpscale.cpp/.h
+  changed) and applies to a pristine `3e237a4` with a result identical to the overlay.
+- Two build-script traps found on the way, now fixed in `build-local.ps1`: (1) the patch
+  workflow's `git add -N` leaves intent-to-add entries in the checkout's index, which the script's
+  `git checkout -- .` / `git clean` did not remove, so files dropped from the overlay (or another
+  branch's, like `PeerCopy.cpp`, which my first `D:\fgh` build compiled in) lingered and were
+  globbed into the DLL. The script now runs `git reset -q` first. (2) `Copy-Item` keeps the overlay
+  files' timestamps, so a source edited while a build ran was older than its `.obj` next time and
+  was not recompiled. The script now hashes each overlay file's previous copy and stamps the changed
+  ones with the current time (logs `N overlay file(s) changed since the last build`).
+
+**Next test (user, single GPU: game and monitor on one GPU; install `D:\fgh\MGPU-Scaling.zip`):** `bFrameGenOnSecondaryGPU = 0`,
+`iFSRRuntime = 1`, ReShade with AutoHDR on. Expect the two `[FG]` lines above, `[FSR] the swap chain
+was created as format 28 but is format 24`, no `[E]`, a correct HDR picture in menus and gameplay,
+FG on (~50% generated in the 10 s line) and off (menus, or `bFrameGenerationMode` off), HUD clean in
+generated frames. Then scRGB (`UseHDR10=0`, restart): format 10 in the same lines. Without AutoHDR
+nothing changes (no conversion line).
+
+## Earlier (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
 
 Logs saved in the session scratchpad (`runs/MGPUScaling-2slots.log`, `-3slots.log`). CS on
 (telemetry too), same build. Clean 10 s gameplay windows:
