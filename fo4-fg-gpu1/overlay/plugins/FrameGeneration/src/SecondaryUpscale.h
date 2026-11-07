@@ -2,9 +2,9 @@
 
 // SecondaryUpscale - FG-GPU1: FSR 4.1 upscaling on the display GPU.
 //
-// With Upscaling.dll's iUpscaleMethodPreference = 3, the render GPU draws the 3D scene at the
-// quality mode's resolution with a sub-pixel jitter and no TAA (Upscaling.dll), and skips the
-// upscale. This plugin then
+// With the upscaler's iUpscaleMethodPreference = 3, the render GPU draws the 3D scene at the
+// quality mode's resolution with a sub-pixel jitter and no TAA (the upscaler, namespace up), and
+// skips the upscale. This part then
 //
 //   render GPU   PostDisplay: copies the render-resolution scene (UI-free) into its lane and fills
 //                the full-size frame buffer from it with a plain bilinear blit, so the UI is drawn
@@ -18,6 +18,13 @@
 // Frames Upscaling.dll renders natively (menus, before this is ready) are copied to the back
 // buffer as they are, without frame generation: the depth and motion-vector lanes are sized for
 // the render resolution. Everything runs on the game's render thread.
+//
+// Display format: the game renders RGBA8, but the swap chain can be another format, because an
+// add-on such as ReShade's AutoHDR switches it to R10G10B10A2 (HDR10) or R16G16B16A16_FLOAT
+// (scRGB) while FFX creates it. CopyResource cannot convert, so then the composite is created in
+// the swap chain's format and native frames go through it too (Copy). Without FSR 4.1 upscaling
+// the same pass is set up on its own ("conversion only"): the finished frame gets a mirror and is
+// copied into the back buffer through the composite. With an RGBA8 swap chain nothing changes.
 
 #include <d3d12.h>
 #include <dxgi.h>
@@ -30,8 +37,6 @@ class SecondaryUpscale
 {
 public:
 	static constexpr UINT kSlots = 2;
-	// FGGPU1_UpscaleApiVersion / FO4Upscaling_SecondaryGPUApiVersion: both plugins must agree.
-	static constexpr uint32_t kApiVersion = 1;
 
 	static SecondaryUpscale* GetSingleton()
 	{
@@ -39,26 +44,35 @@ public:
 		return &singleton;
 	}
 
-	// At swap-chain creation, after the FSR frame-generation contexts. When Upscaling.dll's settings
+	// At swap-chain creation, after the FSR frame-generation contexts. When the upscaler's settings
 	// ask for it and everything it needs is there, creates the FSR 4.1 context, its outputs and the
 	// composite. False (logged) leaves the session exactly as before.
+	// a_displayFormat is the swap chain's real format (read back after FFX created it), not the
+	// format the game asked for. When it is not RGBA8 and upscaling is not set up, the conversion
+	// pass is set up on its own (Converting()).
 	bool Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth, UINT a_displayHeight,
-		DXGI_FORMAT a_backBufferFormat);
+		DXGI_FORMAT a_displayFormat);
 
 	// Set up for it: the lanes are sized for the render resolution and the finished frame is
 	// unpacked into a mirror. Fixed for the session.
 	[[nodiscard]] bool Planned() const noexcept { return planned; }
+	// The swap chain is not RGBA8: every frame reaches the back buffer through the composite, so
+	// the finished frame needs a mirror even without upscaling. Fixed for the session.
+	[[nodiscard]] bool Converting() const noexcept { return converting; }
+	// The finished frame is unpacked into a mirror and RecordPresent puts it into the back buffer.
+	[[nodiscard]] bool OwnsPresent() const noexcept { return planned || converting; }
+	[[nodiscard]] DXGI_FORMAT DisplayFormat() const noexcept { return displayFormat; }
 	// Frames can be upscaled: planned, lanes bound, nothing has failed.
 	[[nodiscard]] bool Ready() const noexcept { return planned && bound && !failed; }
 	[[nodiscard]] UINT RenderWidth() const noexcept { return renderWidth; }
 	[[nodiscard]] UINT RenderHeight() const noexcept { return renderHeight; }
 
-	// Upscaling.dll asks every frame before it renders at a_width x a_height.
+	// The upscaler asks every frame before it renders at a_width x a_height.
 	bool ReadyFor(uint32_t a_width, uint32_t a_height);
 
 	// The finished frame's lane (CreateInterop), and the scene/depth/motion-vector lanes
 	// (CreateFrameGenerationResources). BindLanes false (logged) means frames cannot be upscaled.
-	void SetFinalLane(int a_lane) { finalLane = a_lane; }
+	void SetFinalLane(int a_lane);
 	[[nodiscard]] bool HasFinalMirror() const noexcept;
 	bool BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane);
 	void Fail(const char* a_reason);
@@ -70,7 +84,7 @@ public:
 	// the frame was upscaled.
 	bool FinishSubmit(UINT a_slot);
 	// On the frame's direct list: the composite (a_upscaled) or a copy of the finished frame into
-	// the back buffer (PRESENT before and after).
+	// the back buffer (PRESENT before and after); converted to the swap chain's format if needed.
 	void RecordPresent(ID3D12GraphicsCommandList* a_list, UINT a_slot, bool a_upscaled, ID3D12Resource* a_backBuffer);
 	// The FSR 4.1 result of a_slot: the UI-free frame for frame generation.
 	[[nodiscard]] ID3D12Resource* Output(UINT a_slot) const noexcept;
@@ -79,6 +93,8 @@ public:
 
 	// Every ~10 s from Present.
 	void LogStats();
+
+	static const char* FormatName(DXGI_FORMAT a_format);
 
 private:
 	static constexpr UINT kMarkUpscaleBegin = 0;
@@ -98,13 +114,23 @@ private:
 		float fovY = 1.0f;
 	};
 
-	bool CreatePipeline();
+	// Reads the upscaler's settings and checks what upscaling here needs; sets the render size.
+	bool PlanUpscale();
+	// a_upscale: the Composite pass, FSR 4.1 outputs, upscale list and timestamps. Always: the root
+	// signature, descriptors and the display-format composite; Copy when the swap chain is not RGBA8.
+	bool CreatePipeline(bool a_upscale);
+	bool CreateComputePipeline(const char* a_entry, winrt::com_ptr<ID3D12PipelineState>& a_pipeline);
+	bool WriteFinishedDescriptors();
+	void RecordCopyThroughComposite(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_finished,
+		ID3D12Resource* a_backBuffer);
 	bool TrySubmit(UINT a_slot);
 	void CollectTimings(UINT a_slot);
 
 	bool planned = false;
+	bool converting = false;
 	bool bound = false;
 	bool failed = false;
+	DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 	UINT renderWidth = 0;
 	UINT renderHeight = 0;
@@ -122,9 +148,11 @@ private:
 
 	std::array<winrt::com_ptr<ID3D12Resource>, kSlots> outputs;  // FSR 4.1 results (UI-free, display size)
 	winrt::com_ptr<ID3D12Resource> composite;                    // UI over the FSR 4.1 result, copied to the back buffer
+	                                                             // (display format)
 
 	winrt::com_ptr<ID3D12RootSignature> rootSignature;
-	winrt::com_ptr<ID3D12PipelineState> pipeline;
+	winrt::com_ptr<ID3D12PipelineState> pipeline;      // Composite (upscaling only)
+	winrt::com_ptr<ID3D12PipelineState> copyPipeline;  // Copy: finished frame -> composite (non-RGBA8 swap chain)
 	winrt::com_ptr<ID3D12DescriptorHeap> descriptors;
 	UINT descriptorSize = 0;
 

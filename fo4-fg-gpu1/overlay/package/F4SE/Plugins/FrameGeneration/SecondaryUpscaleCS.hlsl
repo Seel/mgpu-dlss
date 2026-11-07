@@ -12,8 +12,12 @@
 //              with alpha the smallest UI coverage that explains final - background. Where there is
 //              no UI, final == background and out == upscaled; under opaque UI, out == final.
 //
-// Compiled with RENDER_WIDTH, RENDER_HEIGHT, DISPLAY_WIDTH, DISPLAY_HEIGHT defined. Both entry
-// points use the same registers; Blit only reads t0 and writes u0.
+//   Copy       (display GPU, D3D12) the finished frame unchanged into the composite, for a swap chain
+//              in another format than the game's RGBA8 (an HDR add-on promoted it): copies cannot
+//              convert, a shader store can. Native frames, and every frame without upscaling.
+//
+// Compiled with RENDER_WIDTH, RENDER_HEIGHT, DISPLAY_WIDTH, DISPLAY_HEIGHT defined. All entry
+// points use the same registers; Blit only reads t0, Copy only t1, and both write u0.
 
 static const uint2 RenderSize = uint2(RENDER_WIDTH, RENDER_HEIGHT);
 static const uint2 DisplaySize = uint2(DISPLAY_WIDTH, DISPLAY_HEIGHT);
@@ -73,4 +77,11 @@ float4 SceneBilinear(uint2 a_pixel)
 	float alpha = saturate(max(coverage.r, max(coverage.g, coverage.b)));
 
 	Output[a_id.xy] = float4(saturate(final + (upscaled - background) * (1.0 - alpha)), 1.0);
+}
+
+[numthreads(8, 8, 1)] void Copy(uint3 a_id : SV_DispatchThreadID)
+{
+	if (any(a_id.xy >= DisplaySize))
+		return;
+	Output[a_id.xy] = float4(Final.Load(int3(a_id.xy, 0)).rgb, 1.0);
 }

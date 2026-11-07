@@ -77,6 +77,9 @@ public:
 	ffx::Context swapChainContext{};
 	ffx::Context frameGenContext{};
 	HWND window = nullptr;
+	// The swap chain's real format, read from its back buffer after creation (an HDR add-on may have
+	// changed it from the game's RGBA8). Frame generation is created with it.
+	DXGI_FORMAT displayFormat = DXGI_FORMAT_UNKNOWN;
 
 	// FG-GPU1: FSR 4.1 upscaling on the display GPU (SDK 2.4 only; see SecondaryUpscale).
 	ffx::Context upscaleContext{};

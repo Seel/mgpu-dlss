@@ -147,6 +147,31 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
 
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 
+	// What this plugin copies into is the back buffers, so their format decides. (GetDesc1 cannot
+	// tell: ReShade reports the format the game asked for when an add-on such as AutoHDR changed it.)
+	const DXGI_FORMAT bufferFormat = swapChainBuffers[0]->GetDesc().Format;
+	if (displayFormat != DXGI_FORMAT_UNKNOWN && displayFormat != bufferFormat)
+		REX::CRITICAL("[FG] frame generation was set up for format {}, but the back buffers are format {}; generated frames "
+					  "may be wrong",
+			static_cast<int>(displayFormat), static_cast<int>(bufferFormat));
+	displayFormat = bufferFormat;
+	if (displayFormat != swapChainDesc.Format)
+		REX::INFO("[FG] back buffers: format {}, the game renders format {}", static_cast<int>(displayFormat),
+			static_cast<int>(swapChainDesc.Format));
+	if (displayFormat != swapChainDesc.Format && !secondaryGPU)
+		REX::ERROR("[FG] the swap chain is format {} but the game renders format {} (an HDR add-on changed it); only "
+				   "bFrameGenOnSecondaryGPU = 1 converts between them, so the picture will be wrong. Disable the add-on "
+				   "(e.g. ReShade's AutoHDR) or use the second-GPU mode",
+			static_cast<int>(displayFormat), static_cast<int>(swapChainDesc.Format));
+
+	// FG-GPU1: FSR 4.1 upscaling on this GPU when the upscaler is set to it, and/or the conversion
+	// into back buffers whose format an HDR add-on changed. Decided here, before the lanes exist,
+	// because they are sized for it.
+	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 && secondaryGPU && swapChain &&
+		CrossAdapterBridge::GetSingleton()->IsActive())
+		SecondaryUpscale::GetSingleton()->Initialize(d3d12Device.get(), commandQueue.get(), swapChainDesc.Width,
+			swapChainDesc.Height, displayFormat);
+
 	swapChainProxy = new DXGISwapChainProxy(swapChain);
 }
 
@@ -159,12 +184,9 @@ void DX12SwapChain::CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
 	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
 	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
 	REX::INFO("[FG] FSR3 swap chain created: {}x{} ({})", swapChainDesc.Width, swapChainDesc.Height, fidelityFX->RuntimeName());
-
-	// FG-GPU1: FSR 4.1 upscaling on this GPU when Upscaling.dll is set to it. Decided here, before
-	// the lanes exist, because they are sized for it.
-	if (secondaryGPU && swapChain && CrossAdapterBridge::GetSingleton()->IsActive())
-		SecondaryUpscale::GetSingleton()->Initialize(d3d12Device.get(), commandQueue.get(), swapChainDesc.Width,
-			swapChainDesc.Height, swapChainDesc.Format);
+	// The format frame generation was created for; CreateSwapChain checks it against the buffers.
+	if (fidelityFX->displayFormat != DXGI_FORMAT_UNKNOWN)
+		displayFormat = fidelityFX->displayFormat;
 }
 
 void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
@@ -244,14 +266,15 @@ void DX12SwapChain::CreateInterop()
 
 	if (secondaryGPU) {
 		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
-		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it.
+		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it. So
+		// it does when the back buffer has another format (HDR add-on): a shader converts it.
 		auto secondaryUpscale = SecondaryUpscale::GetSingleton();
 		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
 			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(),
-			secondaryUpscale->Planned());
+			secondaryUpscale->OwnsPresent());
 		if (finalFrameLane < 0)
 			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
-		else if (secondaryUpscale->Planned())
+		else if (secondaryUpscale->OwnsPresent())
 			secondaryUpscale->SetFinalLane(finalFrameLane);
 	}
 }
@@ -349,8 +372,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
 			// the finished frame into the back buffer.
 			bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
-			bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
-				swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
+			// A mirrored finished frame (upscaling, or a converted swap-chain format) was read by
+			// RecordUnpack; RecordPresent below puts it into the back buffer.
+			if (!bridge->Mirror(finalFrameLane, frameIndex))
+				bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
+					swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
 			// iHalfResDepthMV = 1: full-resolution depth for FSR3 from the half-resolution mirror.
 			bridge->RecordDepthUpsample(commandLists[frameIndex].get(), frameIndex);
 		}
@@ -358,12 +384,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	// FG-GPU1 FSR 4.1 upscaling on this GPU: the finished frame was unpacked into a mirror. Put its
-	// UI over the FSR 4.1 result, or show it as rendered (menus, loading), in the back buffer.
+	// UI over the FSR 4.1 result, or show it as rendered (menus, loading), in the back buffer; with a
+	// swap chain in another format (HDR add-on) both are converted on the way.
 	auto secondaryUpscale = SecondaryUpscale::GetSingleton();
-	const bool upscaleLanes = crossAdapter && secondaryUpscale->HasFinalMirror();
+	const bool presentPass = crossAdapter && secondaryUpscale->HasFinalMirror();
+	const bool upscaleLanes = presentPass && secondaryUpscale->Planned();
 	bool upscaledFrame = false;
-	if (upscaleLanes) {
-		upscaledFrame = upscalingForUI->frameUpscaled[frameIndex] && secondaryUpscale->FinishSubmit(frameIndex);
+	if (presentPass) {
+		upscaledFrame = upscaleLanes && upscalingForUI->frameUpscaled[frameIndex] && secondaryUpscale->FinishSubmit(frameIndex);
 		secondaryUpscale->RecordPresent(commandLists[frameIndex].get(), frameIndex, upscaledFrame,
 			swapChainBuffers[frameIndex].get());
 	}
@@ -515,11 +543,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			bridge->SignalConsumed(commandQueue.get());
 		bridge->SignalDisplayListDone(commandQueue.get());
 	}
-	if (upscaleLanes) {
+	if (presentPass) {
 		secondaryUpscale->EndFrame(frameIndex, upscaledFrame);
 		secondaryUpscale->LogStats();
 	}
-	// Upscaling.dll reports the next frame before it renders it.
+	// The upscaler reports the next frame before it renders it.
 	upscaling->frameUpscaled[frameIndex] = false;
 	upscaling->externalFrame.valid = false;
 	upscaling->externalFrame.captured = false;
@@ -847,7 +875,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
 {
-	return swapChain->GetDesc(pDesc);
+	const HRESULT hr = swapChain->GetDesc(pDesc);
+	// GetBuffer hands out the game-side texture, which keeps the game's format even when an HDR
+	// add-on changed the real swap chain's; report that one, so D3D11 code (the game, overlays)
+	// creates views that match the buffer it gets.
+	if (SUCCEEDED(hr) && pDesc)
+		pDesc->BufferDesc.Format = DX12SwapChain::GetSingleton()->swapChainDesc.Format;
+	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT , UINT , UINT , DXGI_FORMAT , UINT )

@@ -10,6 +10,12 @@
 #include <vector>
 #include <winrt/base.h>
 
+// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
+// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
+// frame-generation part's classes of the same names.
+namespace up
+{
+
 const uint renderTargetsPatch[] = { 20, 57, 24, 25, 23, 58, 59, 28, 3, 9, 60, 61, 4, 29, 1, 36, 37, 22, 10, 11, 7, 8, 64, 14, 16 };
 
 /**
@@ -75,21 +81,19 @@ public:
 	// ========================================
 
 	/**
-	 * @brief The frame-generation plugin's side of kSecondaryGPU
+	 * @brief The frame-generation part's side of kSecondaryGPU
 	 *
-	 * AAAFrameGeneration.dll (FG-GPU1 build) exports these. This plugin keeps doing everything
-	 * that makes a frame upscalable (render scale, jitter, TAA off, mip bias, the dynamic
-	 * resolution fixes) and skips its own upscale; the frame-generation plugin sends the
-	 * render-resolution scene to the second GPU, runs FSR 4.1 there and fills the full-size
-	 * frame buffer for the UI. Without it (or before its FSR 4.1 context exists) the method
-	 * falls back to native resolution with TAA.
+	 * The frame-generation part of this plugin implements these (SecondaryUpscale.cpp). The
+	 * upscaler keeps doing everything that makes a frame upscalable (render scale, jitter, TAA
+	 * off, mip bias, the dynamic resolution fixes) and skips its own upscale; the frame-generation
+	 * part sends the render-resolution scene to the second GPU, runs FSR 4.1 there and fills the
+	 * full-size frame buffer for the UI. Until its FSR 4.1 context exists the method falls back
+	 * to native resolution with TAA.
 	 */
 	struct SecondaryGPU
 	{
 		using ReadyFn = bool (*)(uint32_t, uint32_t);
 		using SetFrameFn = void (*)(bool, uint32_t, uint32_t, float, float, float);
-
-		static constexpr uint32_t kApiVersion = 1;
 
 		bool resolved = false;
 		ReadyFn ready = nullptr;
@@ -129,7 +133,8 @@ public:
 	/**
 	 * @brief Load settings from MCM configuration file
 	 *
-	 * Reads Data/MCM/Settings/Upscaling.ini and updates the settings struct
+	 * Reads the [Upscaling] section of Data/MCM/Settings/MGPUScaling.ini (over the shipped
+	 * defaults) and updates the settings struct
 	 */
 	void LoadSettings();
 
@@ -409,3 +414,5 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> overrideDepthCS;             ///< Depth copy shader
 	winrt::com_ptr<ID3D11PixelShader> BSImagespaceShaderSSLRRaytracing;  ///< Custom SSR shader
 };
+
+}  // namespace up

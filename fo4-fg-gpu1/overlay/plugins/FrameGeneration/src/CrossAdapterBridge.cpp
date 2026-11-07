@@ -950,6 +950,53 @@ HRESULT CrossAdapterBridge::Transfer(ID3D12Fence* a_producerFenceA, UINT64 a_pro
 	return S_OK;
 }
 
+namespace
+{
+	// The format family a copy keeps the bits of: copies may change the type (UNORM/SRGB/TYPELESS)
+	// but never convert, so RGBA8 -> R10G10B10A2 (same size per pixel) is not a copy.
+	DXGI_FORMAT CopyFamily(DXGI_FORMAT a_format)
+	{
+		switch (a_format) {
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+		case DXGI_FORMAT_R8G8B8A8_UNORM:
+		case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+		case DXGI_FORMAT_R8G8B8A8_UINT:
+		case DXGI_FORMAT_R8G8B8A8_SNORM:
+		case DXGI_FORMAT_R8G8B8A8_SINT:
+			return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+		case DXGI_FORMAT_B8G8R8A8_UNORM:
+		case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+			return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+		case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+		case DXGI_FORMAT_R10G10B10A2_UNORM:
+		case DXGI_FORMAT_R10G10B10A2_UINT:
+			return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+		case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+		case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		case DXGI_FORMAT_R16G16B16A16_UNORM:
+		case DXGI_FORMAT_R16G16B16A16_UINT:
+		case DXGI_FORMAT_R16G16B16A16_SNORM:
+		case DXGI_FORMAT_R16G16B16A16_SINT:
+			return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+		case DXGI_FORMAT_R16G16_TYPELESS:
+		case DXGI_FORMAT_R16G16_FLOAT:
+		case DXGI_FORMAT_R16G16_UNORM:
+		case DXGI_FORMAT_R16G16_UINT:
+		case DXGI_FORMAT_R16G16_SNORM:
+		case DXGI_FORMAT_R16G16_SINT:
+			return DXGI_FORMAT_R16G16_TYPELESS;
+		case DXGI_FORMAT_R32_TYPELESS:
+		case DXGI_FORMAT_R32_FLOAT:
+		case DXGI_FORMAT_R32_UINT:
+		case DXGI_FORMAT_R32_SINT:
+			return DXGI_FORMAT_R32_TYPELESS;
+		default:
+			return a_format;
+		}
+	}
+}
+
 bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot,
 	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState)
 {
@@ -957,8 +1004,11 @@ bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane&
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
 	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
 	if (destDesc.Width != a_lane.desc.Width || destDesc.Height != a_lane.desc.Height ||
-		destFootprint.Footprint.RowPitch != a_lane.footprint.Footprint.RowPitch) {
-		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
+		destFootprint.Footprint.RowPitch != a_lane.footprint.Footprint.RowPitch ||
+		CopyFamily(destDesc.Format) != CopyFamily(a_lane.desc.Format)) {
+		// e.g. an HDR add-on changed the swap chain to R10G10B10A2 (same pitch, so only the format
+		// check catches it) or a 64-bit format. SecondaryUpscale converts those; this copy would
+		// only reinterpret the bits.
 		if (!a_lane.mismatchLogged) {
 			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
 				a_lane.name, a_lane.desc.Width, a_lane.desc.Height, static_cast<int>(a_lane.desc.Format), destDesc.Width,

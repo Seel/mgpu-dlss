@@ -3,6 +3,19 @@
 #include <algorithm>
 #include <SimpleIni.h>
 
+#include "MGPUScaling.h"
+
+// The frame-generation part of this plugin (SecondaryUpscale.cpp) runs FSR 4.1 on the second GPU.
+extern "C" bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight);
+extern "C" void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth, uint32_t a_renderHeight, float a_jitterX,
+	float a_jitterY, float a_sharpness);
+
+// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
+// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
+// frame-generation part's classes of the same names.
+namespace up
+{
+
 extern bool enbLoaded;
 
 /** @brief Hook for updating jitter, dynamic resolution, and resources */
@@ -371,15 +384,15 @@ void Upscaling::LoadSettings()
 {
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	// Shipped defaults first, then the user's MCM changes (the frame-generation plugin reads the
-	// same two files in the same order to size its buffers for kSecondaryGPU).
-	ini.LoadFile("Data\\MCM\\Config\\Upscaling\\settings.ini");
-	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
+	// Shipped defaults first, then the user's MCM changes (the frame-generation part reads the same
+	// section the same way to size its buffers for kSecondaryGPU).
+	mgpu::LoadSettings(ini);
+	const char* section = mgpu::kUpscalingSection;
 
-	settings.upscaleMethodPreference = std::min(static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2)),
+	settings.upscaleMethodPreference = std::min(static_cast<uint>(ini.GetLongValue(section, "iUpscaleMethodPreference", 2)),
 		static_cast<uint>(UpscaleMethod::kSecondaryGPU));
-	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
-	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", 0.5)), 0.0f, 1.0f);
+	settings.qualityMode = static_cast<uint>(ini.GetLongValue(section, "iQualityMode", 1));
+	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue(section, "fSharpness", 0.5)), 0.0f, 1.0f);
 
 	REX::INFO("[SETTINGS] Loaded: upscaleMethod={}, qualityMode={}, sharpness={:.2f}",
 		settings.upscaleMethodPreference, settings.qualityMode, settings.sharpness);
@@ -1026,7 +1039,7 @@ ID3D11ComputeShader* Upscaling::GetDilateMotionVectorCS()
 {
 	if (!dilateMotionVectorCS) {
 		REX::DEBUG("Compiling DilateMotionVectorCS.hlsl");
-		dilateMotionVectorCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/DilateMotionVectorCS.hlsl", {}, "cs_5_0"));
+		dilateMotionVectorCS.attach((ID3D11ComputeShader*)Util::CompileShader(MGPU_SHADER(L"DilateMotionVectorCS.hlsl"), {}, "cs_5_0"));
 	}
 	return dilateMotionVectorCS.get();
 }
@@ -1035,7 +1048,7 @@ ID3D11ComputeShader* Upscaling::GetOverrideLinearDepthCS()
 {
 	if (!overrideLinearDepthCS) {
 		REX::DEBUG("Compiling OverrideLinearDepthCS.hlsl");
-		overrideLinearDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/OverrideLinearDepthCS.hlsl", {}, "cs_5_0"));
+		overrideLinearDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(MGPU_SHADER(L"OverrideLinearDepthCS.hlsl"), {}, "cs_5_0"));
 	}
 	return overrideLinearDepthCS.get();
 }
@@ -1044,7 +1057,7 @@ ID3D11ComputeShader* Upscaling::GetOverrideDepthCS()
 {
 	if (!overrideDepthCS) {
 		REX::DEBUG("Compiling OverrideDepthCS.hlsl");
-		overrideDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/OverrideDepthCS.hlsl", {}, "cs_5_0"));
+		overrideDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(MGPU_SHADER(L"OverrideDepthCS.hlsl"), {}, "cs_5_0"));
 	}
 	return overrideDepthCS.get();
 }
@@ -1053,7 +1066,7 @@ ID3D11PixelShader* Upscaling::GetBSImagespaceShaderSSLRRaytracing()
 {
 	if (!BSImagespaceShaderSSLRRaytracing) {
 		REX::DEBUG("Compiling BSImagespaceShaderSSLRRaytracing.hlsl");
-		BSImagespaceShaderSSLRRaytracing.attach((ID3D11PixelShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/BSImagespaceShaderSSLRRaytracing.hlsl", {}, "ps_5_0"));
+		BSImagespaceShaderSSLRRaytracing.attach((ID3D11PixelShader*)Util::CompileShader(MGPU_SHADER(L"BSImagespaceShaderSSLRRaytracing.hlsl"), {}, "ps_5_0"));
 	}
 	return BSImagespaceShaderSSLRRaytracing.get();
 }
@@ -1201,29 +1214,10 @@ void Upscaling::SecondaryGPU::Resolve()
 		return;
 	resolved = true;
 
-	HMODULE frameGeneration = GetModuleHandleW(L"AAAFrameGeneration.dll");
-	if (!frameGeneration) {
-		REX::WARN("[UPSCALE] FSR 4.1 on the second GPU needs AAAFrameGeneration.dll (FG-GPU1 build), which is not loaded; "
-				  "rendering at native resolution");
-		return;
-	}
-	using VersionFn = uint32_t (*)();
-	const auto version = reinterpret_cast<VersionFn>(GetProcAddress(frameGeneration, "FGGPU1_UpscaleApiVersion"));
-	if (!version || version() != kApiVersion) {
-		REX::WARN("[UPSCALE] AAAFrameGeneration.dll does not offer upscaling on the second GPU (version {}, need {}); "
-				  "install the matching FG-GPU1 build. Rendering at native resolution",
-			version ? version() : 0, kApiVersion);
-		return;
-	}
-	ready = reinterpret_cast<ReadyFn>(GetProcAddress(frameGeneration, "FGGPU1_SecondaryUpscalerReady"));
-	setFrame = reinterpret_cast<SetFrameFn>(GetProcAddress(frameGeneration, "FGGPU1_SetSecondaryUpscale"));
-	if (!Available()) {
-		ready = nullptr;
-		setFrame = nullptr;
-		REX::WARN("[UPSCALE] AAAFrameGeneration.dll is missing an FG-GPU1 export; rendering at native resolution");
-		return;
-	}
-	REX::INFO("[UPSCALE] FSR 4.1 on the second GPU: connected to AAAFrameGeneration.dll");
+	// Same DLL: the frame-generation part answers directly (it was AAAFrameGeneration.dll's exports).
+	ready = &::FGGPU1_SecondaryUpscalerReady;
+	setFrame = &::FGGPU1_SetSecondaryUpscale;
+	REX::INFO("[UPSCALE] FSR 4.1 on the second GPU: handled by the frame-generation part of this plugin");
 }
 
 bool Upscaling::SecondaryGPUReady()
@@ -1239,17 +1233,10 @@ bool Upscaling::SecondaryGPUReady()
 	static int previous = -1;
 	if (previous != static_cast<int>(ready)) {
 		REX::INFO("[UPSCALE] FSR 4.1 on the second GPU {}", ready ? "is ready: rendering at the quality mode's resolution" :
-																	"is not ready (see AAAFrameGeneration.log): rendering at native resolution");
+																	"is not ready (see the [FSR4] lines): rendering at native resolution");
 		previous = static_cast<int>(ready);
 	}
 	return ready;
-}
-
-// FG-GPU1: the frame-generation plugin checks that this Upscaling.dll knows kSecondaryGPU before
-// it sizes its buffers for it.
-extern "C" __declspec(dllexport) uint32_t FO4Upscaling_SecondaryGPUApiVersion()
-{
-	return Upscaling::SecondaryGPU::kApiVersion;
 }
 
 void Upscaling::Upscale()
@@ -1258,7 +1245,7 @@ void Upscaling::Upscale()
 		return;
 
 	// FG-GPU1: the frame buffer keeps the render-resolution scene in its top-left corner. The
-	// frame-generation plugin's hook on this call copies it out for the second GPU and fills the
+	// frame-generation part's hook on this call copies it out for the second GPU and fills the
 	// frame buffer for the UI, whichever of the two hooks runs first.
 	if (upscaleMethod == UpscaleMethod::kSecondaryGPU)
 		return;
@@ -1409,3 +1396,5 @@ void Upscaling::PatchSSRShader()
 	// Replace the game's SSR pixel shader with our custom one that fixes scaled render targets
 	context->PSSetShader(GetBSImagespaceShaderSSLRRaytracing(), nullptr, 0);
 }
+
+}  // namespace up

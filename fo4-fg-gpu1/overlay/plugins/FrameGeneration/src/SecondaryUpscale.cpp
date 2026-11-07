@@ -5,16 +5,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <iterator>
 #include <string>
 
 #include "CrossAdapterBridge.h"
 #include "FidelityFX.h"
+#include "MGPUScaling.h"
 #include "Upscaling.h"
 
 namespace
 {
-	constexpr const wchar_t* kShaderPath = L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl";
+	constexpr const wchar_t* kShaderPath = MGPU_SHADER(L"SecondaryUpscaleCS.hlsl");
 
 	D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before,
 		D3D12_RESOURCE_STATES a_after)
@@ -29,42 +31,111 @@ namespace
 	}
 
 
-	// FSR's quality modes, the ratios ffxFsr3GetUpscaleRatioFromQualityMode returns in Upscaling.dll.
+	// FSR's quality modes, the ratios ffxFsr3GetUpscaleRatioFromQualityMode returns in the upscaler.
 	constexpr float kUpscaleRatio[] = { 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
 	constexpr const char* kQualityName[] = { "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance" };
 }
 
-bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth,
-	UINT a_displayHeight, DXGI_FORMAT a_backBufferFormat)
+const char* SecondaryUpscale::FormatName(DXGI_FORMAT a_format)
 {
-	if (planned || !a_device || !a_queue)
+	switch (a_format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+		return "R8G8B8A8_UNORM";
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+		return "R8G8B8A8_UNORM_SRGB";
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+		return "B8G8R8A8_UNORM";
+	case DXGI_FORMAT_R10G10B10A2_UNORM:
+		return "R10G10B10A2_UNORM (HDR10)";
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		return "R16G16B16A16_FLOAT (scRGB)";
+	default:
+		return "another format";
+	}
+}
+
+bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth,
+	UINT a_displayHeight, DXGI_FORMAT a_displayFormat)
+{
+	if (planned || converting || !a_device || !a_queue)
 		return planned;
 
-	// Upscaling.dll's own settings decide, read the way it reads them (shipped defaults, then the
-	// user's MCM file), so the two plugins agree on the render size without talking yet.
+	displayWidth = a_displayWidth;
+	displayHeight = a_displayHeight;
+	displayFormat = a_displayFormat;
+	device.copy_from(a_device);
+	queue = a_queue;
+
+	// The game's frames are RGBA8. Any other swap-chain format (an HDR add-on promoted it while FFX
+	// created it) needs a shader pass, because copies do not convert.
+	const bool convert = a_displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM;
+	if (convert) {
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+		support.Format = a_displayFormat;
+		const bool storable = SUCCEEDED(a_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+		                      (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+		                      (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+		if (!storable) {
+			REX::CRITICAL("[FG-GPU1] the swap chain is format {} ({}), which the display GPU cannot write from a shader; "
+						  "frames cannot be shown. Disable the add-on that changes it (e.g. ReShade's AutoHDR)",
+				static_cast<int>(a_displayFormat), FormatName(a_displayFormat));
+			return false;
+		}
+		REX::INFO("[FG-GPU1] the swap chain is {} (format {}), the game renders R8G8B8A8_UNORM: every frame is converted "
+				  "on the display GPU",
+			FormatName(a_displayFormat), static_cast<int>(a_displayFormat));
+	}
+
+	if (PlanUpscale()) {
+		if (FidelityFX::GetSingleton()->CreateUpscaler(a_device, renderWidth, renderHeight, displayWidth, displayHeight,
+				Upscaling::GetSingleton()->settings.debugLogging) &&
+			CreatePipeline(true)) {
+			planned = true;
+			converting = convert;
+			QueryPerformanceCounter(&statLastLog);
+			REX::INFO("[FSR4] upscaling on the display GPU: the game renders {}x{} ({}), FSR {} upscales to {}x{}{}", renderWidth,
+				renderHeight, kQualityName[qualityMode], FidelityFX::GetSingleton()->upscalerProvider, displayWidth, displayHeight,
+				convert ? std::format(", composited in {}", FormatName(a_displayFormat)) : std::string{});
+			return true;
+		}
+	}
+
+	// Not upscaling: with a non-RGBA8 swap chain the finished frame still needs the conversion pass.
+	if (convert) {
+		renderWidth = displayWidth;
+		renderHeight = displayHeight;
+		if (CreatePipeline(false)) {
+			converting = true;
+			REX::INFO("[FG-GPU1] frames reach the {} back buffer through a conversion pass on the display GPU",
+				FormatName(a_displayFormat));
+		} else {
+			REX::CRITICAL("[FG-GPU1] the conversion pass for the {} swap chain could not be set up; frames cannot be shown. "
+						  "Disable the add-on that changes the format (e.g. ReShade's AutoHDR)",
+				FormatName(a_displayFormat));
+		}
+	}
+	return false;
+}
+
+bool SecondaryUpscale::PlanUpscale()
+{
+	// The upscaler's own settings decide, read the way it reads them (shipped defaults, then the
+	// user's MCM file), so both parts agree on the render size before the game renders a frame.
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	ini.LoadFile("Data\\MCM\\Config\\Upscaling\\settings.ini");
-	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
-	const long method = ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2);
+	mgpu::LoadSettings(ini);
+	const long method = ini.GetLongValue(mgpu::kUpscalingSection, "iUpscaleMethodPreference", 2);
 	if (method != 3) {
-		REX::INFO("[FSR4] Upscaling.dll iUpscaleMethodPreference = {} (3 = FSR 4.1 on the display GPU): not upscaling here",
+		REX::INFO("[FSR4] [Upscaling] iUpscaleMethodPreference = {} (3 = FSR 4.1 on the display GPU): not upscaling here",
 			method);
 		return false;
 	}
-	qualityMode = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iQualityMode", 1)), 0, 4);
+	qualityMode = std::clamp(static_cast<int>(ini.GetLongValue(mgpu::kUpscalingSection, "iQualityMode", 1)), 0, 4);
 
-	using VersionFn = uint32_t (*)();
-	HMODULE upscalingDll = GetModuleHandleW(L"Upscaling.dll");
-	const auto version = upscalingDll ?
-	                         reinterpret_cast<VersionFn>(GetProcAddress(upscalingDll, "FO4Upscaling_SecondaryGPUApiVersion")) :
-	                         nullptr;
-	if (!version || version() != kApiVersion) {
-		REX::ERROR("[FSR4] iUpscaleMethodPreference = 3 needs the Upscaling.dll from the FG-GPU1 package ({}); "
-				   "the game renders at full resolution",
-			!upscalingDll ? "no Upscaling.dll is loaded" :
-			!version      ? "the loaded one is a different build" :
-							"the loaded one is a different version");
+	// The upscaler renders the frames this upscales; it is off when another Upscaling.dll is loaded.
+	if (!mgpu::UpscalerActive()) {
+		REX::ERROR("[FSR4] iUpscaleMethodPreference = 3, but the upscaler is off (another Upscaling.dll is loaded, see the "
+				   "[INIT] line); the game renders at full resolution");
 		return false;
 	}
 
@@ -73,42 +144,16 @@ bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_
 		REX::ERROR("[FSR4] upscaling on the display GPU needs the cross-adapter transport with bAsyncUnpack = 1");
 		return false;
 	}
-	if (a_backBufferFormat != DXGI_FORMAT_R8G8B8A8_UNORM) {
-		REX::ERROR("[FSR4] the back buffer is format {}, not R8G8B8A8_UNORM (28); upscaling on the display GPU is off "
-				   "(HDR add-ons change it)",
-			static_cast<int>(a_backBufferFormat));
-		return false;
-	}
 
 	// The arithmetic Upscaling.dll uses for its render targets and jitter.
 	const float scale = 1.0f / kUpscaleRatio[qualityMode];
-	renderWidth = static_cast<UINT>(static_cast<float>(a_displayWidth) * scale);
-	renderHeight = static_cast<UINT>(static_cast<float>(a_displayHeight) * scale);
-	displayWidth = a_displayWidth;
-	displayHeight = a_displayHeight;
-	device.copy_from(a_device);
-	queue = a_queue;
-
-	if (!FidelityFX::GetSingleton()->CreateUpscaler(a_device, renderWidth, renderHeight, displayWidth, displayHeight,
-			Upscaling::GetSingleton()->settings.debugLogging))
-		return false;
-	if (!CreatePipeline())
-		return false;
-
-	planned = true;
-	QueryPerformanceCounter(&statLastLog);
-	REX::INFO("[FSR4] upscaling on the display GPU: the game renders {}x{} ({}), FSR {} upscales to {}x{}", renderWidth,
-		renderHeight, kQualityName[qualityMode], FidelityFX::GetSingleton()->upscalerProvider, displayWidth, displayHeight);
+	renderWidth = static_cast<UINT>(static_cast<float>(displayWidth) * scale);
+	renderHeight = static_cast<UINT>(static_cast<float>(displayHeight) * scale);
 	return true;
 }
 
-bool SecondaryUpscale::CreatePipeline()
+bool SecondaryUpscale::CreateComputePipeline(const char* a_entry, winrt::com_ptr<ID3D12PipelineState>& a_pipeline)
 {
-	const auto fail = [](const char* a_what, HRESULT a_hr) {
-		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
-		return false;
-	};
-
 	const std::string renderW = std::to_string(renderWidth);
 	const std::string renderH = std::to_string(renderHeight);
 	const std::string displayW = std::to_string(displayWidth);
@@ -118,13 +163,43 @@ bool SecondaryUpscale::CreatePipeline()
 
 	winrt::com_ptr<ID3DBlob> shader;
 	winrt::com_ptr<ID3DBlob> errors;
-	HRESULT hr = D3DCompileFromFile(kShaderPath, defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "Composite", "cs_5_0",
+	HRESULT hr = D3DCompileFromFile(kShaderPath, defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, a_entry, "cs_5_0",
 		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), errors.put());
 	if (FAILED(hr)) {
 		if (errors)
 			REX::ERROR("[FSR4] {}", static_cast<const char*>(errors->GetBufferPointer()));
-		return fail("compiling SecondaryUpscaleCS.hlsl (Composite)", hr);
+		REX::ERROR("[FSR4] compiling SecondaryUpscaleCS.hlsl ({}) failed (hr={:#010x})", a_entry, static_cast<std::uint32_t>(hr));
+		return false;
 	}
+
+	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
+	pipelineDesc.pRootSignature = rootSignature.get();
+	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+	hr = device->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(a_pipeline.put()));
+	if (FAILED(hr)) {
+		REX::ERROR("[FSR4] CreateComputePipelineState ({}) failed (hr={:#010x})", a_entry, static_cast<std::uint32_t>(hr));
+		return false;
+	}
+	return true;
+}
+
+bool SecondaryUpscale::CreatePipeline(bool a_upscale)
+{
+	const auto fail = [](const char* a_what, HRESULT a_hr) {
+		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
+		return false;
+	};
+
+	HRESULT hr = S_OK;
+
+	// A failed upscaling setup is followed by the conversion-only one: start from nothing.
+	rootSignature = nullptr;
+	pipeline = nullptr;
+	copyPipeline = nullptr;
+	descriptors = nullptr;
+	composite = nullptr;
+	for (auto& output : outputs)
+		output = nullptr;
 
 	// One table per slot: t0-t2, u0.
 	D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -155,12 +230,11 @@ bool SecondaryUpscale::CreatePipeline()
 	if (FAILED(hr))
 		return fail("CreateRootSignature", hr);
 
-	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
-	pipelineDesc.pRootSignature = rootSignature.get();
-	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
-	hr = device->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(pipeline.put()));
-	if (FAILED(hr))
-		return fail("CreateComputePipelineState", hr);
+	if (a_upscale && !CreateComputePipeline("Composite", pipeline))
+		return false;
+	// Native frames into a back buffer the copy engine cannot convert to.
+	if (displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM && !CreateComputePipeline("Copy", copyPipeline))
+		return false;
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -172,7 +246,9 @@ bool SecondaryUpscale::CreatePipeline()
 	descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
 	// FSR 4.1 outputs (one per slot: frame generation reads a frame's while the next is upscaled)
-	// and the composite. COMMON between uses, like the bridge's mirrors.
+	// and the composite. COMMON between uses, like the bridge's mirrors. The outputs stay RGBA8
+	// like the game's frames (frame generation is told so); the composite has the swap chain's
+	// format because it is copied into the back buffer.
 	D3D12_RESOURCE_DESC desc{};
 	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 	desc.Width = displayWidth;
@@ -185,18 +261,26 @@ bool SecondaryUpscale::CreatePipeline()
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	D3D12_HEAP_PROPERTIES defaultHeap{};
 	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-	for (auto& output : outputs) {
-		hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-			IID_PPV_ARGS(output.put()));
-		if (FAILED(hr))
-			return fail("CreateCommittedResource(FSR 4.1 output)", hr);
-		output->SetName(L"FG-GPU1 FSR 4.1 output");
+	if (a_upscale) {
+		for (auto& output : outputs) {
+			hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+				IID_PPV_ARGS(output.put()));
+			if (FAILED(hr))
+				return fail("CreateCommittedResource(FSR 4.1 output)", hr);
+			output->SetName(L"FG-GPU1 FSR 4.1 output");
+		}
 	}
+	desc.Format = displayFormat;
 	hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
 		IID_PPV_ARGS(composite.put()));
 	if (FAILED(hr))
 		return fail("CreateCommittedResource(composite)", hr);
-	composite->SetName(L"FG-GPU1 FSR 4.1 composite");
+	composite->SetName(L"FG-GPU1 composite (display format)");
+
+	// The upscale list and timestamps belong to upscaling; the conversion pass records on the
+	// frame's own list.
+	if (!a_upscale)
+		return true;
 
 	for (auto& allocator : allocators) {
 		hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put()));
@@ -254,7 +338,45 @@ bool SecondaryUpscale::ReadyFor(uint32_t a_width, uint32_t a_height)
 bool SecondaryUpscale::HasFinalMirror() const noexcept
 {
 	auto bridge = CrossAdapterBridge::GetSingleton();
-	return planned && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
+	return OwnsPresent() && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
+}
+
+void SecondaryUpscale::SetFinalLane(int a_lane)
+{
+	finalLane = a_lane;
+	// Conversion only: no other lane is bound, so the finished frame's descriptors are written now.
+	if (converting && !planned && !WriteFinishedDescriptors()) {
+		converting = false;
+		REX::CRITICAL("[FG-GPU1] the finished frame has no mirror on the display GPU; the {} swap chain gets no frames",
+			FormatName(displayFormat));
+	}
+}
+
+bool SecondaryUpscale::WriteFinishedDescriptors()
+{
+	auto bridge = CrossAdapterBridge::GetSingleton();
+	if (!HasFinalMirror())
+		return false;
+	for (UINT slot = 0; slot < kSlots; ++slot) {
+		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
+		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
+		// t0 and t2 are not read by Copy; null descriptors keep the table fully initialised.
+		ID3D12Resource* sources[3] = { nullptr, bridge->Mirror(finalLane, slot), nullptr };
+		for (auto* source : sources) {
+			D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+			srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			srv.Texture2D.MipLevels = 1;
+			device->CreateShaderResourceView(source, &srv, handle);
+			handle.ptr += descriptorSize;
+		}
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+		uav.Format = displayFormat;
+		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device->CreateUnorderedAccessView(composite.get(), nullptr, &uav, handle);
+	}
+	return true;
 }
 
 bool SecondaryUpscale::BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane)
@@ -296,7 +418,7 @@ bool SecondaryUpscale::BindLanes(int a_sceneLane, int a_depthLane, int a_motionL
 			handle.ptr += descriptorSize;
 		}
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-		uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		uav.Format = displayFormat;
 		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 		device->CreateUnorderedAccessView(composite.get(), nullptr, &uav, handle);
 	}
@@ -526,6 +648,10 @@ void SecondaryUpscale::RecordPresent(ID3D12GraphicsCommandList* a_list, UINT a_s
 			Transition(a_backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
 		};
 		a_list->ResourceBarrier(2, done);
+	} else if (copyPipeline) {
+		// Rendered natively (menus, loading), not upscalable, or not upscaling at all, into a back
+		// buffer of another format (HDR add-on): converted on the way.
+		RecordCopyThroughComposite(a_list, a_slot, finished, a_backBuffer);
 	} else {
 		// Rendered natively (menus, loading) or not upscalable: shown as the render GPU finished it.
 		const D3D12_RESOURCE_BARRIER before[2] = {
@@ -549,6 +675,40 @@ void SecondaryUpscale::RecordPresent(ID3D12GraphicsCommandList* a_list, UINT a_s
 		a_list->ResolveQueryData(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks, kMarks, readback.get(),
 			sizeof(UINT64) * a_slot * kMarks);
 	}
+}
+
+void SecondaryUpscale::RecordCopyThroughComposite(ID3D12GraphicsCommandList* a_list, UINT a_slot,
+	ID3D12Resource* a_finished, ID3D12Resource* a_backBuffer)
+{
+	// A swap-chain buffer is a render target, not a UAV, so the shader writes the composite and the
+	// copy engine moves it (same format) into the back buffer.
+	const D3D12_RESOURCE_BARRIER before[2] = {
+		Transition(a_finished, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+		Transition(composite.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+	};
+	a_list->ResourceBarrier(2, before);
+
+	ID3D12DescriptorHeap* heaps[] = { descriptors.get() };
+	a_list->SetDescriptorHeaps(1, heaps);
+	a_list->SetComputeRootSignature(rootSignature.get());
+	a_list->SetPipelineState(copyPipeline.get());
+	D3D12_GPU_DESCRIPTOR_HANDLE table = descriptors->GetGPUDescriptorHandleForHeapStart();
+	table.ptr += static_cast<UINT64>(a_slot * kDescriptorsPerSlot) * descriptorSize;
+	a_list->SetComputeRootDescriptorTable(0, table);
+	a_list->Dispatch((displayWidth + 7) / 8, (displayHeight + 7) / 8, 1);
+
+	const D3D12_RESOURCE_BARRIER after[3] = {
+		Transition(a_finished, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+		Transition(composite.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+		Transition(a_backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
+	};
+	a_list->ResourceBarrier(3, after);
+	a_list->CopyResource(a_backBuffer, composite.get());
+	const D3D12_RESOURCE_BARRIER done[2] = {
+		Transition(composite.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+		Transition(a_backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
+	};
+	a_list->ResourceBarrier(2, done);
 }
 
 ID3D12Resource* SecondaryUpscale::Output(UINT a_slot) const noexcept
@@ -624,19 +784,15 @@ void SecondaryUpscale::LogStats()
 }
 
 // ---------------------------------------------------------------------------------------
-// Upscaling.dll (FG-GPU1 build) calls these; see Upscaling::SecondaryGPU there.
+// The upscaler calls these every frame; see up::Upscaling::SecondaryGPU. (They were
+// AAAFrameGeneration.dll's exports for Upscaling.dll; now both are in one DLL.)
 
-extern "C" __declspec(dllexport) uint32_t FGGPU1_UpscaleApiVersion()
-{
-	return SecondaryUpscale::kApiVersion;
-}
-
-extern "C" __declspec(dllexport) bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight)
+extern "C" bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight)
 {
 	return SecondaryUpscale::GetSingleton()->ReadyFor(a_renderWidth, a_renderHeight);
 }
 
-extern "C" __declspec(dllexport) void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth,
+extern "C" void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth,
 	uint32_t a_renderHeight, float a_jitterX, float a_jitterY, float a_sharpness)
 {
 	auto& frame = Upscaling::GetSingleton()->externalFrame;

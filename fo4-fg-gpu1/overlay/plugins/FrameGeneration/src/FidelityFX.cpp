@@ -3,6 +3,7 @@
 #include "Upscaling.h"
 
 #include "DX12SwapChain.h"
+#include "MGPUScaling.h"
 
 #include <atomic>
 #include <cmath>
@@ -15,7 +16,7 @@ ffxFunctions ffxModule;
 
 namespace
 {
-	constexpr const wchar_t* kFfxFolder = L"Data\\F4SE\\Plugins\\FrameGeneration\\FidelityFX\\";
+	constexpr const wchar_t* kFfxFolder = mgpu::kFidelityFXDir;
 	constexpr const wchar_t* kLegacyDll = L"amd_fidelityfx_dx12.dll";
 	constexpr const wchar_t* kLoaderDll = L"amd_fidelityfx_loader_dx12.dll";
 	constexpr const wchar_t* kFrameGenDll = L"amd_fidelityfx_framegeneration_dx12.dll";
@@ -176,7 +177,7 @@ namespace
 		for (auto& c : lower)
 			c = static_cast<wchar_t>(towlower(c));
 		// The SDK 2.4 loader looks for effect DLLs next to Fallout4.exe before its own folder.
-		if (lower.find(L"\\f4se\\plugins\\framegeneration\\fidelityfx\\") == std::wstring::npos)
+		if (lower.find(L"\\f4se\\plugins\\mgpuscaling\\fidelityfx\\") == std::wstring::npos)
 			REX::WARN("[FSR] {} was loaded from {}, not from this plugin's FidelityFX folder (another mod's copy?)",
 				Narrow(a_name), Narrow(path));
 		else
@@ -347,12 +348,39 @@ bool FidelityFX::CreateContexts(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DE
 												 " (driver-assisted frame pacing capable)");
 	}
 
+	// The format the swap chain really has. An add-on can change it while FFX creates it: ReShade's
+	// AutoHDR turns it into R10G10B10A2 (HDR10) or R16G16B16A16_FLOAT (scRGB). FFX creates its
+	// back buffers from the real one, so frame generation and everything that writes the back
+	// buffer must use this format, not the one the game asked for. GetDesc1 cannot tell: ReShade
+	// reports the requested format when an add-on changed it. The back buffer itself can.
+	displayFormat = a_desc->Format;
+	winrt::com_ptr<ID3D12Resource> backBuffer;
+	if (SUCCEEDED((*a_swapChain)->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()))) && backBuffer) {
+		const DXGI_FORMAT bufferFormat = backBuffer->GetDesc().Format;
+		if (bufferFormat != DXGI_FORMAT_UNKNOWN)
+			displayFormat = bufferFormat;
+	} else {
+		REX::WARN("[FSR] could not read the swap chain's back buffer; assuming format {}", static_cast<int>(displayFormat));
+	}
+	if (displayFormat != a_desc->Format) {
+		REX::WARN("[FSR] the swap chain was created as format {} but is format {} (an HDR add-on such as ReShade's AutoHDR "
+				  "changed it); frame generation and the display GPU's output follow it. Change HDR settings only with the "
+				  "game closed",
+			static_cast<int>(a_desc->Format), static_cast<int>(displayFormat));
+		if (!sdk24)
+			REX::ERROR("[FSR] {} cannot be told that the UI-free frame stays RGBA8 under a {} back buffer; generated "
+					   "frames may be wrong. Use iFSRRuntime = 1 with HDR add-ons",
+				RuntimeName(), static_cast<int>(displayFormat));
+	}
+
 	// ---- frame generation
 	ffx::CreateContextDescFrameGeneration createFg{};
 	createFg.displaySize = { a_desc->Width, a_desc->Height };
 	createFg.maxRenderSize = createFg.displaySize;
 	createFg.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
-	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(a_desc->Format);
+	// SDR content in whatever container the swap chain has: HDR is applied after frame generation
+	// (ReShade at the real Present), so FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE stays off.
+	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(displayFormat);
 
 	ffx::CreateBackendDX12Desc backend{};
 	backend.device = device;
@@ -367,8 +395,9 @@ bool FidelityFX::CreateContexts(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DE
 		ffx::CreateContextDescFrameGenerationVersion version{};
 		version.version = FFX_FRAMEGENERATION_VERSION;
 
-		// The HUD-less copy is always RGBA8 (Upscaling::CreateFrameGenerationResources). Declare it
-		// when the back buffer is something else, e.g. BGRA8.
+		// The HUD-less copy is always RGBA8 (Upscaling::CreateFrameGenerationResources, and the FSR 4.1
+		// output on the second GPU). Declare it when the back buffer is something else, e.g. BGRA8 or
+		// the 10-bit/16-bit format of an HDR add-on.
 		ffx::CreateContextDescFrameGenerationHudless hudless{};
 		hudless.hudlessBackBufferFormat = ffxApiGetSurfaceFormatDX12(DXGI_FORMAT_R8G8B8A8_UNORM);
 		const bool declareHudless = hudless.hudlessBackBufferFormat != createFg.backBufferFormat;
@@ -446,7 +475,7 @@ bool FidelityFX::CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, 
 
 	// Fallout 4's frame is upscaled after its imagespace, i.e. tonemapped LDR in a UNORM target:
 	// perceptual colour. Depth is 0 at the near plane (not inverted), motion vectors are at render
-	// resolution and carry no jitter (the same flags Upscaling.dll uses for FSR 3.1).
+	// resolution and carry no jitter (the same flags the upscaler uses for FSR 3.1).
 	ffx::CreateContextDescUpscale create{};
 	create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
 	if (a_debugChecking)
@@ -722,7 +751,7 @@ void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_overr
 			-jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale);
 
 		// FG-GPU1 upscaling: depth and motion vectors are the render-resolution lanes, and the size
-		// and jitter come from Upscaling.dll for this frame instead of the dynamic-resolution state,
+		// and jitter come from the upscaler for this frame instead of the dynamic-resolution state,
 		// which other hooks change around Present.
 		if (a_override) {
 			renderWidth = a_override->renderWidth;

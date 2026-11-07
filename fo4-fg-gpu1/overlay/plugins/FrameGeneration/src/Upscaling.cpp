@@ -7,6 +7,7 @@
 #include "DirectXMath.h"
 #include "FidelityFX.h"
 #include "SecondaryUpscale.h"
+#include "MGPUScaling.h"
 
 enum class RenderTarget
 {
@@ -124,32 +125,32 @@ void Upscaling::LoadSettings()
 {
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	// Read defaults from MCM Config, then overlay user changes from MCM Settings
-	ini.LoadFile("Data\\MCM\\Config\\FrameGeneration\\settings.ini");
-	ini.LoadFile("Data\\MCM\\Settings\\FrameGeneration.ini");
+	// Shipped defaults, then the user's MCM changes: the [FrameGeneration] section of MGPUScaling.ini.
+	mgpu::LoadSettings(ini);
+	const char* section = mgpu::kFrameGenerationSection;
 
-	settings.frameGenerationMode = ini.GetBoolValue("Settings", "bFrameGenerationMode", true);
-	settings.frameLimitMode = ini.GetBoolValue("Settings", "bFrameLimitMode", true);
-	settings.disableInMenus = ini.GetBoolValue("Settings", "bDisableInMenus", true);
-	settings.debugLogging = ini.GetBoolValue("Settings", "bEnableDebugLogging", false);
-	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
+	settings.frameGenerationMode = ini.GetBoolValue(section, "bFrameGenerationMode", true);
+	settings.frameLimitMode = ini.GetBoolValue(section, "bFrameLimitMode", true);
+	settings.disableInMenus = ini.GetBoolValue(section, "bDisableInMenus", true);
+	settings.debugLogging = ini.GetBoolValue(section, "bEnableDebugLogging", false);
+	settings.frameGenType = (int)ini.GetLongValue(section, "iFrameGenType", 0);
 	// MCM stepper is 0-indexed (0=2x, 1=3x, 2=4x) but we store as numFramesToGenerate (1, 2, 3)
-	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
-	settings.secondaryGPU = ini.GetBoolValue("Settings", "bFrameGenOnSecondaryGPU", false);
-	settings.secondaryGPUName = ini.GetValue("Settings", "sSecondaryGPUName", "");
+	settings.frameGenFrames = std::clamp((int)ini.GetLongValue(section, "iFrameGenFrames", 0) + 1, 1, 3);
+	settings.secondaryGPU = ini.GetBoolValue(section, "bFrameGenOnSecondaryGPU", false);
+	settings.secondaryGPUName = ini.GetValue(section, "sSecondaryGPUName", "");
 	// bTransportHudLess was the old name of this switch; keep reading it so an existing
 	// settings.ini (or a test build someone edited) is not silently reset to the default.
-	if (ini.KeyExists("Settings", "bSendHudlessFrame"))
-		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bSendHudlessFrame", true);
+	if (ini.KeyExists(section, "bSendHudlessFrame"))
+		settings.sendHudlessFrame = ini.GetBoolValue(section, "bSendHudlessFrame", true);
 	else
-		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bTransportHudLess", true);
-	settings.asyncUnpack = ini.GetBoolValue("Settings", "bAsyncUnpack", true);
-	settings.earlyTransfer = ini.GetBoolValue("Settings", "bEarlyTransfer", true);
-	settings.earlyUnpack = ini.GetBoolValue("Settings", "bEarlyUnpack", true);
-	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iHalfResDepthMV", 1)), 0, 2);
-	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRRuntime", 1)), 0, 1);
-	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRSwapChainProvider", 0)), 0, 1);
-	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRFrameGenProvider", 0)), 0, 1);
+		settings.sendHudlessFrame = ini.GetBoolValue(section, "bTransportHudLess", true);
+	settings.asyncUnpack = ini.GetBoolValue(section, "bAsyncUnpack", true);
+	settings.earlyTransfer = ini.GetBoolValue(section, "bEarlyTransfer", true);
+	settings.earlyUnpack = ini.GetBoolValue(section, "bEarlyUnpack", true);
+	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue(section, "iHalfResDepthMV", 1)), 0, 2);
+	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRRuntime", 1)), 0, 1);
+	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
+	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -445,9 +446,9 @@ void Upscaling::CreateFrameGenerationResources()
 		REX::INFO("[FG-GPU1] bSendHudlessFrame=0: the extra UI-free frame is not sent (HUD will smear, ~25% less PCIe)");
 	}
 
-	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
-	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
-	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
+	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"CopyDepthToSharedBufferCS.hlsl"), "cs_5_0");
+	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"GenerateSharedBuffersCS.hlsl"), "cs_5_0");
+	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"GenerateUIBufferCS.hlsl"), "cs_5_0");
 
 	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
 }
@@ -476,7 +477,7 @@ void Upscaling::SetupHalfResDepthMV(UINT a_width, UINT a_height)
 	const char* halfMotion = halfResMode == 2 ? "1" : "0";
 	const D3D_SHADER_MACRO postAlpha[] = { { "ALPHA_MASK", "1" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
 	const D3D_SHADER_MACRO copyOnly[] = { { "ALPHA_MASK", "0" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
-	constexpr auto kShader = L"Data\\F4SE\\Plugins\\FrameGeneration\\HalfResDepthMVCS.hlsl";
+	constexpr auto kShader = MGPU_SHADER(L"HalfResDepthMVCS.hlsl");
 	halfResPostAlphaCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", postAlpha);
 	halfResCopyCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", copyOnly);
 
@@ -484,7 +485,7 @@ void Upscaling::SetupHalfResDepthMV(UINT a_width, UINT a_height)
 	if (!ready)
 		REX::ERROR("[FG-GPU1] HalfResDepthMVCS.hlsl did not compile; sending depth and motion vectors at full resolution");
 	if (ready && halfResMode == 1)
-		ready = bridge->CreateDepthUpsampler(a_width, a_height, L"Data\\F4SE\\Plugins\\FrameGeneration\\DepthFromHalfResCS.hlsl");
+		ready = bridge->CreateDepthUpsampler(a_width, a_height, MGPU_SHADER(L"DepthFromHalfResCS.hlsl"));
 
 	if (!ready) {
 		if (halfResPostAlphaCS)
@@ -867,7 +868,7 @@ bool Upscaling::CreateSceneBlit()
 	const std::string displayH = std::to_string(dx12SwapChain->swapChainDesc.Height);
 	const D3D_SHADER_MACRO defines[] = { { "RENDER_WIDTH", renderW.c_str() }, { "RENDER_HEIGHT", renderH.c_str() },
 		{ "DISPLAY_WIDTH", displayW.c_str() }, { "DISPLAY_HEIGHT", displayH.c_str() }, { nullptr, nullptr } };
-	sceneBlitCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl",
+	sceneBlitCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"SecondaryUpscaleCS.hlsl"),
 		"cs_5_0", "Blit", defines);
 	if (!sceneBlitCS)
 		return false;

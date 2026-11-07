@@ -1,8 +1,10 @@
-# FO4 FG-GPU1: frame generation on the second GPU
+# MGPU Scaling: upscaling and frame generation on a second GPU (Fallout 4)
 
-Fallout 4 keeps rendering on the **RTX 3090**. FSR3 frame generation and the final present run on the **RX 9060 XT**, which is the card the monitor is plugged into. Nothing is copied back to the 3090.
+Fallout 4 keeps rendering on the **RTX 3090**. FSR3 frame generation, FSR 4.1 upscaling and the final present run on the **RX 9060 XT**, which is the card the monitor is plugged into. Nothing is copied back to the 3090.
 
-This is a modified `AAAFrameGeneration.dll` from [northaxosky/FO4Upscaling](https://github.com/northaxosky/FO4Upscaling) (pinned at `3e237a4`). The upstream plugin creates its D3D12 device on the game's GPU. This version creates two devices:
+MGPU Scaling is one F4SE plugin, `AAAMGPUScaling.dll`. It was developed as "FG-GPU1": a modified `AAAFrameGeneration.dll` plus a matching `Upscaling.dll` from [northaxosky/FO4Upscaling](https://github.com/northaxosky/FO4Upscaling) (pinned at `3e237a4`). Both are now built into the one DLL, with one MCM page, one settings file, one log and its own data folder. It replaces FO4Upscaling's frame generation, the FG-GPU1 package and doodlum's Upscaling; disable those mods (it refuses to run beside `AAAFrameGeneration.dll`, and turns its upscaler off beside any other `Upscaling.dll`). Log lines and code still say `FG-GPU1` for the second-GPU parts.
+
+The upstream frame generation plugin creates its D3D12 device on the game's GPU. This version creates two devices:
 
 | | GPU | Does |
 |---|---|---|
@@ -24,8 +26,10 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | Path | What |
 |---|---|
 | `overlay/` | Full copies of the changed/new upstream files. The build copies them over the pinned checkout. |
+| `overlay/plugins/MGPUScaling/` | The plugin target (`AAAMGPUScaling.dll`): its entry point and settings code, and in `src/upscaler/` FO4Upscaling's Upscaling plugin in `namespace up` |
+| `overlay/plugins/FrameGeneration/src/` | The frame-generation part (changed upstream files plus the new second-GPU code); compiled into the same DLL |
 | `overlay/include/ffx2/` | FSR SDK 2.4 API, frame-generation and upscaler headers (unmodified, MIT), used for both FSR runtimes |
-| `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review (without the vendored SDK headers and licence text) |
+| `fg-gpu1.patch` | The same changes as a diff against `3e237a4`, for review (without the vendored SDK headers and licence text; the upscaler files show as copies of `plugins/Upscaling/src`) |
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
@@ -33,9 +37,12 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 
 The changes:
 - `CrossAdapterBridge.h/.cpp` are new: adapter choice, cross-adapter heaps and fences, the copy queue, unpacking, stats.
-- `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU.
-- `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` and `settings.ini` are small edits.
-- `overlay/plugins/Upscaling/` patches FO4Upscaling's `Upscaling.dll` (built and shipped too): upscale method 3 renders for the second GPU's FSR 4.1.
+- `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU, and the conversion into a swap chain an HDR add-on changed.
+- `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` are small edits.
+- `plugins/MGPUScaling/src/upscaler/` is FO4Upscaling's `Upscaling` plugin, wrapped in `namespace up` (its classes have the same names as the frame-generation part's) and patched: upscale method 3 renders for the second GPU's FSR 4.1. Its entry point is `Upscaler.cpp`.
+- `plugins/MGPUScaling/src/XSEPlugin.cpp` replaces both plugins' entry points and installs their hooks in the order the two DLLs did (see the comment there); `MGPUScaling.h/.cpp` hold the paths, the settings loader and the one-time settings migration.
+- `include/PCH.h`: `stl::detour_thunk` chains behind a function another plugin hooked first instead of copying that plugin's jump unrelocated (Community Shaders' frame annotations crashed the game otherwise).
+- The top-level `CMakeLists.txt` adds the `MGPUScaling` target and drops `AAAFrameGeneration`; MCM's `config.json`/`settings.ini` are one page set with `[FrameGeneration]` and `[Upscaling]` sections.
 
 ## Build on this PC
 
@@ -50,10 +57,11 @@ pwsh -ExecutionPolicy Bypass -File D:\projects\mgpu-dlss\fo4-fg-gpu1\build-local
 it and re-runs itself under `pwsh` when that is installed — but 7 is what it is developed and tested
 on. `powershell.exe` is permanently 5.1; installing 7 does not change what that name means.
 
-It clones FO4Upscaling at the pinned commit into `D:\fgb`, applies `overlay/`, builds
-`AAAFrameGeneration.dll` in Release (`/W4 /WX`) and writes a ready-to-install folder to
-`D:\fgb\package`, including the FidelityFX runtime. First run takes 20–40 min because vcpkg
-compiles the dependencies once; later runs take a few minutes. `-Clean` forces a rebuild.
+It clones FO4Upscaling at the pinned commit into `D:\fgb` (resetting its source folders to that
+commit first), applies `overlay/`, builds `AAAMGPUScaling.dll` in Release (`/W4 /WX`) and writes a
+ready-to-install folder to `D:\fgb\package` and the same as `D:\fgb\MGPU-Scaling.zip`, including the
+FidelityFX runtimes. First run takes 20–40 min because vcpkg compiles the dependencies once; later
+runs take a few minutes. `-Clean` forces a rebuild.
 
 Verified on this machine with VS 18.11 / MSVC 14.52 / CMake 4.3.1: configure, build and
 package complete with 0 warnings, and the resulting DLL exports the three F4SE entry points.
@@ -61,16 +69,20 @@ package complete with 0 warnings, and the resulting DLL exports the three F4SE e
 ## Build on GitHub
 
 1. Commit and push; `.github/workflows/fo4-fg-gpu1.yml` is already in place.
-2. On GitHub, open **Actions → FO4 FG on GPU1** and use **Run workflow**. It is manual only; pushes do not start a build.
-3. When it's green, download the **FO4-FG-GPU1** artifact. It's a zip laid out as a mod (`Data\F4SE\Plugins\AAAFrameGeneration.dll`, …).
+2. On GitHub, open **Actions → MGPU Scaling** and use **Run workflow**. It is manual only; pushes do not start a build.
+3. When it's green, download the **MGPU-Scaling** artifact. It's a zip laid out as a mod (`Data\F4SE\Plugins\AAAMGPUScaling.dll`, …).
 
 ## Install
 
-1. In Vortex, install the zip as a mod (or copy its `Data` folder into the game folder).
-2. Every setting below is also in the Mod Configuration Menu (Frame Generation page); entries marked "(restart)" apply after a game restart, the rest within about a second. Settings come from `Data\MCM\Config\FrameGeneration\settings.ini`. The shipped file has `bFrameGenOnSecondaryGPU = 1` and `iFrameGenType = 0`. If `Data\MCM\Settings\FrameGeneration.ini` exists (MCM writes it), it **overrides** the shipped file, so set the same keys there.
+1. In Vortex, install `MGPU-Scaling.zip` as a mod (or copy its `Data` folder into the game folder). **Disable** the FG-GPU1 package, FO4Upscaling's frame generation mod and doodlum's Upscaling: MGPU Scaling replaces all three and shares no file with them. If `AAAFrameGeneration.dll` is still installed, MGPU Scaling shows a message at start and stays off; if another `Upscaling.dll` is installed, its upscaler (and FSR 4.1 on the second GPU) stays off and the log says why.
+
+   Package layout: `Data\F4SE\Plugins\AAAMGPUScaling.dll`, `Data\F4SE\Plugins\MGPUScaling\Shaders\*.hlsl`, `Data\F4SE\Plugins\MGPUScaling\FidelityFX\*` and `Data\MCM\Config\MGPUScaling\`. The log is `Documents\My Games\Fallout4\F4SE\MGPUScaling.log`. The "AAA" keeps it the first F4SE plugin to load, which its D3D11 device hook needs.
+2. Every setting below is also in the Mod Configuration Menu, page **MGPU Scaling** (sub-pages Frame Generation, Second GPU, Upscaling); entries marked "(restart)" apply after a game restart, the rest within about a second. The shipped defaults are `Data\MCM\Config\MGPUScaling\settings.ini`; MCM writes your changes to `Data\MCM\Settings\MGPUScaling.ini`, which **overrides** them, so edit that file by hand. Frame generation's keys are in its `[FrameGeneration]` section, the upscaler's in `[Upscaling]`.
+
+   On the first start without `MGPUScaling.ini`, the plugin copies your settings from the old `Data\MCM\Settings\FrameGeneration.ini` and `Upscaling.ini` (`[Settings]`, only the keys this plugin knows) into it and logs `[INIT] carried N settings over`. The old files are left alone.
 
 ```ini
-[Settings]
+[FrameGeneration]
 bFrameGenerationMode = 1
 bFrameGenOnSecondaryGPU = 1
 sSecondaryGPUName =          ; optional, e.g. 9060 - only needed if auto-selection refuses
@@ -83,6 +95,11 @@ iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
 iFSRRuntime = 1              ; 0 = FidelityFX SDK 1.1.4 (FSR 3.1.4); 1 = FSR SDK 2.4, newest provider offered (default)
 iFSRSwapChainProvider = 0    ; SDK 2.4: 0 = newest swap chain (4.0.0 on RX 9000); 1 = newest 3.x (3.1.7), for A/B
 iFSRFrameGenProvider = 0     ; SDK 2.4: 0 = newest interpolator (4.0.2 ML on Win11 + RX 9000, else 3.1.6); 1 = 3.x
+
+[Upscaling]
+iUpscaleMethodPreference = 3 ; 0 = off, 1 = FSR 3.1, 2 = DLSS, 3 = FSR 4.1 on the second GPU (restart to switch to/from 3)
+iQualityMode = 1             ; 1 Quality, 2 Balanced, 3 Performance, 4 Ultra Performance, 0 Native AA
+fSharpness = 0.5
 ```
 
 `iFSRRuntime` picks the FSR runtime; see [FSR SDK 2.4](#fsr-sdk-24-ifsrruntime) below. It applies
@@ -133,14 +150,13 @@ and 2 add no pass there; mode 1 adds one ~0.1–0.2 ms compute pass on the 9060,
 path. If anything in the setup fails, the log says so and the plugin uses mode 0.
 
 3. **First test with the fewest moving parts:**
-   - Disable ReShade's `AutoHDR.addon64`. An HDR swap chain changes the back-buffer format, and the plugin then refuses to copy (it logs this).
-   - Ideally run the first test without ReShade at all: rename `dxgi.dll` temporarily.
+   - Ideally run the first test without ReShade at all (rename `dxgi.dll` temporarily), then with ReShade and without `AutoHDR.addon64`, then with it; see [HDR and ReShade](#hdr-and-reshade-autohdr).
    - ENB is off on your install (`d3d11.dll` is absent), which is required. GPU1 mode doesn't support ENB yet.
 4. Launch through F4SE. Borderless/windowed (the plugin only engages for windowed swap chains, as upstream). The monitor must be connected to the 9060 XT; the plugin logs which GPU it renders on and which one presents.
 
 ## What to look for
 
-The log is usually `Documents\My Games\Fallout4\F4SE\AAAFrameGeneration.log`. All new lines start with `[FG-GPU1]`:
+The log is usually `Documents\My Games\Fallout4\F4SE\MGPUScaling.log` (frame generation and the upscaler write to the same file; the upscaler's lines start with `[UPSCALE]`, `[RES]`, `[HOOK]` and so on). All second-GPU lines start with `[FG-GPU1]`:
 
 ```
 [FG-GPU1] game window monitor 0x10001 "\\.\DISPLAY1"
@@ -203,7 +219,7 @@ If anything fails during setup, the plugin logs why and falls back to running FG
 
 ## FSR SDK 2.4 (`iFSRRuntime`)
 
-The package ships two FSR runtimes in `Data\F4SE\Plugins\FrameGeneration\FidelityFX\`:
+The package ships two FSR runtimes in `Data\F4SE\Plugins\MGPUScaling\FidelityFX\`:
 
 | `iFSRRuntime` | DLLs | what you get |
 |---|---|---|
@@ -244,7 +260,7 @@ session on 1.1.4. The 2.4 loader looks for `amd_fidelityfx_framegeneration_dx12.
 example) wins; the log warns when that happens.
 
 ```
-[FSR] runtime: FSR SDK 2.4 (Data\F4SE\Plugins\FrameGeneration\FidelityFX\amd_fidelityfx_loader_dx12.dll)
+[FSR] runtime: FSR SDK 2.4 (Data\F4SE\Plugins\MGPUScaling\FidelityFX\amd_fidelityfx_loader_dx12.dll)
 [FSR] swap chain providers offered: 4.0.0, 3.1.7
 [FSR] swap chain provider: 4.0.0 (driver-assisted frame pacing capable)
 [FSR] frame generation providers offered: 3.1.6
@@ -262,8 +278,8 @@ GPU1 mode on its own renders the game at whatever resolution the game asks for, 
 doubles the presented frames on the 9060. It does **not** upscale. If the game renders 4K natively,
 the 3090's frame rate is the ceiling: 38 game fps becomes ~75 presented fps, not 100+. To raise the
 base frame rate, let the 3090 render fewer pixels: either FSR 4.1 on the 9060 (next section), or
-FO4Upscaling's DLSS/FSR 3.1 on the 3090 (`iUpscaleMethodPreference = 2` or `1` in the
-`Upscaling.dll` shipped here); FSR3 FG then interpolates the upscaled output.
+the upscaler's DLSS/FSR 3.1 on the 3090 (`[Upscaling] iUpscaleMethodPreference = 2` or `1`);
+FSR3 FG then interpolates the upscaled output.
 
 ## FSR 4.1 upscaling on the second GPU
 
@@ -273,20 +289,20 @@ for 4K) and the 9060 upscales it to 4K before frame generation. The 3090 keeps d
 so text stays sharp. This frees most of the 3090's 4K render time for heavier graphics settings
 and mods. The RTX 3090 itself is not offered FSR 4.
 
-Switch it on in **`Upscaling.dll`**'s settings (MCM → Upscaling → Upscale Method Preference →
-"AMD FSR 4.1 (second GPU)", or `iUpscaleMethodPreference = 3` in
-`Data\MCM\Settings\Upscaling.ini`) and restart. The package ships the matching `Upscaling.dll`
-(FO4Upscaling at the same commit, plus this mode); it replaces any other `Upscaling.dll` (doodlum's,
-for example), which cannot do this. Needs `iFSRRuntime = 1` and `bAsyncUnpack = 1`. `iQualityMode`
-picks the render resolution (1 Quality 1.5×, 2 Balanced 1.7×, 3 Performance 2×, 0 Native AA).
-Changing the method or the quality mode needs a restart: the transport and the FSR 4.1 context are
-sized for it at startup.
+Switch it on in the upscaler's settings (MCM → MGPU Scaling → Upscaling → Upscale Method
+Preference → "AMD FSR 4.1 (second GPU)", or `iUpscaleMethodPreference = 3` in the `[Upscaling]`
+section of `Data\MCM\Settings\MGPUScaling.ini`) and restart. It is the shipped default. The
+upscaler is part of the same DLL (FO4Upscaling's `Upscaling` at the same commit, plus this mode); no
+other `Upscaling.dll` may be installed (doodlum's cannot do this, and two would hook the same calls).
+Needs `iFSRRuntime = 1` and `bAsyncUnpack = 1`. `iQualityMode` picks the render resolution
+(1 Quality 1.5×, 2 Balanced 1.7×, 3 Performance 2×, 0 Native AA). Changing the method or the
+quality mode needs a restart: the transport and the FSR 4.1 context are sized for it at startup.
 
 How a frame goes:
 
 | step | GPU | what |
 |---|---|---|
-| scene | 3090 | `Upscaling.dll` renders at e.g. 2560×1440 into the corner of the 4K targets, with a sub-pixel jitter each frame and **TAA off** (FSR 4.1 is the anti-aliasing) |
+| scene | 3090 | the upscaler renders at e.g. 2560×1440 into the corner of the 4K targets, with a sub-pixel jitter each frame and **TAA off** (FSR 4.1 is the anti-aliasing) |
 | world hook | 3090 → 9060 | render-resolution depth and motion vectors cross PCIe |
 | end of imagespace | 3090 → 9060 | the render-resolution scene (UI-free) crosses; the 3090 fills its 4K frame buffer from it with a plain bilinear stretch, so the UI is drawn over a background |
 | as soon as those land | 9060 | **FSR 4.1** 1440p → 4K on the direct queue, while the 3090 still draws the UI |
@@ -298,9 +314,10 @@ frame ≈ **77 MB/frame** (126.6 MB at native 4K). `iHalfResDepthMV` and `bSendH
 are ignored in this mode. AMD lists FSR 4.1 at ~3.4 ms on a 9060 XT at 4K; a probe on this PC
 measured 3.3 ms.
 
-Menus `Upscaling.dll` renders natively (Pip-Boy, containers, loading) are shown as rendered, without
-frame generation. If anything is missing (the other `Upscaling.dll`, SDK 1.1.4, no FSR 4 provider,
-an HDR back buffer), the log says why and the game renders at full resolution as before.
+Menus the upscaler renders natively (Pip-Boy, containers, loading) are shown as rendered, without
+frame generation. If anything is missing (another `Upscaling.dll` installed, SDK 1.1.4, no FSR 4
+provider), the log says why and the game renders at full resolution as before. An HDR back buffer
+no longer turns it off; see the next section.
 
 ```
 [FSR4] upscaler providers offered for the display GPU: 4.1.2, 3.1.6, 2.3.4
@@ -310,8 +327,43 @@ an HDR back buffer), the log says why and the game renders at full resolution as
 [FSR4] 2560x1440 -> 3840x2160: 710 frames upscaled, 0 at full resolution, 1 history resets | FSR 4.1.2 on the display GPU avg 3.30 ms max 3.80 ms | UI composite + copy avg 0.25 ms max 0.40 ms
 ```
 
-(Expected lines, not a capture.) `Upscaling.log` shows the other side:
+(Expected lines, not a capture.) The upscaler's side, in the same log:
 `[UPSCALE] FSR 4.1 on the second GPU is ready: rendering at the quality mode's resolution`.
+
+## HDR and ReShade (AutoHDR)
+
+ReShade attaches to the only real swap chain in the process: the one FFX creates on the 9060. Its
+effects therefore already run **after** FSR 4.1, after the UI composite and after frame generation,
+on real and generated frames alike (twice per game frame, so effects cost double).
+
+ReShade's AutoHDR add-on changes that swap chain to `R10G10B10A2_UNORM` (HDR10) or
+`R16G16B16A16_FLOAT` (scRGB, `UseHDR10=0`) while FFX creates it. Before this version the plugin
+kept writing 8-bit frames into it with plain copies, which do not convert: colour garbage,
+freezes, and possibly the crash after loading a save. Now:
+
+- the plugin reads the format the swap chain's back buffers really have after creation and logs it
+  (`[FSR] the swap chain was created as format 28 but is format 24 ...`). It reads the buffers, not
+  `GetDesc1`: ReShade reports the format the game asked for there when an add-on changed it (the
+  first MGPU Scaling build trusted `GetDesc1`, missed the change and showed a black screen);
+- frame generation is created for that format, told that its UI-free frame stays RGBA8, and left
+  in SDR mode (the content is SDR in a 10/16-bit container; HDR is applied afterwards by
+  `AdvancedAutoHDR.fx`/`AutoHDR.fx` in ReShade);
+- the UI composite writes the swap chain's format, and native frames (menus, loading) and every
+  frame without FSR 4.1 go through a small conversion pass on the 9060
+  (`[FG-GPU1] the swap chain is R10G10B10A2_UNORM (HDR10) ... every frame is converted`);
+- the game-side lanes stay RGBA8, so nothing changes on the 3090 or across PCIe.
+
+Limits: this needs `iFSRRuntime = 1` (the 1.1.4 runtime cannot be told the UI-free frame's format)
+and the second-GPU mode (single-GPU frame generation still cannot convert). **Change HDR settings
+only with the game closed**: toggling HDR in the AutoHDR overlay resizes the swap chain behind FFX
+and this plugin, which cannot see it (ReShade hides the format change), so expect a wrong picture
+until a restart. ReShade
+effects that sample the back buffer as sRGB warn that a 10-bit buffer has no sRGB view (CAS, MagicHDR
+in this install); the HDR-aware ones (`AdvancedAutoHDR`, `lilium_*`) are unaffected. Use scRGB if
+the others look wrong in HDR10.
+
+The game-side `GetDesc` of the swap chain now reports the game's own RGBA8 format, matching the
+texture `GetBuffer` returns, instead of the real (10-bit) one; D3D11 overlays create matching views.
 
 ## Performance budget
 
@@ -347,9 +399,9 @@ path. That is why `bAsyncUnpack` streams the buffers lane by lane: the 9060's re
 
 - **Cross-adapter heap 3090 → 9060 XT.** MGPU Bridge proved AMD → NVIDIA. This direction should work the same way, and if it fails the code tries the reverse automatically. If both fail, the log shows the HRESULT and frame generation stays on the 3090.
 - **A failure after startup is not recovered.** Once the bridge is up, the first failed HRESULT — including the 2 s timeout waiting for the previous frame's copy if the secondary GPU's queue stalls — disables the transport for the rest of the session. `secondaryGPU` stays selected, so the game keeps running but no new frame reaches the screen (`CRITICAL [FG-GPU1] transport is down`). Restart the game; there is no automatic single-GPU fallback after this point.
-- **Format mismatch freezes the picture instead of falling back.** If the swap chain format changes under the plugin (HDR/AutoHDR), the finished-frame copy is skipped and FSR3 presents stale data. That is why the first test should run without ReShade/AutoHDR.
-- **Doodlum's `Upscaling.dll` together with FO4Upscaling's FG plugin.** They hook some of the same render functions. If the image or motion is wrong, try FO4Upscaling's own `Upscaling.dll` (same source tree) as a matched pair.
-- **FO4 Community Shaders** says doodlum's `Upscaling.dll` below 1.2 is incompatible and disables all of CS while it's present. That's independent of this mod, but worth knowing.
+- **HDR add-ons are followed at startup only.** A swap-chain format set while FFX creates it is handled (previous section); one changed later (HDR toggled in game) is not seen and needs a restart. The finished-frame copy refuses formats it cannot copy into (it used to compare only size and row pitch, which 8-bit and 10-bit share), so if the conversion is not set up for some reason the screen stays black and the log has `lane 'final frame' is ... format 28 but its destination is ... format 24; skipping the copy`.
+- **Other upscaling / frame generation plugins.** `AAAFrameGeneration.dll` (FO4Upscaling, old FG-GPU1) keeps MGPU Scaling off for the session (message box); another `Upscaling.dll` (doodlum's, FO4Upscaling's) turns MGPU Scaling's upscaler off. Remove them. The upscaler's hooks are installed at F4SE's PostLoad, i.e. after every plugin's own load, where `Upscaling.dll` used to install them; plugins that sort after "Upscaling" and hook the same render calls would now be nested inside it.
+- **FO4 Community Shaders**: its current source disables all of CS when an `Upscaling.dll` below plugin version 1.2 is installed (it takes it for doodlum's); the old FG-GPU1 `Upscaling.dll` was version 1.0 (the CS build installed here, `bcad629`, predates that check). MGPU Scaling ships no `Upscaling.dll`. Keep CS's own Upscaling and FrameGeneration features off: they would create a second swap chain and a second ReShade runtime on the 3090. CS's **frame annotations** (`[diagnostics] frame_annotations`) hook `DrawWorld::Forward` and `DrawWorld::Imagespace` before this plugin does; FO4Upscaling's detour library cannot sit on top of another plugin's hook (it copies the hook's jump unrelocated), which crashed the game on the first world frame. MGPU Scaling now chains behind such a hook instead and logs `[HOOK] ... was already hooked by another plugin ...; chained behind it`.
 - **PCIe budget at 4K.** Start at 2560×1440 if the copy time is too high. The log prints the exact payload per lane; colour, HUD-less colour and depth are 4 B/px, but if the game's motion-vector target is RGBA16F (8 B/px) the total is ~166 MB/frame at 4K rather than the 133 MB quoted above. Trimming the depth/motion copies to the render resolution is the next optimisation (not done yet).
 - **DLSS-G / XeSS runtime DLLs are not in this package.** GPU1 mode forces FSR3 and never loads Streamline or XeSS, so this is fine. Switching `bFrameGenOnSecondaryGPU = 0` and `iFrameGenType = 1/2` would need those DLLs from the upstream package.
 - **Frame cap.** `bFrameLimitMode = 1` caps the base frame rate to about half the refresh rate (≈72 fps at 144 Hz) when VSync is off. That's upstream behaviour.

@@ -1,6 +1,6 @@
 <#
-  Builds AAAFrameGeneration.dll (FG-GPU1) and the matching Upscaling.dll locally with the
-  Visual Studio already installed.
+  Builds MGPU Scaling (AAAMGPUScaling.dll: FG-GPU1 frame generation and upscaling in one F4SE
+  plugin) locally with the Visual Studio already installed.
 
   Usage (either shell works; when started from Windows PowerShell 5.1 the script re-runs
   itself under PowerShell 7 if pwsh is installed):
@@ -10,7 +10,7 @@
   First run: ~20-40 min (vcpkg builds boost/directxtk/... once). Later runs: a few minutes.
 
   Work happens in -WorkDir (short path on purpose: vcpkg breaks on long paths).
-  Result: <WorkDir>\package\Data\...  - zip it or point Vortex/MO2 at it.
+  Result: <WorkDir>\package\Data\... and the same as <WorkDir>\MGPU-Scaling.zip for Vortex/MO2.
 #>
 param(
     [string]$WorkDir = "D:\fgb",
@@ -101,6 +101,10 @@ $src = "$WorkDir\FO4Upscaling"
 Fetch-Pinned "https://github.com/northaxosky/FO4Upscaling.git" $src $UpstreamSha -Recursive
 
 Step "Applying the GPU1 overlay"
+# Back to the pinned commit first, so files the overlay no longer carries (it moved or dropped
+# some) do not linger from earlier builds. Only the source folders; build\ and extern\ stay.
+Run git @("-C", $src, "checkout", "-q", "--", ".")
+Run git @("-C", $src, "clean", "-fdq", "--", "plugins", "package", "include", "cmake")
 Copy-Item -Recurse -Force "$Here\overlay\*" $src
 & git -C $src status --short
 
@@ -116,34 +120,29 @@ Copy-Item -Force "$src\cmake\CommonLibF4.cmake.txt" "$src\extern\CommonLibF4\CMa
 Push-Location $src
 try {
     Run cmake @("-S", ".", "--preset=default", "-G", $generator)
-    Step "Build AAAFrameGeneration (Release)"
-    Run cmake @("--build", "build", "--config", "Release", "--target", "AAAFrameGeneration")
-    # The matching Upscaling.dll: render scale, jitter and no TAA for FSR 4.1 on the second GPU
-    # (iUpscaleMethodPreference = 3). Same pinned tree, with the overlay's changes.
-    Step "Build Upscaling (Release)"
-    Run cmake @("--build", "build", "--config", "Release", "--target", "Upscaling")
+    # One target: the frame-generation sources (plugins\FrameGeneration\src) and the upscaler
+    # (plugins\MGPUScaling\src\upscaler) in one DLL, AAAMGPUScaling.dll.
+    Step "Build MGPUScaling (Release)"
+    Run cmake @("--build", "build", "--config", "Release", "--target", "MGPUScaling")
 } finally { Pop-Location }
 
 # ---------------------------------------------------------------- package
+# Everything in its own places (Data\F4SE\Plugins\MGPUScaling, MCM\Config\MGPUScaling), so the
+# package shares no file with doodlum's Upscaling or FO4Upscaling's frame generation mod.
 Step "Package"
 $pkg = "$WorkDir\package"
 if (Test-Path $pkg) { Remove-Item -Recurse -Force $pkg }
 $plugins = "$pkg\Data\F4SE\Plugins"
-New-Item -ItemType Directory -Force "$plugins\FrameGeneration\FidelityFX", "$pkg\Data\MCM\Config\FrameGeneration",
-    "$plugins\Upscaling", "$pkg\Data\MCM\Config\Upscaling" | Out-Null
-$bin = "$src\build\plugins\FrameGeneration\Release"
-Copy-Item "$bin\AAAFrameGeneration.dll" $plugins
-if (Test-Path "$bin\AAAFrameGeneration.pdb") { Copy-Item "$bin\AAAFrameGeneration.pdb" $plugins }
-Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\*.hlsl" "$plugins\FrameGeneration"
-Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\FidelityFX\LICENSE.txt" "$plugins\FrameGeneration\FidelityFX"
-Copy-Item -Recurse "$src\package\MCM\Config\FrameGeneration\*" "$pkg\Data\MCM\Config\FrameGeneration"
-# Upscaling.dll (FG-GPU1 build) with its shaders and MCM page. No Streamline runtime: its DLSS
-# method falls back to FSR 3.1 without it, and the FSR 4.1 method does not use it.
-$upBin = "$src\build\plugins\Upscaling\Release"
-Copy-Item "$upBin\Upscaling.dll" $plugins
-if (Test-Path "$upBin\Upscaling.pdb") { Copy-Item "$upBin\Upscaling.pdb" $plugins }
-Copy-Item "$src\package\F4SE\Plugins\Upscaling\*.hlsl" "$plugins\Upscaling"
-Copy-Item -Recurse "$src\package\MCM\Config\Upscaling\*" "$pkg\Data\MCM\Config\Upscaling"
+$data = "$plugins\MGPUScaling"
+New-Item -ItemType Directory -Force "$data\Shaders", "$data\FidelityFX", "$pkg\Data\MCM\Config\MGPUScaling" | Out-Null
+$bin = "$src\build\plugins\MGPUScaling\Release"
+Copy-Item "$bin\AAAMGPUScaling.dll" $plugins
+if (Test-Path "$bin\AAAMGPUScaling.pdb") { Copy-Item "$bin\AAAMGPUScaling.pdb" $plugins }
+# Frame generation's and the upscaler's shaders (no file name is used twice). No Streamline
+# runtime: the upscaler's DLSS method falls back to FSR 3.1 without it; FSR 4.1 does not use it.
+Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\*.hlsl", "$src\package\F4SE\Plugins\Upscaling\*.hlsl" "$data\Shaders"
+Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\FidelityFX\LICENSE.txt" "$data\FidelityFX"
+Copy-Item -Recurse "$src\package\MCM\Config\MGPUScaling\*" "$pkg\Data\MCM\Config\MGPUScaling"
 
 # FidelityFX runtime (same version/hash as upstream scripts/sdk-manifest.sh)
 $ffxZip = "$WorkDir\FidelityFX-SDK-v1.1.4.zip"
@@ -157,7 +156,7 @@ $zip = [System.IO.Compression.ZipFile]::OpenRead($ffxZip)
 try {
     $entry = $zip.Entries | Where-Object { $_.FullName -like "*PrebuiltSignedDLL/amd_fidelityfx_dx12.dll" } | Select-Object -First 1
     if (-not $entry) { throw "amd_fidelityfx_dx12.dll not in the FidelityFX zip" }
-    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, "$plugins\FrameGeneration\FidelityFX\amd_fidelityfx_dx12.dll", $true)
+    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, "$data\FidelityFX\amd_fidelityfx_dx12.dll", $true)
 } finally { $zip.Dispose() }
 
 # FSR SDK 2.4 runtime (iFSRRuntime = 1): the loader, the frame-generation effect DLL and the
@@ -179,11 +178,19 @@ foreach ($name in $fsr2Dlls.Keys) {
         Invoke-WebRequest "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/$fsr2Commit/Kits/FidelityFX/signedbin/$name" -OutFile $cached
     }
     if ((Get-FileHash $cached -Algorithm SHA256).Hash.ToLower() -ne $fsr2Dlls[$name]) { Remove-Item $cached; throw "$name hash mismatch" }
-    Copy-Item $cached "$plugins\FrameGeneration\FidelityFX\$name"
+    Copy-Item $cached "$data\FidelityFX\$name"
 }
-Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\FidelityFX\LICENSE-FSR-SDK-2.4.txt" "$plugins\FrameGeneration\FidelityFX"
-Copy-Item "$Here\README.md" "$pkg\FG-GPU1-README.md"
+Copy-Item "$src\package\F4SE\Plugins\FrameGeneration\FidelityFX\LICENSE-FSR-SDK-2.4.txt" "$data\FidelityFX"
+Copy-Item "$Here\README.md" "$pkg\MGPU-Scaling-README.md"
+foreach ($licence in "COPYING", "LICENSE", "EXCEPTIONS.md") {
+    if (Test-Path "$src\$licence") { Copy-Item "$src\$licence" $pkg }
+}
+
+$zip = "$WorkDir\MGPU-Scaling.zip"
+if (Test-Path $zip) { Remove-Item -Force $zip }
+Compress-Archive -Path "$pkg\*" -DestinationPath $zip
 
 Step "Done"
 Get-ChildItem -Recurse -File $pkg | ForEach-Object { $_.FullName.Substring($pkg.Length + 1) }
-Write-Host "`nInstall: zip '$pkg' and add it in Vortex, or copy its Data folder into the game folder." -ForegroundColor Green
+Write-Host "`nInstall: add '$zip' in Vortex (or copy '$pkg\Data' into the game folder)." -ForegroundColor Green
+Write-Host "Disable the FG-GPU1, FO4Upscaling and doodlum's Upscaling mods: MGPU Scaling replaces all three." -ForegroundColor Green

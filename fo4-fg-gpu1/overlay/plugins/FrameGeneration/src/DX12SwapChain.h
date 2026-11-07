@@ -74,7 +74,13 @@ public:
 
 	IDXGISwapChain4* swapChain;
 
+	// The swap chain as the game asked for it: its format is the one the game renders (RGBA8) and
+	// the D3D11 side (interop textures, lanes) uses.
 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
+	// The format the back buffers really have (read from the buffers: ReShade's GetDesc1 reports the
+	// requested one). An HDR add-on (ReShade's AutoHDR) can make it R10G10B10A2 or
+	// R16G16B16A16_FLOAT; everything that writes the back buffer follows it.
+	DXGI_FORMAT displayFormat = DXGI_FORMAT_UNKNOWN;
 
 	Texture2D* swapChainBufferProxy;
 	WrappedResource* swapChainBufferProxyENB;

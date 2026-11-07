@@ -1,3 +1,88 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ace7889..5eef4d5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,6 +25,11 @@ find_package(directx-headers CONFIG REQUIRED)
+ find_package(magic_enum CONFIG REQUIRED)
+ 
+ # Plugin targets
+-add_subdirectory(plugins/FrameGeneration)
++# MGPU Scaling (FG-GPU1): plugins/MGPUScaling builds AAAMGPUScaling.dll from the frame-generation
++# sources in plugins/FrameGeneration/src and the upscaler in plugins/MGPUScaling/src/upscaler. The
++# separate AAAFrameGeneration target is not configured: its sources need MGPUScaling.h now.
++# plugins/Upscaling stays: it defines the FidelityFX SDK 1.x targets the upscaler links (its own
++# Upscaling target still builds from the unmodified upstream sources, but is not packaged).
+ add_subdirectory(plugins/Upscaling)
+ add_subdirectory(plugins/MotionVectorFixes)
++add_subdirectory(plugins/MGPUScaling)
+diff --git a/include/PCH.h b/include/PCH.h
+index 149af74..a90fe1e 100644
+--- a/include/PCH.h
++++ b/include/PCH.h
+@@ -15,7 +15,9 @@
+ #undef DEBUG
+ #undef ERROR
+ 
++#include <cstdint>
+ #include <string>
++#include <typeinfo>
+ using namespace std::literals;
+ 
+ #include "detours/detours.h"
+@@ -63,16 +65,51 @@ namespace stl
+ 		T::func = vtbl.write_vfunc(idx, T::thunk);
+ 	}
+ 
++	namespace detail
++	{
++		// MGPU Scaling: where a function's entry jumps when another plugin hooked it first, or 0.
++		// Microsoft Detours (Community Shaders' frame annotations) and CommonLib's 5-byte branches
++		// write "jmp rel32"; 6-byte branches write "jmp [rip+disp32]".
++		inline std::uintptr_t HookedEntryTarget(std::uintptr_t a_entry) noexcept
++		{
++			const auto* code = reinterpret_cast<const std::uint8_t*>(a_entry);
++			if (code[0] == 0xE9)
++				return a_entry + 5 + static_cast<std::intptr_t>(*reinterpret_cast<const std::int32_t*>(code + 1));
++			if (code[0] == 0xFF && code[1] == 0x25) {
++				const auto slot = a_entry + 6 + static_cast<std::intptr_t>(*reinterpret_cast<const std::int32_t*>(code + 2));
++				return *reinterpret_cast<const std::uintptr_t*>(slot);
++			}
++			return 0;
++		}
++
++		// Nukem's DetourFunction copies the entry's first instructions into its trampoline without
++		// fixing relative ones. On a function another plugin hooked first, that copied jump lands on
++		// garbage and the game crashes on the first call (Community Shaders with frame annotations:
++		// DrawWorld::Forward and DrawWorld::Imagespace, on the first world frame). Chain behind the
++		// other hook instead: the entry jumps here, and the original is where its jump went, which
++		// runs the other hook and then the game's function. Returns the original.
++		inline std::uintptr_t DetourOrChain(std::uintptr_t a_target, std::uintptr_t a_thunk, const char* a_name)
++		{
++			if (const auto previous = HookedEntryTarget(a_target)) {
++				REL::GetTrampoline().write_jmp<5>(a_target, a_thunk);
++				REX::INFO("[HOOK] {} at {:#x} was already hooked by another plugin (jump to {:#x}); chained behind it",
++					a_name, a_target, previous);
++				return previous;
++			}
++			return Detours::X64::DetourFunction(a_target, a_thunk);
++		}
++	}
++
+ 	template <class T>
+ 	void detour_thunk(REL::ID a_relId)
+ 	{
+-		*(uintptr_t*)&T::func = Detours::X64::DetourFunction(a_relId.address(), (uintptr_t)&T::thunk);
++		*(uintptr_t*)&T::func = detail::DetourOrChain(a_relId.address(), (uintptr_t)&T::thunk, typeid(T).name());
+ 	}
+ 
+ 	template <class T>
+ 	void detour_thunk_ignore_func(REL::ID a_relId)
+ 	{
+-		std::ignore = Detours::X64::DetourFunction(a_relId.address(), (uintptr_t)&T::thunk);
++		std::ignore = detail::DetourOrChain(a_relId.address(), (uintptr_t)&T::thunk, typeid(T).name());
+ 	}
+ 
+ 	template <std::size_t idx, class T>
 diff --git a/package/F4SE/Plugins/FrameGeneration/DepthFromHalfResCS.hlsl b/package/F4SE/Plugins/FrameGeneration/DepthFromHalfResCS.hlsl
 new file mode 100644
 index 0000000..281acb9
@@ -135,10 +220,10 @@ index 0000000..9533257
 +}
 diff --git a/package/F4SE/Plugins/FrameGeneration/SecondaryUpscaleCS.hlsl b/package/F4SE/Plugins/FrameGeneration/SecondaryUpscaleCS.hlsl
 new file mode 100644
-index 0000000..45fa33c
+index 0000000..f51b7b6
 --- /dev/null
 +++ b/package/F4SE/Plugins/FrameGeneration/SecondaryUpscaleCS.hlsl
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,87 @@
 +// FG-GPU1: FSR 4.1 upscaling on the second GPU.
 +//
 +// The render GPU draws the scene at render resolution into the top-left corner of the full-size
@@ -153,8 +238,12 @@ index 0000000..45fa33c
 +//              with alpha the smallest UI coverage that explains final - background. Where there is
 +//              no UI, final == background and out == upscaled; under opaque UI, out == final.
 +//
-+// Compiled with RENDER_WIDTH, RENDER_HEIGHT, DISPLAY_WIDTH, DISPLAY_HEIGHT defined. Both entry
-+// points use the same registers; Blit only reads t0 and writes u0.
++//   Copy       (display GPU, D3D12) the finished frame unchanged into the composite, for a swap chain
++//              in another format than the game's RGBA8 (an HDR add-on promoted it): copies cannot
++//              convert, a shader store can. Native frames, and every frame without upscaling.
++//
++// Compiled with RENDER_WIDTH, RENDER_HEIGHT, DISPLAY_WIDTH, DISPLAY_HEIGHT defined. All entry
++// points use the same registers; Blit only reads t0, Copy only t1, and both write u0.
 +
 +static const uint2 RenderSize = uint2(RENDER_WIDTH, RENDER_HEIGHT);
 +static const uint2 DisplaySize = uint2(DISPLAY_WIDTH, DISPLAY_HEIGHT);
@@ -215,16 +304,44 @@ index 0000000..45fa33c
 +
 +	Output[a_id.xy] = float4(saturate(final + (upscaled - background) * (1.0 - alpha)), 1.0);
 +}
-diff --git a/package/MCM/Config/FrameGeneration/config.json b/package/MCM/Config/FrameGeneration/config.json
-index 554ba18..b218cca 100644
---- a/package/MCM/Config/FrameGeneration/config.json
-+++ b/package/MCM/Config/FrameGeneration/config.json
-@@ -22,7 +22,15 @@
- 			"type": "text"
- 		},
- 		{
--			"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU.",
-+			"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU. 'Second GPU' mode always uses FSR3.",
++
++[numthreads(8, 8, 1)] void Copy(uint3 a_id : SV_DispatchThreadID)
++{
++	if (any(a_id.xy >= DisplaySize))
++		return;
++	Output[a_id.xy] = float4(Final.Load(int3(a_id.xy, 0)).rgb, 1.0);
++}
+diff --git a/package/MCM/Config/MGPUScaling/config.json b/package/MCM/Config/MGPUScaling/config.json
+new file mode 100644
+index 0000000..e1d7967
+--- /dev/null
++++ b/package/MCM/Config/MGPUScaling/config.json
+@@ -0,0 +1,397 @@
++{
++	"modName": "MGPUScaling",
++	"displayName": "MGPU Scaling",
++	"minMcmVersion": 2,
++	"pluginRequirements": [],
++	"content": [
++		{
++			"text": "<font size='30'><p align='center'>MGPU SCALING</p></font>",
++			"html": true,
++			"type": "text"
++		},
++		{
++			"text": "ABOUT",
++			"type": "section"
++		},
++		{
++			"text": "Upscaling and frame generation for Fallout 4, with the option to run frame generation and FSR 4.1 upscaling on a second GPU (the one the monitor is plugged into) while the game renders on the first.",
++			"type": "text"
++		},
++		{
++			"text": "",
++			"type": "text"
++		},
++		{
++			"text": "Frame Generation: on/off, FSR runtime and providers. Second GPU: the two-GPU transport. Upscaling: the method and the render resolution.",
 +			"type": "text"
 +		},
 +		{
@@ -233,111 +350,6 @@ index 554ba18..b218cca 100644
 +		},
 +		{
 +			"text": "Settings marked (restart) take effect after restarting the game. All others apply within about a second.",
- 			"type": "text"
- 		},
- 		{
-@@ -46,7 +54,7 @@
- 			"id": "bFrameLimitMode:Settings",
- 			"text": "Frame Rate Limiter",
- 			"type": "switcher",
--			"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Takes effect immediately. (Default: On)",
-+			"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Not used when HighFPSPhysicsFix is installed; its own limiter applies instead. Takes effect immediately. (Default: On)",
- 			"valueOptions": {
- 				"sourceType": "ModSettingBool"
- 			}
-@@ -55,16 +63,16 @@
- 			"id": "bDisableInMenus:Settings",
- 			"text": "Disable in Menus",
- 			"type": "switcher",
--			"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. (Default: On)",
-+			"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. Takes effect immediately. (Default: On)",
- 			"valueOptions": {
- 				"sourceType": "ModSettingBool"
- 			}
- 		},
- 		{
- 			"id": "iFrameGenType:Settings",
--			"text": "Backend",
-+			"text": "Backend (restart)",
- 			"type": "stepper",
--			"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Changing this requires a game restart. (Default: DLSS-G)",
-+			"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Ignored in 'Second GPU' mode, which always uses FSR3. Requires a game restart. (Default: AMD FSR3)",
- 			"valueOptions": {
- 				"sourceType": "ModSettingInt",
- 				"options": [
-@@ -76,9 +84,9 @@
- 		},
- 		{
- 			"id": "iFrameGenFrames:Settings",
--			"text": "Frame Multiplier (DLSS-G)",
-+			"text": "Frame Multiplier, DLSS-G (restart)",
- 			"type": "stepper",
--			"help": "How many frames to generate per rendered frame. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires restart. (Default: 2x)",
-+			"help": "How many frames to generate per rendered frame. DLSS-G only; FSR3 always generates one. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires a game restart. (Default: 2x)",
- 			"valueOptions": {
- 				"sourceType": "ModSettingInt",
- 				"options": [
-@@ -92,15 +100,150 @@
- 			"text": "",
- 			"type": "text"
- 		},
-+		{
-+			"text": "FSR RUNTIME",
-+			"type": "section"
-+		},
-+		{
-+			"id": "iFSRRuntime:Settings",
-+			"text": "FSR Runtime (restart)",
-+			"type": "stepper",
-+			"help": "FSR SDK 2.4 uses the newest FSR frame generation your driver and Windows offer: the 4.0.0 swap chain (driver-assisted frame pacing on RX 9000 with Adrenalin 26.10.1+, VSync off, fullscreen/borderless, inside the VRR range) and FSR 4 ML frame generation where available (Windows 11 + RX 9000), otherwise FSR 3.1.6. The log lists what was offered and used. SDK 1.1.4 is the FSR 3.1.4 runtime this mod was tested with. Requires a game restart. (Default: FSR SDK 2.4)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingInt",
-+				"options": [
-+					"FidelityFX SDK 1.1.4 (FSR 3.1.4)",
-+					"FSR SDK 2.4 (newest offered)"
-+				]
-+			}
-+		},
-+		{
-+			"id": "iFSRSwapChainProvider:Settings",
-+			"text": "FSR 2.4 Swap Chain (restart)",
-+			"type": "stepper",
-+			"help": "FSR SDK 2.4 only. Newest: the newest swap chain offered (4.0.0 on RX 9000, with driver-assisted frame pacing). 3.x: the newest 3.x swap chain (3.1.7), which paces frames itself - for comparing pacing. Requires a game restart. (Default: Newest)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingInt",
-+				"options": [
-+					"Newest offered",
-+					"3.x only"
-+				]
-+			}
-+		},
-+		{
-+			"id": "iFSRFrameGenProvider:Settings",
-+			"text": "FSR 2.4 Frame Generation (restart)",
-+			"type": "stepper",
-+			"help": "FSR SDK 2.4 only. Newest: FSR 4 ML frame generation where offered (Windows 11 + RX 9000), otherwise the newest FSR 3 interpolator (3.1.6). 3.x: always the FSR 3 interpolator - for comparing image quality and cost. Requires a game restart. (Default: Newest)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingInt",
-+				"options": [
-+					"Newest offered",
-+					"3.x only"
-+				]
-+			}
-+		},
-+		{
-+			"text": "",
-+			"type": "text"
-+		},
-+		{
-+			"text": "SECOND GPU (FG-GPU1)",
-+			"type": "section"
-+		},
-+		{
-+			"text": "The game renders on one GPU; FSR3 frame generation and presentation run on the GPU the monitor is plugged into. Every frame's colour, UI-free colour, depth and motion vectors are copied across PCIe.",
-+			"type": "text"
-+		},
-+		{
-+			"text": "FSR 4.1 upscaling on that GPU too: set Upscaling > Upscale Method Preference to AMD FSR 4.1 (second GPU) and restart. The game then renders at the quality mode's resolution and the second GPU upscales it before frame generation. Needs FSR Runtime = FSR SDK 2.4 and the Upscaling.dll from this package.",
 +			"type": "text"
 +		},
 +		{
@@ -345,114 +357,396 @@ index 554ba18..b218cca 100644
 +			"type": "text"
 +		},
 +		{
-+			"id": "bFrameGenOnSecondaryGPU:Settings",
-+			"text": "Frame Generation on Second GPU (restart)",
-+			"type": "switcher",
-+			"help": "Run FSR3 frame generation and present on the GPU that drives the monitor, while the game keeps rendering on its own GPU. Not supported with ENB yet. Requires a game restart. (Default: On in this package)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingBool"
-+			}
-+		},
-+		{
-+			"id": "sSecondaryGPUName:Settings",
-+			"text": "Second GPU Name (restart)",
-+			"type": "textinput",
-+			"help": "Optional: part of the second GPU's name, e.g. 9060. Leave empty to pick the GPU that drives the monitor the game window is on. Only needed if the log says the choice is ambiguous. Requires a game restart. (Default: empty)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingString"
-+			}
-+		},
-+		{
-+			"id": "bSendHudlessFrame:Settings",
-+			"text": "Send UI-free Frame (restart)",
-+			"type": "switcher",
-+			"help": "Send an extra, UI-free copy of every frame. On: generated frames keep a clean HUD. Off: about 25% less PCIe traffic, but the HUD is interpolated with the scene and smears during camera movement. Requires a game restart. (Default: On)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingBool"
-+			}
-+		},
-+		{
-+			"id": "iHalfResDepthMV:Settings",
-+			"text": "Half-resolution Depth / Motion (restart)",
-+			"type": "stepper",
-+			"help": "Send depth (and optionally motion vectors) at half resolution to save PCIe time. Only generated frames use them; real frames stay full resolution. Depth: rebuilt to full resolution on the second GPU, FSR3 keeps every motion vector (about 2 ms saved at 4K). Depth + motion: FSR3 works at half resolution, like behind 'Performance' upscaling (about 4 ms saved). Requires a game restart. (Default: Depth)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingInt",
-+				"options": [
-+					"Off (full resolution)",
-+					"Depth",
-+					"Depth + motion vectors"
-+				]
-+			}
-+		},
-+		{
-+			"id": "bAsyncUnpack:Settings",
-+			"text": "Async Unpack (restart)",
-+			"type": "switcher",
-+			"help": "On: the second GPU reads what arrives on its own copy queue, starting on each buffer as soon as it has crossed PCIe. Off: the original path, which waits for the whole transfer and reads it on the FSR3 queue (for comparison). Requires a game restart. (Default: On)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingBool"
-+			}
-+		},
-+		{
-+			"id": "bEarlyTransfer:Settings",
-+			"text": "Early Transfer",
-+			"type": "switcher",
-+			"help": "On: depth and motion vectors start crossing PCIe right after the world pass and the UI-free frame right after its capture; only the finished frame waits for Present. Off: everything crosses at Present (for comparison). Takes effect immediately. (Default: On)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingBool"
-+			}
-+		},
-+		{
-+			"id": "bEarlyUnpack:Settings",
-+			"text": "Early Unpack",
-+			"type": "switcher",
-+			"help": "On: the second GPU reads depth, motion vectors and the UI-free frame as soon as they arrive, before Present; afterwards only the finished frame is left to read. Off: all reads start at Present (for comparison). Needs Async Unpack and Early Transfer. Takes effect immediately. (Default: On)",
-+			"valueOptions": {
-+				"sourceType": "ModSettingBool"
-+			}
-+		},
-+		{
-+			"text": "",
++			"text": "This replaces AAAFrameGeneration.dll and Upscaling.dll (FO4Upscaling / FG-GPU1 builds, and doodlum's Upscaling): disable those mods.",
 +			"type": "text"
++		}
++	],
++	"pages": [
++		{
++			"pageDisplayName": "Frame Generation",
++			"content": [
++				{
++					"text": "ABOUT",
++					"type": "section"
++				},
++				{
++					"text": "Frame generation inserts interpolated frames between rendered frames, effectively doubling your frame rate.",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU. 'Second GPU' mode always uses FSR3.",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "Settings marked (restart) take effect after restarting the game. All others apply within about a second.",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "SETTINGS",
++					"type": "section"
++				},
++				{
++					"id": "bFrameGenerationMode:FrameGeneration",
++					"text": "Enable Frame Generation",
++					"type": "switcher",
++					"help": "Toggle frame generation on or off. Takes effect immediately. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "bFrameLimitMode:FrameGeneration",
++					"text": "Frame Rate Limiter",
++					"type": "switcher",
++					"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Not used when HighFPSPhysicsFix is installed; its own limiter applies instead. Takes effect immediately. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "bDisableInMenus:FrameGeneration",
++					"text": "Disable in Menus",
++					"type": "switcher",
++					"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. Takes effect immediately. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "iFrameGenType:FrameGeneration",
++					"text": "Backend (restart)",
++					"type": "stepper",
++					"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Ignored in 'Second GPU' mode, which always uses FSR3. Requires a game restart. (Default: AMD FSR3)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"AMD FSR3",
++							"NVIDIA DLSS-G",
++							"Intel XeSS-FG"
++						]
++					}
++				},
++				{
++					"id": "iFrameGenFrames:FrameGeneration",
++					"text": "Frame Multiplier, DLSS-G (restart)",
++					"type": "stepper",
++					"help": "How many frames to generate per rendered frame. DLSS-G only; FSR3 always generates one. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires a game restart. (Default: 2x)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"2x (1 generated)",
++							"3x (2 generated)",
++							"4x (3 generated)"
++						]
++					}
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "FSR RUNTIME",
++					"type": "section"
++				},
++				{
++					"id": "iFSRRuntime:FrameGeneration",
++					"text": "FSR Runtime (restart)",
++					"type": "stepper",
++					"help": "FSR SDK 2.4 uses the newest FSR frame generation your driver and Windows offer: the 4.0.0 swap chain (driver-assisted frame pacing on RX 9000 with Adrenalin 26.10.1+, VSync off, fullscreen/borderless, inside the VRR range) and FSR 4 ML frame generation where available (Windows 11 + RX 9000), otherwise FSR 3.1.6. The log lists what was offered and used. SDK 1.1.4 is the FSR 3.1.4 runtime this mod was tested with. Requires a game restart. (Default: FSR SDK 2.4)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"FidelityFX SDK 1.1.4 (FSR 3.1.4)",
++							"FSR SDK 2.4 (newest offered)"
++						]
++					}
++				},
++				{
++					"id": "iFSRSwapChainProvider:FrameGeneration",
++					"text": "FSR 2.4 Swap Chain (restart)",
++					"type": "stepper",
++					"help": "FSR SDK 2.4 only. Newest: the newest swap chain offered (4.0.0 on RX 9000, with driver-assisted frame pacing). 3.x: the newest 3.x swap chain (3.1.7), which paces frames itself - for comparing pacing. Requires a game restart. (Default: Newest)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"Newest offered",
++							"3.x only"
++						]
++					}
++				},
++				{
++					"id": "iFSRFrameGenProvider:FrameGeneration",
++					"text": "FSR 2.4 Frame Generation (restart)",
++					"type": "stepper",
++					"help": "FSR SDK 2.4 only. Newest: FSR 4 ML frame generation where offered (Windows 11 + RX 9000), otherwise the newest FSR 3 interpolator (3.1.6). 3.x: always the FSR 3 interpolator - for comparing image quality and cost. Requires a game restart. (Default: Newest)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"Newest offered",
++							"3.x only"
++						]
++					}
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "DEBUG",
++					"type": "section"
++				},
++				{
++					"id": "bEnableDebugLogging:FrameGeneration",
++					"text": "Frame Generation Debug (restart)",
++					"type": "switcher",
++					"help": "Verbose Streamline/XeSS logging (DLSS-G and XeSS-FG only) and FSR 4.1 API checks on the second GPU. Logs go to F4SE/MGPUScaling.log. Requires a game restart. (Default: Off)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				}
++			]
 +		},
- 		{
- 			"text": "DEBUG",
- 			"type": "section"
- 		},
- 		{
- 			"id": "bEnableDebugLogging:Settings",
--			"text": "Enable Debug Logging",
-+			"text": "Enable Debug Logging (restart)",
- 			"type": "switcher",
--			"help": "Enables verbose Streamline logging for troubleshooting. Logs go to F4SE/AAAFrameGeneration.log. Requires game restart. (Default: Off)",
-+			"help": "Enables verbose Streamline/XeSS logging for troubleshooting (no effect with FSR3 or in 'Second GPU' mode). Logs go to F4SE/AAAFrameGeneration.log. Requires a game restart. (Default: Off)",
- 			"valueOptions": {
- 				"sourceType": "ModSettingBool"
- 			}
-diff --git a/package/MCM/Config/FrameGeneration/settings.ini b/package/MCM/Config/FrameGeneration/settings.ini
-index fa75993..c0933ee 100644
---- a/package/MCM/Config/FrameGeneration/settings.ini
-+++ b/package/MCM/Config/FrameGeneration/settings.ini
-@@ -8,18 +8,95 @@ bFrameGenerationMode = 1
- ; Default: true
- bFrameLimitMode = 1
- 
--; Disable frame generation in menus (Pip-Boy, etc.) to avoid interpolation artifacts
++		{
++			"pageDisplayName": "Second GPU",
++			"content": [
++				{
++					"text": "SECOND GPU (FG-GPU1)",
++					"type": "section"
++				},
++				{
++					"text": "The game renders on one GPU; FSR3 frame generation and presentation run on the GPU the monitor is plugged into. Every frame's colour, UI-free colour, depth and motion vectors are copied across PCIe.",
++					"type": "text"
++				},
++				{
++					"text": "FSR 4.1 upscaling on that GPU too: Upscaling page > Upscale Method Preference > AMD FSR 4.1 (second GPU), then restart. The game then renders at the quality mode's resolution and the second GPU upscales it before frame generation. Needs FSR Runtime = FSR SDK 2.4.",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"id": "bFrameGenOnSecondaryGPU:FrameGeneration",
++					"text": "Frame Generation on Second GPU (restart)",
++					"type": "switcher",
++					"help": "Run FSR3 frame generation and present on the GPU that drives the monitor, while the game keeps rendering on its own GPU. Not supported with ENB yet. Requires a game restart. (Default: On in this package)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "sSecondaryGPUName:FrameGeneration",
++					"text": "Second GPU Name (restart)",
++					"type": "textinput",
++					"help": "Optional: part of the second GPU's name, e.g. 9060. Leave empty to pick the GPU that drives the monitor the game window is on. Only needed if the log says the choice is ambiguous. Requires a game restart. (Default: empty)",
++					"valueOptions": {
++						"sourceType": "ModSettingString"
++					}
++				},
++				{
++					"id": "bSendHudlessFrame:FrameGeneration",
++					"text": "Send UI-free Frame (restart)",
++					"type": "switcher",
++					"help": "Send an extra, UI-free copy of every frame. On: generated frames keep a clean HUD. Off: about 25% less PCIe traffic, but the HUD is interpolated with the scene and smears during camera movement. Requires a game restart. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "iHalfResDepthMV:FrameGeneration",
++					"text": "Half-resolution Depth / Motion (restart)",
++					"type": "stepper",
++					"help": "Send depth (and optionally motion vectors) at half resolution to save PCIe time. Only generated frames use them; real frames stay full resolution. Depth: rebuilt to full resolution on the second GPU, FSR3 keeps every motion vector (about 2 ms saved at 4K). Depth + motion: FSR3 works at half resolution, like behind 'Performance' upscaling (about 4 ms saved). Requires a game restart. (Default: Depth)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"Off (full resolution)",
++							"Depth",
++							"Depth + motion vectors"
++						]
++					}
++				},
++				{
++					"id": "bAsyncUnpack:FrameGeneration",
++					"text": "Async Unpack (restart)",
++					"type": "switcher",
++					"help": "On: the second GPU reads what arrives on its own copy queue, starting on each buffer as soon as it has crossed PCIe. Off: the original path, which waits for the whole transfer and reads it on the FSR3 queue (for comparison). Requires a game restart. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "bEarlyTransfer:FrameGeneration",
++					"text": "Early Transfer",
++					"type": "switcher",
++					"help": "On: depth and motion vectors start crossing PCIe right after the world pass and the UI-free frame right after its capture; only the finished frame waits for Present. Off: everything crosses at Present (for comparison). Takes effect immediately. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"id": "bEarlyUnpack:FrameGeneration",
++					"text": "Early Unpack",
++					"type": "switcher",
++					"help": "On: the second GPU reads depth, motion vectors and the UI-free frame as soon as they arrive, before Present; afterwards only the finished frame is left to read. Off: all reads start at Present (for comparison). Needs Async Unpack and Early Transfer. Takes effect immediately. (Default: On)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "HDR",
++					"type": "section"
++				},
++				{
++					"text": "HDR add-ons such as ReShade's AutoHDR change the swap chain to 10-bit (HDR10) or 16-bit (scRGB). Frame generation and the second GPU's output follow that format; ReShade then runs after frame generation, on real and generated frames. Change HDR settings only with the game closed.",
++					"type": "text"
++				}
++			]
++		},
++		{
++			"pageDisplayName": "Upscaling",
++			"content": [
++				{
++					"text": "ABOUT",
++					"type": "section"
++				},
++				{
++					"text": "Upscaling reconstructs lower resolutions to the native resolution using advanced algorithms, improving image quality and performance.",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "When ENBSeries is active, only DLAA is available.",
++					"type": "text"
++				},
++				{
++					"text": "",
++					"type": "text"
++				},
++				{
++					"text": "SETTINGS",
++					"type": "section"
++				},
++				{
++					"id": "iUpscaleMethodPreference:Upscaling",
++					"text": "Upscale Method Preference",
++					"type": "stepper",
++					"help": "NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used. FSR 4.1 (second GPU) renders here at the quality mode's resolution and upscales on the GPU that runs frame generation (Second GPU page); the game renders natively until that GPU is ready. Changing to or from it, or changing the quality mode while it is on, needs a game restart. (Default: FSR 4.1 (second GPU))",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"Disabled",
++							"AMD FSR 3.1",
++							"NVIDIA DLSS 4",
++							"AMD FSR 4.1 (second GPU)"
++						]
++					}
++				},
++				{
++					"id": "iQualityMode:Upscaling",
++					"text": "Quality Mode",
++					"type": "stepper",
++					"help": "Controls the internal resolution. (Default: Quality)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"Native AA",
++							"Quality",
++							"Balanced",
++							"Performance",
++							"Ultra Performance"
++						]
++					}
++				},
++				{
++					"id": "fSharpness:Upscaling",
++					"text": "Sharpness",
++					"type": "slider",
++					"help": "Post-upscale sharpening via AMD RCAS. Reduces softness from upscaling. (Default: 0.5)",
++					"valueOptions": {
++						"sourceType": "ModSettingFloat",
++						"min": 0.0,
++						"max": 1.0,
++						"step": 0.05
++					}
++				},
++				{
++					"text": "DEBUG",
++					"type": "section"
++				},
++				{
++					"id": "bEnableDebugLogging:Upscaling",
++					"text": "Upscaling Debug Logging (restart)",
++					"type": "switcher",
++					"help": "Verbose diagnostic logging for troubleshooting. Logs go to F4SE/MGPUScaling.log. Requires a game restart. (Default: Off)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				}
++			]
++		}
++	]
++}
+diff --git a/package/MCM/Config/MGPUScaling/settings.ini b/package/MCM/Config/MGPUScaling/settings.ini
+new file mode 100644
+index 0000000..adf5719
+--- /dev/null
++++ b/package/MCM/Config/MGPUScaling/settings.ini
+@@ -0,0 +1,131 @@
++; MGPU Scaling: shipped defaults. MCM (MGPU Scaling) writes your changes to
++; Data\MCM\Settings\MGPUScaling.ini, which overrides this file; set keys there by hand too.
++; On the first start without that file, the plugin copies your settings from the old
++; Data\MCM\Settings\FrameGeneration.ini and Upscaling.ini into it.
++
++[FrameGeneration]
++
++; Enable frame generation (can be toggled mid-game)
++; Default: true
++bFrameGenerationMode = 1
++
++; Cap frame rate to monitor refresh rate when VSync is disabled (can be toggled mid-game)
++; Default: true
++bFrameLimitMode = 1
++
 +; Disable frame generation in menus (Pip-Boy, etc.) to avoid interpolation artifacts (can be toggled mid-game)
- ; Default: true
- bDisableInMenus = 1
- 
- ; Frame generation backend (requires game restart to change)
--; Default: 1 (0=FSR3, 1=DLSS-G, 2=XeSS-FG)
--iFrameGenType = 1
++; Default: true
++bDisableInMenus = 1
++
++; Frame generation backend (requires game restart to change)
 +; 0=FSR3, 1=DLSS-G, 2=XeSS-FG. Default in this package: 0. Ignored (FSR3) when bFrameGenOnSecondaryGPU = 1.
 +iFrameGenType = 0
- 
- ; DLSS-G frame multiplier (requires game restart, RTX 50+ for 3x/4x)
- ; Default: 0 (0=2x, 1=3x MFG, 2=4x MFG)
- iFrameGenFrames = 0
- 
++
++; DLSS-G frame multiplier (requires game restart, RTX 50+ for 3x/4x)
++; Default: 0 (0=2x, 1=3x MFG, 2=4x MFG)
++iFrameGenFrames = 0
++
 +; FSR runtime used for FSR frame generation (requires game restart).
 +;   0 = FidelityFX SDK 1.1.4 (FSR 3.1.4), the runtime this mod was first tested with.
 +;   1 = FSR SDK 2.4: the newest FSR frame generation the driver and Windows offer. On an RX 9000
@@ -469,9 +763,10 @@ index fa75993..c0933ee 100644
 +iFSRSwapChainProvider = 0
 +iFSRFrameGenProvider = 0
 +
- ; Enables verbose Streamline logging for troubleshooting. Requires game restart.
- ; Default: false
- bEnableDebugLogging = 0
++; Verbose Streamline/XeSS logging (DLSS-G and XeSS-FG only) and FSR 4.1 API checks on the
++; second GPU. Requires game restart.
++; Default: false
++bEnableDebugLogging = 0
 +
 +; [FG-GPU1] Run FSR3 frame generation and present on a SECOND GPU - the one the monitor is
 +; plugged into - while the game keeps rendering on its own GPU. Every frame's colour,
@@ -513,12 +808,12 @@ index fa75993..c0933ee 100644
 +; Read every ~60 frames, so it can be toggled while the game runs. Default: true
 +bEarlyUnpack = 1
 +
-+; [FG-GPU1] FSR 4.1 upscaling on the frame-generation GPU is switched on in Upscaling.dll's
-+; settings (Data\MCM\Settings\Upscaling.ini, or MCM > Upscaling): iUpscaleMethodPreference = 3.
++; [FG-GPU1] FSR 4.1 upscaling on the frame-generation GPU is switched on in [Upscaling] below
++; (or MCM > MGPU Scaling > Upscaling): iUpscaleMethodPreference = 3.
 +; The game then renders at iQualityMode's resolution with TAA off, the render-resolution scene,
 +; depth and motion vectors cross PCIe, and this GPU upscales with FSR 4.1 before frame
 +; generation; the UI is drawn at full resolution and composited over the result. Needs
-+; iFSRRuntime = 1, bAsyncUnpack = 1 and the Upscaling.dll shipped with FG-GPU1. In that mode
++; iFSRRuntime = 1 and bAsyncUnpack = 1, and no other Upscaling.dll installed. In that mode
 +; bSendHudlessFrame and iHalfResDepthMV are ignored (the scene is always sent, at full render
 +; resolution). Changing the method or the quality mode needs a restart.
 +
@@ -533,51 +828,35 @@ index fa75993..c0933ee 100644
 +;       use it if 1 still falls short of your frame cap in CPU-heavy areas.
 +; Requires restart. Default: 1
 +iHalfResDepthMV = 1
-diff --git a/package/MCM/Config/Upscaling/config.json b/package/MCM/Config/Upscaling/config.json
-index e4f87dd..e28aad6 100644
---- a/package/MCM/Config/Upscaling/config.json
-+++ b/package/MCM/Config/Upscaling/config.json
-@@ -37,13 +37,14 @@
- 			"id": "iUpscaleMethodPreference:Settings",
- 			"text": "Upscale Method Preference",
- 			"type": "stepper",
--			"help": "NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used. (Default: DLSS)",
-+			"help": "NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used. FSR 4.1 (second GPU) renders here at the quality mode's resolution and upscales on the GPU that runs frame generation (FG-GPU1); the game renders natively until that GPU is ready. Changing to or from it, or changing the quality mode while it is on, needs a game restart. (Default: FSR 4.1 (second GPU))",
- 			"valueOptions": {
- 				"sourceType": "ModSettingInt",
- 				"options": [
- 					"Disabled",
- 					"AMD FSR 3.1",
--					"NVIDIA DLSS 4"
-+					"NVIDIA DLSS 4",
-+					"AMD FSR 4.1 (second GPU)"
- 				]
- 			}
- 		},
-diff --git a/package/MCM/Config/Upscaling/settings.ini b/package/MCM/Config/Upscaling/settings.ini
-index 92296d7..f0a195f 100644
---- a/package/MCM/Config/Upscaling/settings.ini
-+++ b/package/MCM/Config/Upscaling/settings.ini
-@@ -3,8 +3,11 @@
- ; AMD Robust Contrast Adaptive Sharpening improves image clarity, even when upscaling is disabled or in 3D menus.
- 
- ; NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used.
--; Default: 2 (0 = Disabled, 1 = FSR, 2 = DLSS)
--iUpscaleMethodPreference = 2
++
++[Upscaling]
++; Upscaling reconstructs lower resolutions to the native resolution using advanced algorithms, improving image quality and performance.
++; AMD Robust Contrast Adaptive Sharpening improves image clarity, even when upscaling is disabled or in 3D menus.
++
++; NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used.
 +; 3 = AMD FSR 4.1 on the second GPU (FG-GPU1): the game renders here at the quality mode's resolution
-+; and AAAFrameGeneration.dll upscales it on the GPU that runs frame generation. Native resolution
++; and the frame-generation part upscales it on the GPU that runs frame generation. Native resolution
 +; until that GPU is ready. Changing to or from 3, or iQualityMode while it is 3, needs a restart.
 +; Default: 3 in the FG-GPU1 package (0 = Disabled, 1 = FSR, 2 = DLSS, 3 = FSR 4.1 on the second GPU)
 +iUpscaleMethodPreference = 3
- 
- ; Controls the internal resolution.
- ; Default: 1 (1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance, 0=Native AA)
++
++; Controls the internal resolution.
++; Default: 1 (1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance, 0=Native AA)
++iQualityMode = 1
++
++; Post-upscale sharpening via AMD RCAS. Reduces softness from upscaling/frame generation.
++; Default: 0.5 (0.0=off, 1.0=maximum sharpening)
++fSharpness = 0.5
++
++; Enables verbose diagnostic logging for troubleshooting. Logs go to F4SE/MGPUScaling.log.
++; Default: false
++bEnableDebugLogging = 0
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..8a39d7d
+index 0000000..b5a8e63
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,1854 @@
+@@ -0,0 +1,1904 @@
 +#include "CrossAdapterBridge.h"
 +
 +#include <d3dcompiler.h>
@@ -1530,6 +1809,53 @@ index 0000000..8a39d7d
 +	return S_OK;
 +}
 +
++namespace
++{
++	// The format family a copy keeps the bits of: copies may change the type (UNORM/SRGB/TYPELESS)
++	// but never convert, so RGBA8 -> R10G10B10A2 (same size per pixel) is not a copy.
++	DXGI_FORMAT CopyFamily(DXGI_FORMAT a_format)
++	{
++		switch (a_format) {
++		case DXGI_FORMAT_R8G8B8A8_TYPELESS:
++		case DXGI_FORMAT_R8G8B8A8_UNORM:
++		case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++		case DXGI_FORMAT_R8G8B8A8_UINT:
++		case DXGI_FORMAT_R8G8B8A8_SNORM:
++		case DXGI_FORMAT_R8G8B8A8_SINT:
++			return DXGI_FORMAT_R8G8B8A8_TYPELESS;
++		case DXGI_FORMAT_B8G8R8A8_TYPELESS:
++		case DXGI_FORMAT_B8G8R8A8_UNORM:
++		case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++			return DXGI_FORMAT_B8G8R8A8_TYPELESS;
++		case DXGI_FORMAT_R10G10B10A2_TYPELESS:
++		case DXGI_FORMAT_R10G10B10A2_UNORM:
++		case DXGI_FORMAT_R10G10B10A2_UINT:
++			return DXGI_FORMAT_R10G10B10A2_TYPELESS;
++		case DXGI_FORMAT_R16G16B16A16_TYPELESS:
++		case DXGI_FORMAT_R16G16B16A16_FLOAT:
++		case DXGI_FORMAT_R16G16B16A16_UNORM:
++		case DXGI_FORMAT_R16G16B16A16_UINT:
++		case DXGI_FORMAT_R16G16B16A16_SNORM:
++		case DXGI_FORMAT_R16G16B16A16_SINT:
++			return DXGI_FORMAT_R16G16B16A16_TYPELESS;
++		case DXGI_FORMAT_R16G16_TYPELESS:
++		case DXGI_FORMAT_R16G16_FLOAT:
++		case DXGI_FORMAT_R16G16_UNORM:
++		case DXGI_FORMAT_R16G16_UINT:
++		case DXGI_FORMAT_R16G16_SNORM:
++		case DXGI_FORMAT_R16G16_SINT:
++			return DXGI_FORMAT_R16G16_TYPELESS;
++		case DXGI_FORMAT_R32_TYPELESS:
++		case DXGI_FORMAT_R32_FLOAT:
++		case DXGI_FORMAT_R32_UINT:
++		case DXGI_FORMAT_R32_SINT:
++			return DXGI_FORMAT_R32_TYPELESS;
++		default:
++			return a_format;
++		}
++	}
++}
++
 +bool CrossAdapterBridge::RecordLaneCopy(ID3D12GraphicsCommandList* a_list, Lane& a_lane, UINT a_slot,
 +	ID3D12Resource* a_dest, D3D12_RESOURCE_STATES a_destState)
 +{
@@ -1537,8 +1863,11 @@ index 0000000..8a39d7d
 +	D3D12_PLACED_SUBRESOURCE_FOOTPRINT destFootprint{};
 +	deviceB->GetCopyableFootprints(&destDesc, 0, 1, 0, &destFootprint, nullptr, nullptr, nullptr);
 +	if (destDesc.Width != a_lane.desc.Width || destDesc.Height != a_lane.desc.Height ||
-+		destFootprint.Footprint.RowPitch != a_lane.footprint.Footprint.RowPitch) {
-+		// e.g. an HDR add-on promoted the swap chain to a 64-bit format.
++		destFootprint.Footprint.RowPitch != a_lane.footprint.Footprint.RowPitch ||
++		CopyFamily(destDesc.Format) != CopyFamily(a_lane.desc.Format)) {
++		// e.g. an HDR add-on changed the swap chain to R10G10B10A2 (same pitch, so only the format
++		// check catches it) or a 64-bit format. SecondaryUpscale converts those; this copy would
++		// only reinterpret the bits.
 +		if (!a_lane.mismatchLogged) {
 +			REX::ERROR("[FG-GPU1] lane '{}' is {}x{} format {} but its destination is {}x{} format {}; skipping the copy",
 +				a_lane.name, a_lane.desc.Width, a_lane.desc.Height, static_cast<int>(a_lane.desc.Format), destDesc.Width,
@@ -2944,7 +3273,7 @@ index 81be80f..5f5de78 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..9fc6c41 100644
+index e10d528..6b652da 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
 @@ -1,9 +1,10 @@
@@ -3036,7 +3365,37 @@ index e10d528..9fc6c41 100644
  void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
  {
  	swapChainDesc = {};
-@@ -91,24 +152,19 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+@@ -86,29 +147,46 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+ 
+ 	frameIndex = swapChain->GetCurrentBackBufferIndex();
+ 
++	// What this plugin copies into is the back buffers, so their format decides. (GetDesc1 cannot
++	// tell: ReShade reports the format the game asked for when an add-on such as AutoHDR changed it.)
++	const DXGI_FORMAT bufferFormat = swapChainBuffers[0]->GetDesc().Format;
++	if (displayFormat != DXGI_FORMAT_UNKNOWN && displayFormat != bufferFormat)
++		REX::CRITICAL("[FG] frame generation was set up for format {}, but the back buffers are format {}; generated frames "
++					  "may be wrong",
++			static_cast<int>(displayFormat), static_cast<int>(bufferFormat));
++	displayFormat = bufferFormat;
++	if (displayFormat != swapChainDesc.Format)
++		REX::INFO("[FG] back buffers: format {}, the game renders format {}", static_cast<int>(displayFormat),
++			static_cast<int>(swapChainDesc.Format));
++	if (displayFormat != swapChainDesc.Format && !secondaryGPU)
++		REX::ERROR("[FG] the swap chain is format {} but the game renders format {} (an HDR add-on changed it); only "
++				   "bFrameGenOnSecondaryGPU = 1 converts between them, so the picture will be wrong. Disable the add-on "
++				   "(e.g. ReShade's AutoHDR) or use the second-GPU mode",
++			static_cast<int>(displayFormat), static_cast<int>(swapChainDesc.Format));
++
++	// FG-GPU1: FSR 4.1 upscaling on this GPU when the upscaler is set to it, and/or the conversion
++	// into back buffers whose format an HDR add-on changed. Decided here, before the lanes exist,
++	// because they are sized for it.
++	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 && secondaryGPU && swapChain &&
++		CrossAdapterBridge::GetSingleton()->IsActive())
++		SecondaryUpscale::GetSingleton()->Initialize(d3d12Device.get(), commandQueue.get(), swapChainDesc.Width,
++			swapChainDesc.Height, displayFormat);
++
+ 	swapChainProxy = new DXGISwapChainProxy(swapChain);
+ }
  
  void DX12SwapChain::CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
  {
@@ -3056,22 +3415,20 @@ index e10d528..9fc6c41 100644
 -	if (ffx::CreateContext(fidelityFX->swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
 -		REX::CRITICAL("[FidelityFX] Failed to create swap chain context!");
 -	}
+-
+-	fidelityFX->SetupFrameGeneration();
+-	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
 +	// Swap chain context + frame generation context; with iFSRRuntime = 1 this logs the providers
 +	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
 +	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
 +	REX::INFO("[FG] FSR3 swap chain created: {}x{} ({})", swapChainDesc.Width, swapChainDesc.Height, fidelityFX->RuntimeName());
- 
--	fidelityFX->SetupFrameGeneration();
--	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
-+	// FG-GPU1: FSR 4.1 upscaling on this GPU when Upscaling.dll is set to it. Decided here, before
-+	// the lanes exist, because they are sized for it.
-+	if (secondaryGPU && swapChain && CrossAdapterBridge::GetSingleton()->IsActive())
-+		SecondaryUpscale::GetSingleton()->Initialize(d3d12Device.get(), commandQueue.get(), swapChainDesc.Width,
-+			swapChainDesc.Height, swapChainDesc.Format);
++	// The format frame generation was created for; CreateSwapChain checks it against the buffers.
++	if (fidelityFX->displayFormat != DXGI_FORMAT_UNKNOWN)
++		displayFormat = fidelityFX->displayFormat;
  }
  
  void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
-@@ -145,9 +201,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -145,9 +223,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -3087,7 +3444,7 @@ index e10d528..9fc6c41 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +226,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +248,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -3096,7 +3453,7 @@ index e10d528..9fc6c41 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +239,21 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +261,22 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -3107,20 +3464,21 @@ index e10d528..9fc6c41 100644
 +
 +	if (secondaryGPU) {
 +		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
-+		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it.
++		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it. So
++		// it does when the back buffer has another format (HDR add-on): a shader converts it.
 +		auto secondaryUpscale = SecondaryUpscale::GetSingleton();
 +		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
 +			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(),
-+			secondaryUpscale->Planned());
++			secondaryUpscale->OwnsPresent());
 +		if (finalFrameLane < 0)
 +			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
-+		else if (secondaryUpscale->Planned())
++		else if (secondaryUpscale->OwnsPresent())
 +			secondaryUpscale->SetFinalLane(finalFrameLane);
 +	}
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -239,17 +312,64 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +335,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -3166,8 +3524,11 @@ index e10d528..9fc6c41 100644
 +			// HUD-less colour, depth and motion vectors into their mirrors on this GPU,
 +			// the finished frame into the back buffer.
 +			bridge->RecordUnpack(commandLists[frameIndex].get(), frameIndex);
-+			bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
-+				swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
++			// A mirrored finished frame (upscaling, or a converted swap-chain format) was read by
++			// RecordUnpack; RecordPresent below puts it into the back buffer.
++			if (!bridge->Mirror(finalFrameLane, frameIndex))
++				bridge->RecordUnpackTo(commandLists[frameIndex].get(), finalFrameLane, frameIndex,
++					swapChainBuffers[frameIndex].get(), D3D12_RESOURCE_STATE_PRESENT);
 +			// iHalfResDepthMV = 1: full-resolution depth for FSR3 from the half-resolution mirror.
 +			bridge->RecordDepthUpsample(commandLists[frameIndex].get(), frameIndex);
 +		}
@@ -3175,12 +3536,14 @@ index e10d528..9fc6c41 100644
 +	}
 +
 +	// FG-GPU1 FSR 4.1 upscaling on this GPU: the finished frame was unpacked into a mirror. Put its
-+	// UI over the FSR 4.1 result, or show it as rendered (menus, loading), in the back buffer.
++	// UI over the FSR 4.1 result, or show it as rendered (menus, loading), in the back buffer; with a
++	// swap chain in another format (HDR add-on) both are converted on the way.
 +	auto secondaryUpscale = SecondaryUpscale::GetSingleton();
-+	const bool upscaleLanes = crossAdapter && secondaryUpscale->HasFinalMirror();
++	const bool presentPass = crossAdapter && secondaryUpscale->HasFinalMirror();
++	const bool upscaleLanes = presentPass && secondaryUpscale->Planned();
 +	bool upscaledFrame = false;
-+	if (upscaleLanes) {
-+		upscaledFrame = upscalingForUI->frameUpscaled[frameIndex] && secondaryUpscale->FinishSubmit(frameIndex);
++	if (presentPass) {
++		upscaledFrame = upscaleLanes && upscalingForUI->frameUpscaled[frameIndex] && secondaryUpscale->FinishSubmit(frameIndex);
 +		secondaryUpscale->RecordPresent(commandLists[frameIndex].get(), frameIndex, upscaledFrame,
 +			swapChainBuffers[frameIndex].get());
 +	}
@@ -3190,7 +3553,7 @@ index e10d528..9fc6c41 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -358,9 +478,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -358,9 +506,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			xessFrameId++;
  		}
  	} else {
@@ -3219,7 +3582,7 @@ index e10d528..9fc6c41 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +508,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +536,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -3230,11 +3593,11 @@ index e10d528..9fc6c41 100644
 +			bridge->SignalConsumed(commandQueue.get());
 +		bridge->SignalDisplayListDone(commandQueue.get());
 +	}
-+	if (upscaleLanes) {
++	if (presentPass) {
 +		secondaryUpscale->EndFrame(frameIndex, upscaledFrame);
 +		secondaryUpscale->LogStats();
 +	}
-+	// Upscaling.dll reports the next frame before it renders it.
++	// The upscaler reports the next frame before it renders it.
 +	upscaling->frameUpscaled[frameIndex] = false;
 +	upscaling->externalFrame.valid = false;
 +	upscaling->externalFrame.captured = false;
@@ -3242,7 +3605,7 @@ index e10d528..9fc6c41 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +591,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +619,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -3261,7 +3624,7 @@ index e10d528..9fc6c41 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +611,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +639,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -3311,7 +3674,7 @@ index e10d528..9fc6c41 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +662,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +690,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -3350,8 +3713,23 @@ index e10d528..9fc6c41 100644
  	// Clear resources
  	upscaling->Reset();
  
+@@ -614,7 +875,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
+ 
+ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
+ {
+-	return swapChain->GetDesc(pDesc);
++	const HRESULT hr = swapChain->GetDesc(pDesc);
++	// GetBuffer hands out the game-side texture, which keeps the game's format even when an HDR
++	// add-on changed the real swap chain's; report that one, so D3D11 code (the game, overlays)
++	// creates views that match the buffer it gets.
++	if (SUCCEEDED(hr) && pDesc)
++		pDesc->BufferDesc.Format = DX12SwapChain::GetSingleton()->swapChainDesc.Format;
++	return hr;
+ }
+ 
+ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT , UINT , UINT , DXGI_FORMAT , UINT )
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.h b/plugins/FrameGeneration/src/DX12SwapChain.h
-index 692f459..15205cf 100644
+index 692f459..04712c8 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.h
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.h
 @@ -10,6 +10,7 @@
@@ -3362,7 +3740,21 @@ index 692f459..15205cf 100644
  
  class WrappedResource
  {
-@@ -91,11 +92,30 @@ public:
+@@ -73,7 +74,13 @@ public:
+ 
+ 	IDXGISwapChain4* swapChain;
+ 
++	// The swap chain as the game asked for it: its format is the one the game renders (RGBA8) and
++	// the D3D11 side (interop textures, lanes) uses.
+ 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
++	// The format the back buffers really have (read from the buffers: ReShade's GetDesc1 reports the
++	// requested one). An HDR add-on (ReShade's AutoHDR) can make it R10G10B10A2 or
++	// R16G16B16A16_FLOAT; everything that writes the back buffer follows it.
++	DXGI_FORMAT displayFormat = DXGI_FORMAT_UNKNOWN;
+ 
+ 	Texture2D* swapChainBufferProxy;
+ 	WrappedResource* swapChainBufferProxyENB;
+@@ -91,11 +98,30 @@ public:
  	UINT frameIndex = 0;
  	UINT64 fenceValue = 0;
  
@@ -3393,7 +3785,7 @@ index 692f459..15205cf 100644
  	void CreateD3D12CommandQueues();
  	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC swapChainDesc);
  	void CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc);
-@@ -109,6 +129,9 @@ public:
+@@ -109,6 +135,9 @@ public:
  	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
  
  	HRESULT GetBuffer(void** ppSurface);
@@ -3404,14 +3796,15 @@ index 692f459..15205cf 100644
  	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
  };
 diff --git a/plugins/FrameGeneration/src/FidelityFX.cpp b/plugins/FrameGeneration/src/FidelityFX.cpp
-index 9fa46df..ba33d73 100644
+index 9fa46df..a1078a4 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.cpp
 +++ b/plugins/FrameGeneration/src/FidelityFX.cpp
-@@ -3,36 +3,510 @@
+@@ -3,34 +3,537 @@
  #include "Upscaling.h"
  
  #include "DX12SwapChain.h"
 -#include <dx12/ffx_api_dx12.hpp>
++#include "MGPUScaling.h"
 +
 +#include <atomic>
 +#include <cmath>
@@ -3424,7 +3817,7 @@ index 9fa46df..ba33d73 100644
  
 +namespace
 +{
-+	constexpr const wchar_t* kFfxFolder = L"Data\\F4SE\\Plugins\\FrameGeneration\\FidelityFX\\";
++	constexpr const wchar_t* kFfxFolder = mgpu::kFidelityFXDir;
 +	constexpr const wchar_t* kLegacyDll = L"amd_fidelityfx_dx12.dll";
 +	constexpr const wchar_t* kLoaderDll = L"amd_fidelityfx_loader_dx12.dll";
 +	constexpr const wchar_t* kFrameGenDll = L"amd_fidelityfx_framegeneration_dx12.dll";
@@ -3585,7 +3978,7 @@ index 9fa46df..ba33d73 100644
 +		for (auto& c : lower)
 +			c = static_cast<wchar_t>(towlower(c));
 +		// The SDK 2.4 loader looks for effect DLLs next to Fallout4.exe before its own folder.
-+		if (lower.find(L"\\f4se\\plugins\\framegeneration\\fidelityfx\\") == std::wstring::npos)
++		if (lower.find(L"\\f4se\\plugins\\mgpuscaling\\fidelityfx\\") == std::wstring::npos)
 +			REX::WARN("[FSR] {} was loaded from {}, not from this plugin's FidelityFX folder (another mod's copy?)",
 +				Narrow(a_name), Narrow(path));
 +		else
@@ -3752,7 +4145,7 @@ index 9fa46df..ba33d73 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation swap chain failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
-+
+ 
 +	std::string swapChainProvider = "3.1.4";
 +	if (sdk24) {
 +		swapChainProvider = ProviderName(swapChainContext);
@@ -3760,7 +4153,32 @@ index 9fa46df..ba33d73 100644
 +			swapChainProvider.starts_with("3") ? " (no driver-assisted frame pacing; that needs 4.0.0 or newer)" :
 +												 " (driver-assisted frame pacing capable)");
 +	}
- 
++
++	// The format the swap chain really has. An add-on can change it while FFX creates it: ReShade's
++	// AutoHDR turns it into R10G10B10A2 (HDR10) or R16G16B16A16_FLOAT (scRGB). FFX creates its
++	// back buffers from the real one, so frame generation and everything that writes the back
++	// buffer must use this format, not the one the game asked for. GetDesc1 cannot tell: ReShade
++	// reports the requested format when an add-on changed it. The back buffer itself can.
++	displayFormat = a_desc->Format;
++	winrt::com_ptr<ID3D12Resource> backBuffer;
++	if (SUCCEEDED((*a_swapChain)->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()))) && backBuffer) {
++		const DXGI_FORMAT bufferFormat = backBuffer->GetDesc().Format;
++		if (bufferFormat != DXGI_FORMAT_UNKNOWN)
++			displayFormat = bufferFormat;
++	} else {
++		REX::WARN("[FSR] could not read the swap chain's back buffer; assuming format {}", static_cast<int>(displayFormat));
++	}
++	if (displayFormat != a_desc->Format) {
++		REX::WARN("[FSR] the swap chain was created as format {} but is format {} (an HDR add-on such as ReShade's AutoHDR "
++				  "changed it); frame generation and the display GPU's output follow it. Change HDR settings only with the "
++				  "game closed",
++			static_cast<int>(a_desc->Format), static_cast<int>(displayFormat));
++		if (!sdk24)
++			REX::ERROR("[FSR] {} cannot be told that the UI-free frame stays RGBA8 under a {} back buffer; generated "
++					   "frames may be wrong. Use iFSRRuntime = 1 with HDR add-ons",
++				RuntimeName(), static_cast<int>(displayFormat));
++	}
++
 +	// ---- frame generation
  	ffx::CreateContextDescFrameGeneration createFg{};
 -	createFg.displaySize = { dx12SwapChain->swapChainDesc.Width, dx12SwapChain->swapChainDesc.Height };
@@ -3768,7 +4186,9 @@ index 9fa46df..ba33d73 100644
  	createFg.maxRenderSize = createFg.displaySize;
  	createFg.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
 -	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(dx12SwapChain->swapChainDesc.Format);
-+	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(a_desc->Format);
++	// SDR content in whatever container the swap chain has: HDR is applied after frame generation
++	// (ReShade at the real Present), so FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE stays off.
++	createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(displayFormat);
 +
 +	ffx::CreateBackendDX12Desc backend{};
 +	backend.device = device;
@@ -3783,8 +4203,9 @@ index 9fa46df..ba33d73 100644
 +		ffx::CreateContextDescFrameGenerationVersion version{};
 +		version.version = FFX_FRAMEGENERATION_VERSION;
 +
-+		// The HUD-less copy is always RGBA8 (Upscaling::CreateFrameGenerationResources). Declare it
-+		// when the back buffer is something else, e.g. BGRA8.
++		// The HUD-less copy is always RGBA8 (Upscaling::CreateFrameGenerationResources, and the FSR 4.1
++		// output on the second GPU). Declare it when the back buffer is something else, e.g. BGRA8 or
++		// the 10-bit/16-bit format of an HDR add-on.
 +		ffx::CreateContextDescFrameGenerationHudless hudless{};
 +		hudless.hudlessBackBufferFormat = ffxApiGetSurfaceFormatDX12(DXGI_FORMAT_R8G8B8A8_UNORM);
 +		const bool declareHudless = hudless.hudlessBackBufferFormat != createFg.backBufferFormat;
@@ -3803,9 +4224,7 @@ index 9fa46df..ba33d73 100644
 +		REX::ERROR("[FSR] {}: creating the frame generation context failed: {} ({})", RuntimeName(), ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
- 
--	ffx::CreateBackendDX12Desc createBackend{};
--	createBackend.device = dx12SwapChain->d3d12Device.get();
++
 +	if (sdk24) {
 +		const auto provider = ProviderName(frameGenContext);
 +		REX::INFO("[FSR] frame generation provider: {} ({})", provider,
@@ -3817,9 +4236,7 @@ index 9fa46df..ba33d73 100644
 +	}
 +	return true;
 +}
- 
--	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
--		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
++
 +void FidelityFX::DestroyContexts(IDXGISwapChain4** a_swapChain)
 +{
 +	if (frameGenContext) {
@@ -3834,9 +4251,9 @@ index 9fa46df..ba33d73 100644
 +	if (a_swapChain && *a_swapChain) {
 +		(*a_swapChain)->Release();
 +		*a_swapChain = nullptr;
- 	}
- }
- 
++	}
++}
++
 +bool FidelityFX::CreateUpscaler(ID3D12Device* a_device, uint32_t a_renderWidth, uint32_t a_renderHeight,
 +	uint32_t a_displayWidth, uint32_t a_displayHeight, bool a_debugChecking)
 +{
@@ -3866,7 +4283,7 @@ index 9fa46df..ba33d73 100644
 +
 +	// Fallout 4's frame is upscaled after its imagespace, i.e. tonemapped LDR in a UNORM target:
 +	// perceptual colour. Depth is 0 at the near plane (not inverted), motion vectors are at render
-+	// resolution and carry no jitter (the same flags Upscaling.dll uses for FSR 3.1).
++	// resolution and carry no jitter (the same flags the upscaler uses for FSR 3.1).
 +	ffx::CreateContextDescUpscale create{};
 +	create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
 +	if (a_debugChecking)
@@ -3890,7 +4307,9 @@ index 9fa46df..ba33d73 100644
 +			a_displayWidth, a_displayHeight, ffxm::ReturnCodeName(rc), rc);
 +		return false;
 +	}
-+
+ 
+-	ffx::CreateBackendDX12Desc createBackend{};
+-	createBackend.device = dx12SwapChain->d3d12Device.get();
 +	upscalerProvider = ProviderName(upscaleContext);
 +	FfxApiEffectMemoryUsage memory{};
 +	ffx::QueryDescUpscaleGetGPUMemoryUsage memoryQuery{};
@@ -3903,7 +4322,9 @@ index 9fa46df..ba33d73 100644
 +	LogModule(kUpscalerDll);
 +	return true;
 +}
-+
+ 
+-	if (ffx::CreateContext(frameGenContext, nullptr, createFg, createBackend) != ffx::ReturnCode::Ok) {
+-		REX::CRITICAL("[FidelityFX] Failed to create frame generation context!");
 +ffx::ReturnCode FidelityFX::DispatchUpscale(ffx::DispatchDescUpscale& a_dispatch)
 +{
 +	if (!upscaleContext)
@@ -3923,14 +4344,12 @@ index 9fa46df..ba33d73 100644
 +		DestroyContexts(a_swapChain);
 +		if (LoadRuntime(Runtime::kLegacy) && CreateContexts(a_dxgiFactory, a_desc, a_window, a_queue, a_swapChain))
 +			return;
-+	}
+ 	}
 +	REX::CRITICAL("[FidelityFX] Failed to create the frame generation swap chain or context!");
-+}
-+
+ }
+ 
  [[nodiscard]] static RE::BSGraphics::State* State_GetSingleton()
- {
- 	REL::Relocation<RE::BSGraphics::State*> singleton{ REL::ID({ 600795, 2704621, 2704621 }) };
-@@ -45,13 +519,114 @@ void FidelityFX::SetupFrameGeneration()
+@@ -45,13 +548,114 @@ void FidelityFX::SetupFrameGeneration()
  	return singleton.get();
  }
  
@@ -4048,7 +4467,7 @@ index 9fa46df..ba33d73 100644
  	auto depth = upscaling->depthBufferShared12[dx12SwapChain->frameIndex].get();
  	auto motionVectors = upscaling->motionVectorBufferShared12[dx12SwapChain->frameIndex].get();
  
-@@ -60,9 +635,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -60,9 +664,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	if (a_useFrameGeneration) {
  		configParameters.frameGenerationEnabled = true;
  
@@ -4059,7 +4478,7 @@ index 9fa46df..ba33d73 100644
  		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
  
  		configParameters.HUDLessColor = ffxApiGetResourceDX12(HUDLessColor);
-@@ -93,7 +666,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -93,7 +695,7 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	configParameters.generationRect.width = dx12SwapChain->swapChainDesc.Width;
  	configParameters.generationRect.height = dx12SwapChain->swapChainDesc.Height;
  
@@ -4068,7 +4487,7 @@ index 9fa46df..ba33d73 100644
  		REX::CRITICAL("[FidelityFX] Failed to configure frame generation!");
  	}
  
-@@ -113,49 +686,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
+@@ -113,49 +715,124 @@ void FidelityFX::Present(bool a_useFrameGeneration)
  	QueryPerformanceCounter(&currentFrameTime);
  
  	float deltaTime = static_cast<float>(currentFrameTime.QuadPart - lastFrameTime.QuadPart) / static_cast<float>(frequency.QuadPart);
@@ -4118,7 +4537,7 @@ index 9fa46df..ba33d73 100644
 +			-jitter.y / renderTargetManager->dynamicHeightRatio * jitterScale);
 +
 +		// FG-GPU1 upscaling: depth and motion vectors are the render-resolution lanes, and the size
-+		// and jitter come from Upscaling.dll for this frame instead of the dynamic-resolution state,
++		// and jitter come from the upscaler for this frame instead of the dynamic-resolution state,
 +		// which other hooks change around Present.
 +		if (a_override) {
 +			renderWidth = a_override->renderWidth;
@@ -4220,7 +4639,7 @@ index 9fa46df..ba33d73 100644
 +	}
  }
 diff --git a/plugins/FrameGeneration/src/FidelityFX.h b/plugins/FrameGeneration/src/FidelityFX.h
-index 78bb041..7db0855 100644
+index 78bb041..0de7d01 100644
 --- a/plugins/FrameGeneration/src/FidelityFX.h
 +++ b/plugins/FrameGeneration/src/FidelityFX.h
 @@ -1,13 +1,60 @@
@@ -4289,7 +4708,7 @@ index 78bb041..7db0855 100644
  class FidelityFX
  {
  public:
-@@ -17,12 +64,60 @@ public:
+@@ -17,12 +64,63 @@ public:
  		return &singleton;
  	}
  
@@ -4307,6 +4726,9 @@ index 78bb041..7db0855 100644
 -	ffx::Context frameGenContext;
 +	ffx::Context frameGenContext{};
 +	HWND window = nullptr;
++	// The swap chain's real format, read from its back buffer after creation (an HDR add-on may have
++	// changed it from the game's RGBA8). Frame generation is created with it.
++	DXGI_FORMAT displayFormat = DXGI_FORMAT_UNKNOWN;
 +
 +	// FG-GPU1: FSR 4.1 upscaling on the display GPU (SDK 2.4 only; see SecondaryUpscale).
 +	ffx::Context upscaleContext{};
@@ -4355,10 +4777,10 @@ index 78bb041..7db0855 100644
  };
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.cpp b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
 new file mode 100644
-index 0000000..9284277
+index 0000000..e57f07e
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
-@@ -0,0 +1,651 @@
+@@ -0,0 +1,807 @@
 +#include "SecondaryUpscale.h"
 +
 +#include <d3dcompiler.h>
@@ -4366,16 +4788,18 @@ index 0000000..9284277
 +#include <algorithm>
 +#include <cmath>
 +#include <cstring>
++#include <format>
 +#include <iterator>
 +#include <string>
 +
 +#include "CrossAdapterBridge.h"
 +#include "FidelityFX.h"
++#include "MGPUScaling.h"
 +#include "Upscaling.h"
 +
 +namespace
 +{
-+	constexpr const wchar_t* kShaderPath = L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl";
++	constexpr const wchar_t* kShaderPath = MGPU_SHADER(L"SecondaryUpscaleCS.hlsl");
 +
 +	D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before,
 +		D3D12_RESOURCE_STATES a_after)
@@ -4390,42 +4814,111 @@ index 0000000..9284277
 +	}
 +
 +
-+	// FSR's quality modes, the ratios ffxFsr3GetUpscaleRatioFromQualityMode returns in Upscaling.dll.
++	// FSR's quality modes, the ratios ffxFsr3GetUpscaleRatioFromQualityMode returns in the upscaler.
 +	constexpr float kUpscaleRatio[] = { 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
 +	constexpr const char* kQualityName[] = { "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance" };
 +}
 +
-+bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth,
-+	UINT a_displayHeight, DXGI_FORMAT a_backBufferFormat)
++const char* SecondaryUpscale::FormatName(DXGI_FORMAT a_format)
 +{
-+	if (planned || !a_device || !a_queue)
++	switch (a_format) {
++	case DXGI_FORMAT_R8G8B8A8_UNORM:
++		return "R8G8B8A8_UNORM";
++	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++		return "R8G8B8A8_UNORM_SRGB";
++	case DXGI_FORMAT_B8G8R8A8_UNORM:
++		return "B8G8R8A8_UNORM";
++	case DXGI_FORMAT_R10G10B10A2_UNORM:
++		return "R10G10B10A2_UNORM (HDR10)";
++	case DXGI_FORMAT_R16G16B16A16_FLOAT:
++		return "R16G16B16A16_FLOAT (scRGB)";
++	default:
++		return "another format";
++	}
++}
++
++bool SecondaryUpscale::Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth,
++	UINT a_displayHeight, DXGI_FORMAT a_displayFormat)
++{
++	if (planned || converting || !a_device || !a_queue)
 +		return planned;
 +
-+	// Upscaling.dll's own settings decide, read the way it reads them (shipped defaults, then the
-+	// user's MCM file), so the two plugins agree on the render size without talking yet.
++	displayWidth = a_displayWidth;
++	displayHeight = a_displayHeight;
++	displayFormat = a_displayFormat;
++	device.copy_from(a_device);
++	queue = a_queue;
++
++	// The game's frames are RGBA8. Any other swap-chain format (an HDR add-on promoted it while FFX
++	// created it) needs a shader pass, because copies do not convert.
++	const bool convert = a_displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM;
++	if (convert) {
++		D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
++		support.Format = a_displayFormat;
++		const bool storable = SUCCEEDED(a_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
++		                      (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
++		                      (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
++		if (!storable) {
++			REX::CRITICAL("[FG-GPU1] the swap chain is format {} ({}), which the display GPU cannot write from a shader; "
++						  "frames cannot be shown. Disable the add-on that changes it (e.g. ReShade's AutoHDR)",
++				static_cast<int>(a_displayFormat), FormatName(a_displayFormat));
++			return false;
++		}
++		REX::INFO("[FG-GPU1] the swap chain is {} (format {}), the game renders R8G8B8A8_UNORM: every frame is converted "
++				  "on the display GPU",
++			FormatName(a_displayFormat), static_cast<int>(a_displayFormat));
++	}
++
++	if (PlanUpscale()) {
++		if (FidelityFX::GetSingleton()->CreateUpscaler(a_device, renderWidth, renderHeight, displayWidth, displayHeight,
++				Upscaling::GetSingleton()->settings.debugLogging) &&
++			CreatePipeline(true)) {
++			planned = true;
++			converting = convert;
++			QueryPerformanceCounter(&statLastLog);
++			REX::INFO("[FSR4] upscaling on the display GPU: the game renders {}x{} ({}), FSR {} upscales to {}x{}{}", renderWidth,
++				renderHeight, kQualityName[qualityMode], FidelityFX::GetSingleton()->upscalerProvider, displayWidth, displayHeight,
++				convert ? std::format(", composited in {}", FormatName(a_displayFormat)) : std::string{});
++			return true;
++		}
++	}
++
++	// Not upscaling: with a non-RGBA8 swap chain the finished frame still needs the conversion pass.
++	if (convert) {
++		renderWidth = displayWidth;
++		renderHeight = displayHeight;
++		if (CreatePipeline(false)) {
++			converting = true;
++			REX::INFO("[FG-GPU1] frames reach the {} back buffer through a conversion pass on the display GPU",
++				FormatName(a_displayFormat));
++		} else {
++			REX::CRITICAL("[FG-GPU1] the conversion pass for the {} swap chain could not be set up; frames cannot be shown. "
++						  "Disable the add-on that changes the format (e.g. ReShade's AutoHDR)",
++				FormatName(a_displayFormat));
++		}
++	}
++	return false;
++}
++
++bool SecondaryUpscale::PlanUpscale()
++{
++	// The upscaler's own settings decide, read the way it reads them (shipped defaults, then the
++	// user's MCM file), so both parts agree on the render size before the game renders a frame.
 +	CSimpleIniA ini;
 +	ini.SetUnicode();
-+	ini.LoadFile("Data\\MCM\\Config\\Upscaling\\settings.ini");
-+	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
-+	const long method = ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2);
++	mgpu::LoadSettings(ini);
++	const long method = ini.GetLongValue(mgpu::kUpscalingSection, "iUpscaleMethodPreference", 2);
 +	if (method != 3) {
-+		REX::INFO("[FSR4] Upscaling.dll iUpscaleMethodPreference = {} (3 = FSR 4.1 on the display GPU): not upscaling here",
++		REX::INFO("[FSR4] [Upscaling] iUpscaleMethodPreference = {} (3 = FSR 4.1 on the display GPU): not upscaling here",
 +			method);
 +		return false;
 +	}
-+	qualityMode = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iQualityMode", 1)), 0, 4);
++	qualityMode = std::clamp(static_cast<int>(ini.GetLongValue(mgpu::kUpscalingSection, "iQualityMode", 1)), 0, 4);
 +
-+	using VersionFn = uint32_t (*)();
-+	HMODULE upscalingDll = GetModuleHandleW(L"Upscaling.dll");
-+	const auto version = upscalingDll ?
-+	                         reinterpret_cast<VersionFn>(GetProcAddress(upscalingDll, "FO4Upscaling_SecondaryGPUApiVersion")) :
-+	                         nullptr;
-+	if (!version || version() != kApiVersion) {
-+		REX::ERROR("[FSR4] iUpscaleMethodPreference = 3 needs the Upscaling.dll from the FG-GPU1 package ({}); "
-+				   "the game renders at full resolution",
-+			!upscalingDll ? "no Upscaling.dll is loaded" :
-+			!version      ? "the loaded one is a different build" :
-+							"the loaded one is a different version");
++	// The upscaler renders the frames this upscales; it is off when another Upscaling.dll is loaded.
++	if (!mgpu::UpscalerActive()) {
++		REX::ERROR("[FSR4] iUpscaleMethodPreference = 3, but the upscaler is off (another Upscaling.dll is loaded, see the "
++				   "[INIT] line); the game renders at full resolution");
 +		return false;
 +	}
 +
@@ -4434,42 +4927,16 @@ index 0000000..9284277
 +		REX::ERROR("[FSR4] upscaling on the display GPU needs the cross-adapter transport with bAsyncUnpack = 1");
 +		return false;
 +	}
-+	if (a_backBufferFormat != DXGI_FORMAT_R8G8B8A8_UNORM) {
-+		REX::ERROR("[FSR4] the back buffer is format {}, not R8G8B8A8_UNORM (28); upscaling on the display GPU is off "
-+				   "(HDR add-ons change it)",
-+			static_cast<int>(a_backBufferFormat));
-+		return false;
-+	}
 +
 +	// The arithmetic Upscaling.dll uses for its render targets and jitter.
 +	const float scale = 1.0f / kUpscaleRatio[qualityMode];
-+	renderWidth = static_cast<UINT>(static_cast<float>(a_displayWidth) * scale);
-+	renderHeight = static_cast<UINT>(static_cast<float>(a_displayHeight) * scale);
-+	displayWidth = a_displayWidth;
-+	displayHeight = a_displayHeight;
-+	device.copy_from(a_device);
-+	queue = a_queue;
-+
-+	if (!FidelityFX::GetSingleton()->CreateUpscaler(a_device, renderWidth, renderHeight, displayWidth, displayHeight,
-+			Upscaling::GetSingleton()->settings.debugLogging))
-+		return false;
-+	if (!CreatePipeline())
-+		return false;
-+
-+	planned = true;
-+	QueryPerformanceCounter(&statLastLog);
-+	REX::INFO("[FSR4] upscaling on the display GPU: the game renders {}x{} ({}), FSR {} upscales to {}x{}", renderWidth,
-+		renderHeight, kQualityName[qualityMode], FidelityFX::GetSingleton()->upscalerProvider, displayWidth, displayHeight);
++	renderWidth = static_cast<UINT>(static_cast<float>(displayWidth) * scale);
++	renderHeight = static_cast<UINT>(static_cast<float>(displayHeight) * scale);
 +	return true;
 +}
 +
-+bool SecondaryUpscale::CreatePipeline()
++bool SecondaryUpscale::CreateComputePipeline(const char* a_entry, winrt::com_ptr<ID3D12PipelineState>& a_pipeline)
 +{
-+	const auto fail = [](const char* a_what, HRESULT a_hr) {
-+		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
-+		return false;
-+	};
-+
 +	const std::string renderW = std::to_string(renderWidth);
 +	const std::string renderH = std::to_string(renderHeight);
 +	const std::string displayW = std::to_string(displayWidth);
@@ -4479,13 +4946,43 @@ index 0000000..9284277
 +
 +	winrt::com_ptr<ID3DBlob> shader;
 +	winrt::com_ptr<ID3DBlob> errors;
-+	HRESULT hr = D3DCompileFromFile(kShaderPath, defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "Composite", "cs_5_0",
++	HRESULT hr = D3DCompileFromFile(kShaderPath, defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, a_entry, "cs_5_0",
 +		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), errors.put());
 +	if (FAILED(hr)) {
 +		if (errors)
 +			REX::ERROR("[FSR4] {}", static_cast<const char*>(errors->GetBufferPointer()));
-+		return fail("compiling SecondaryUpscaleCS.hlsl (Composite)", hr);
++		REX::ERROR("[FSR4] compiling SecondaryUpscaleCS.hlsl ({}) failed (hr={:#010x})", a_entry, static_cast<std::uint32_t>(hr));
++		return false;
 +	}
++
++	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
++	pipelineDesc.pRootSignature = rootSignature.get();
++	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
++	hr = device->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(a_pipeline.put()));
++	if (FAILED(hr)) {
++		REX::ERROR("[FSR4] CreateComputePipelineState ({}) failed (hr={:#010x})", a_entry, static_cast<std::uint32_t>(hr));
++		return false;
++	}
++	return true;
++}
++
++bool SecondaryUpscale::CreatePipeline(bool a_upscale)
++{
++	const auto fail = [](const char* a_what, HRESULT a_hr) {
++		REX::ERROR("[FSR4] {} failed (hr={:#010x}); upscaling on the display GPU is off", a_what, static_cast<std::uint32_t>(a_hr));
++		return false;
++	};
++
++	HRESULT hr = S_OK;
++
++	// A failed upscaling setup is followed by the conversion-only one: start from nothing.
++	rootSignature = nullptr;
++	pipeline = nullptr;
++	copyPipeline = nullptr;
++	descriptors = nullptr;
++	composite = nullptr;
++	for (auto& output : outputs)
++		output = nullptr;
 +
 +	// One table per slot: t0-t2, u0.
 +	D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -4516,12 +5013,11 @@ index 0000000..9284277
 +	if (FAILED(hr))
 +		return fail("CreateRootSignature", hr);
 +
-+	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
-+	pipelineDesc.pRootSignature = rootSignature.get();
-+	pipelineDesc.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
-+	hr = device->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(pipeline.put()));
-+	if (FAILED(hr))
-+		return fail("CreateComputePipelineState", hr);
++	if (a_upscale && !CreateComputePipeline("Composite", pipeline))
++		return false;
++	// Native frames into a back buffer the copy engine cannot convert to.
++	if (displayFormat != DXGI_FORMAT_R8G8B8A8_UNORM && !CreateComputePipeline("Copy", copyPipeline))
++		return false;
 +
 +	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 +	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -4533,7 +5029,9 @@ index 0000000..9284277
 +	descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 +
 +	// FSR 4.1 outputs (one per slot: frame generation reads a frame's while the next is upscaled)
-+	// and the composite. COMMON between uses, like the bridge's mirrors.
++	// and the composite. COMMON between uses, like the bridge's mirrors. The outputs stay RGBA8
++	// like the game's frames (frame generation is told so); the composite has the swap chain's
++	// format because it is copied into the back buffer.
 +	D3D12_RESOURCE_DESC desc{};
 +	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 +	desc.Width = displayWidth;
@@ -4546,18 +5044,26 @@ index 0000000..9284277
 +	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 +	D3D12_HEAP_PROPERTIES defaultHeap{};
 +	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-+	for (auto& output : outputs) {
-+		hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-+			IID_PPV_ARGS(output.put()));
-+		if (FAILED(hr))
-+			return fail("CreateCommittedResource(FSR 4.1 output)", hr);
-+		output->SetName(L"FG-GPU1 FSR 4.1 output");
++	if (a_upscale) {
++		for (auto& output : outputs) {
++			hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++				IID_PPV_ARGS(output.put()));
++			if (FAILED(hr))
++				return fail("CreateCommittedResource(FSR 4.1 output)", hr);
++			output->SetName(L"FG-GPU1 FSR 4.1 output");
++		}
 +	}
++	desc.Format = displayFormat;
 +	hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
 +		IID_PPV_ARGS(composite.put()));
 +	if (FAILED(hr))
 +		return fail("CreateCommittedResource(composite)", hr);
-+	composite->SetName(L"FG-GPU1 FSR 4.1 composite");
++	composite->SetName(L"FG-GPU1 composite (display format)");
++
++	// The upscale list and timestamps belong to upscaling; the conversion pass records on the
++	// frame's own list.
++	if (!a_upscale)
++		return true;
 +
 +	for (auto& allocator : allocators) {
 +		hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put()));
@@ -4615,7 +5121,45 @@ index 0000000..9284277
 +bool SecondaryUpscale::HasFinalMirror() const noexcept
 +{
 +	auto bridge = CrossAdapterBridge::GetSingleton();
-+	return planned && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
++	return OwnsPresent() && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
++}
++
++void SecondaryUpscale::SetFinalLane(int a_lane)
++{
++	finalLane = a_lane;
++	// Conversion only: no other lane is bound, so the finished frame's descriptors are written now.
++	if (converting && !planned && !WriteFinishedDescriptors()) {
++		converting = false;
++		REX::CRITICAL("[FG-GPU1] the finished frame has no mirror on the display GPU; the {} swap chain gets no frames",
++			FormatName(displayFormat));
++	}
++}
++
++bool SecondaryUpscale::WriteFinishedDescriptors()
++{
++	auto bridge = CrossAdapterBridge::GetSingleton();
++	if (!HasFinalMirror())
++		return false;
++	for (UINT slot = 0; slot < kSlots; ++slot) {
++		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
++		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
++		// t0 and t2 are not read by Copy; null descriptors keep the table fully initialised.
++		ID3D12Resource* sources[3] = { nullptr, bridge->Mirror(finalLane, slot), nullptr };
++		for (auto* source : sources) {
++			D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++			srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++			srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++			srv.Texture2D.MipLevels = 1;
++			device->CreateShaderResourceView(source, &srv, handle);
++			handle.ptr += descriptorSize;
++		}
++		D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++		uav.Format = displayFormat;
++		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++		device->CreateUnorderedAccessView(composite.get(), nullptr, &uav, handle);
++	}
++	return true;
 +}
 +
 +bool SecondaryUpscale::BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane)
@@ -4657,7 +5201,7 @@ index 0000000..9284277
 +			handle.ptr += descriptorSize;
 +		}
 +		D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-+		uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++		uav.Format = displayFormat;
 +		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 +		device->CreateUnorderedAccessView(composite.get(), nullptr, &uav, handle);
 +	}
@@ -4887,6 +5431,10 @@ index 0000000..9284277
 +			Transition(a_backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
 +		};
 +		a_list->ResourceBarrier(2, done);
++	} else if (copyPipeline) {
++		// Rendered natively (menus, loading), not upscalable, or not upscaling at all, into a back
++		// buffer of another format (HDR add-on): converted on the way.
++		RecordCopyThroughComposite(a_list, a_slot, finished, a_backBuffer);
 +	} else {
 +		// Rendered natively (menus, loading) or not upscalable: shown as the render GPU finished it.
 +		const D3D12_RESOURCE_BARRIER before[2] = {
@@ -4910,6 +5458,40 @@ index 0000000..9284277
 +		a_list->ResolveQueryData(queryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, a_slot * kMarks, kMarks, readback.get(),
 +			sizeof(UINT64) * a_slot * kMarks);
 +	}
++}
++
++void SecondaryUpscale::RecordCopyThroughComposite(ID3D12GraphicsCommandList* a_list, UINT a_slot,
++	ID3D12Resource* a_finished, ID3D12Resource* a_backBuffer)
++{
++	// A swap-chain buffer is a render target, not a UAV, so the shader writes the composite and the
++	// copy engine moves it (same format) into the back buffer.
++	const D3D12_RESOURCE_BARRIER before[2] = {
++		Transition(a_finished, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++		Transition(composite.get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++	};
++	a_list->ResourceBarrier(2, before);
++
++	ID3D12DescriptorHeap* heaps[] = { descriptors.get() };
++	a_list->SetDescriptorHeaps(1, heaps);
++	a_list->SetComputeRootSignature(rootSignature.get());
++	a_list->SetPipelineState(copyPipeline.get());
++	D3D12_GPU_DESCRIPTOR_HANDLE table = descriptors->GetGPUDescriptorHandleForHeapStart();
++	table.ptr += static_cast<UINT64>(a_slot * kDescriptorsPerSlot) * descriptorSize;
++	a_list->SetComputeRootDescriptorTable(0, table);
++	a_list->Dispatch((displayWidth + 7) / 8, (displayHeight + 7) / 8, 1);
++
++	const D3D12_RESOURCE_BARRIER after[3] = {
++		Transition(a_finished, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
++		Transition(composite.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
++		Transition(a_backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
++	};
++	a_list->ResourceBarrier(3, after);
++	a_list->CopyResource(a_backBuffer, composite.get());
++	const D3D12_RESOURCE_BARRIER done[2] = {
++		Transition(composite.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
++		Transition(a_backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
++	};
++	a_list->ResourceBarrier(2, done);
 +}
 +
 +ID3D12Resource* SecondaryUpscale::Output(UINT a_slot) const noexcept
@@ -4985,19 +5567,15 @@ index 0000000..9284277
 +}
 +
 +// ---------------------------------------------------------------------------------------
-+// Upscaling.dll (FG-GPU1 build) calls these; see Upscaling::SecondaryGPU there.
++// The upscaler calls these every frame; see up::Upscaling::SecondaryGPU. (They were
++// AAAFrameGeneration.dll's exports for Upscaling.dll; now both are in one DLL.)
 +
-+extern "C" __declspec(dllexport) uint32_t FGGPU1_UpscaleApiVersion()
-+{
-+	return SecondaryUpscale::kApiVersion;
-+}
-+
-+extern "C" __declspec(dllexport) bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight)
++extern "C" bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight)
 +{
 +	return SecondaryUpscale::GetSingleton()->ReadyFor(a_renderWidth, a_renderHeight);
 +}
 +
-+extern "C" __declspec(dllexport) void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth,
++extern "C" void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth,
 +	uint32_t a_renderHeight, float a_jitterX, float a_jitterY, float a_sharpness)
 +{
 +	auto& frame = Upscaling::GetSingleton()->externalFrame;
@@ -5012,17 +5590,17 @@ index 0000000..9284277
 +}
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.h b/plugins/FrameGeneration/src/SecondaryUpscale.h
 new file mode 100644
-index 0000000..6a69738
+index 0000000..81b7c1d
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/SecondaryUpscale.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,197 @@
 +#pragma once
 +
 +// SecondaryUpscale - FG-GPU1: FSR 4.1 upscaling on the display GPU.
 +//
-+// With Upscaling.dll's iUpscaleMethodPreference = 3, the render GPU draws the 3D scene at the
-+// quality mode's resolution with a sub-pixel jitter and no TAA (Upscaling.dll), and skips the
-+// upscale. This plugin then
++// With the upscaler's iUpscaleMethodPreference = 3, the render GPU draws the 3D scene at the
++// quality mode's resolution with a sub-pixel jitter and no TAA (the upscaler, namespace up), and
++// skips the upscale. This part then
 +//
 +//   render GPU   PostDisplay: copies the render-resolution scene (UI-free) into its lane and fills
 +//                the full-size frame buffer from it with a plain bilinear blit, so the UI is drawn
@@ -5036,6 +5614,13 @@ index 0000000..6a69738
 +// Frames Upscaling.dll renders natively (menus, before this is ready) are copied to the back
 +// buffer as they are, without frame generation: the depth and motion-vector lanes are sized for
 +// the render resolution. Everything runs on the game's render thread.
++//
++// Display format: the game renders RGBA8, but the swap chain can be another format, because an
++// add-on such as ReShade's AutoHDR switches it to R10G10B10A2 (HDR10) or R16G16B16A16_FLOAT
++// (scRGB) while FFX creates it. CopyResource cannot convert, so then the composite is created in
++// the swap chain's format and native frames go through it too (Copy). Without FSR 4.1 upscaling
++// the same pass is set up on its own ("conversion only"): the finished frame gets a mirror and is
++// copied into the back buffer through the composite. With an RGBA8 swap chain nothing changes.
 +
 +#include <d3d12.h>
 +#include <dxgi.h>
@@ -5048,8 +5633,6 @@ index 0000000..6a69738
 +{
 +public:
 +	static constexpr UINT kSlots = 2;
-+	// FGGPU1_UpscaleApiVersion / FO4Upscaling_SecondaryGPUApiVersion: both plugins must agree.
-+	static constexpr uint32_t kApiVersion = 1;
 +
 +	static SecondaryUpscale* GetSingleton()
 +	{
@@ -5057,26 +5640,35 @@ index 0000000..6a69738
 +		return &singleton;
 +	}
 +
-+	// At swap-chain creation, after the FSR frame-generation contexts. When Upscaling.dll's settings
++	// At swap-chain creation, after the FSR frame-generation contexts. When the upscaler's settings
 +	// ask for it and everything it needs is there, creates the FSR 4.1 context, its outputs and the
 +	// composite. False (logged) leaves the session exactly as before.
++	// a_displayFormat is the swap chain's real format (read back after FFX created it), not the
++	// format the game asked for. When it is not RGBA8 and upscaling is not set up, the conversion
++	// pass is set up on its own (Converting()).
 +	bool Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth, UINT a_displayHeight,
-+		DXGI_FORMAT a_backBufferFormat);
++		DXGI_FORMAT a_displayFormat);
 +
 +	// Set up for it: the lanes are sized for the render resolution and the finished frame is
 +	// unpacked into a mirror. Fixed for the session.
 +	[[nodiscard]] bool Planned() const noexcept { return planned; }
++	// The swap chain is not RGBA8: every frame reaches the back buffer through the composite, so
++	// the finished frame needs a mirror even without upscaling. Fixed for the session.
++	[[nodiscard]] bool Converting() const noexcept { return converting; }
++	// The finished frame is unpacked into a mirror and RecordPresent puts it into the back buffer.
++	[[nodiscard]] bool OwnsPresent() const noexcept { return planned || converting; }
++	[[nodiscard]] DXGI_FORMAT DisplayFormat() const noexcept { return displayFormat; }
 +	// Frames can be upscaled: planned, lanes bound, nothing has failed.
 +	[[nodiscard]] bool Ready() const noexcept { return planned && bound && !failed; }
 +	[[nodiscard]] UINT RenderWidth() const noexcept { return renderWidth; }
 +	[[nodiscard]] UINT RenderHeight() const noexcept { return renderHeight; }
 +
-+	// Upscaling.dll asks every frame before it renders at a_width x a_height.
++	// The upscaler asks every frame before it renders at a_width x a_height.
 +	bool ReadyFor(uint32_t a_width, uint32_t a_height);
 +
 +	// The finished frame's lane (CreateInterop), and the scene/depth/motion-vector lanes
 +	// (CreateFrameGenerationResources). BindLanes false (logged) means frames cannot be upscaled.
-+	void SetFinalLane(int a_lane) { finalLane = a_lane; }
++	void SetFinalLane(int a_lane);
 +	[[nodiscard]] bool HasFinalMirror() const noexcept;
 +	bool BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane);
 +	void Fail(const char* a_reason);
@@ -5088,7 +5680,7 @@ index 0000000..6a69738
 +	// the frame was upscaled.
 +	bool FinishSubmit(UINT a_slot);
 +	// On the frame's direct list: the composite (a_upscaled) or a copy of the finished frame into
-+	// the back buffer (PRESENT before and after).
++	// the back buffer (PRESENT before and after); converted to the swap chain's format if needed.
 +	void RecordPresent(ID3D12GraphicsCommandList* a_list, UINT a_slot, bool a_upscaled, ID3D12Resource* a_backBuffer);
 +	// The FSR 4.1 result of a_slot: the UI-free frame for frame generation.
 +	[[nodiscard]] ID3D12Resource* Output(UINT a_slot) const noexcept;
@@ -5097,6 +5689,8 @@ index 0000000..6a69738
 +
 +	// Every ~10 s from Present.
 +	void LogStats();
++
++	static const char* FormatName(DXGI_FORMAT a_format);
 +
 +private:
 +	static constexpr UINT kMarkUpscaleBegin = 0;
@@ -5116,13 +5710,23 @@ index 0000000..6a69738
 +		float fovY = 1.0f;
 +	};
 +
-+	bool CreatePipeline();
++	// Reads the upscaler's settings and checks what upscaling here needs; sets the render size.
++	bool PlanUpscale();
++	// a_upscale: the Composite pass, FSR 4.1 outputs, upscale list and timestamps. Always: the root
++	// signature, descriptors and the display-format composite; Copy when the swap chain is not RGBA8.
++	bool CreatePipeline(bool a_upscale);
++	bool CreateComputePipeline(const char* a_entry, winrt::com_ptr<ID3D12PipelineState>& a_pipeline);
++	bool WriteFinishedDescriptors();
++	void RecordCopyThroughComposite(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_finished,
++		ID3D12Resource* a_backBuffer);
 +	bool TrySubmit(UINT a_slot);
 +	void CollectTimings(UINT a_slot);
 +
 +	bool planned = false;
++	bool converting = false;
 +	bool bound = false;
 +	bool failed = false;
++	DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 +
 +	UINT renderWidth = 0;
 +	UINT renderHeight = 0;
@@ -5140,9 +5744,11 @@ index 0000000..6a69738
 +
 +	std::array<winrt::com_ptr<ID3D12Resource>, kSlots> outputs;  // FSR 4.1 results (UI-free, display size)
 +	winrt::com_ptr<ID3D12Resource> composite;                    // UI over the FSR 4.1 result, copied to the back buffer
++	                                                             // (display format)
 +
 +	winrt::com_ptr<ID3D12RootSignature> rootSignature;
-+	winrt::com_ptr<ID3D12PipelineState> pipeline;
++	winrt::com_ptr<ID3D12PipelineState> pipeline;      // Composite (upscaling only)
++	winrt::com_ptr<ID3D12PipelineState> copyPipeline;  // Copy: finished frame -> composite (non-RGBA8 swap chain)
 +	winrt::com_ptr<ID3D12DescriptorHeap> descriptors;
 +	UINT descriptorSize = 0;
 +
@@ -5186,10 +5792,10 @@ index 0000000..6a69738
 +	bool loggedSizeMismatch = false;
 +};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..e7c143d 100644
+index 3483d96..8374e97 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
-@@ -2,8 +2,11 @@
+@@ -2,8 +2,12 @@
  
  #include <d3dcompiler.h>
  
@@ -5198,10 +5804,11 @@ index 3483d96..e7c143d 100644
  #include "DirectXMath.h"
 +#include "FidelityFX.h"
 +#include "SecondaryUpscale.h"
++#include "MGPUScaling.h"
  
  enum class RenderTarget
  {
-@@ -79,7 +82,8 @@ enum class DepthStencilTarget
+@@ -79,7 +83,8 @@ enum class DepthStencilTarget
  	kCount = 13
  };
  
@@ -5211,7 +5818,7 @@ index 3483d96..e7c143d 100644
  {
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto device = reinterpret_cast<ID3D11Device*>(rendererData->device);
-@@ -99,7 +103,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
+@@ -99,7 +104,7 @@ ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const char* ProgramTyp
  		REX::ERROR("Failed to compile shader; {} does not exist", str);
  		return nullptr;
  	}
@@ -5220,29 +5827,50 @@ index 3483d96..e7c143d 100644
  		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
  		if (shaderErrors) shaderErrors->Release();
  		if (shaderBlob) shaderBlob->Release();
-@@ -131,6 +135,21 @@ void Upscaling::LoadSettings()
- 	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
+@@ -120,17 +125,32 @@ void Upscaling::LoadSettings()
+ {
+ 	CSimpleIniA ini;
+ 	ini.SetUnicode();
+-	// Read defaults from MCM Config, then overlay user changes from MCM Settings
+-	ini.LoadFile("Data\\MCM\\Config\\FrameGeneration\\settings.ini");
+-	ini.LoadFile("Data\\MCM\\Settings\\FrameGeneration.ini");
+-
+-	settings.frameGenerationMode = ini.GetBoolValue("Settings", "bFrameGenerationMode", true);
+-	settings.frameLimitMode = ini.GetBoolValue("Settings", "bFrameLimitMode", true);
+-	settings.disableInMenus = ini.GetBoolValue("Settings", "bDisableInMenus", true);
+-	settings.debugLogging = ini.GetBoolValue("Settings", "bEnableDebugLogging", false);
+-	settings.frameGenType = (int)ini.GetLongValue("Settings", "iFrameGenType", 0);
++	// Shipped defaults, then the user's MCM changes: the [FrameGeneration] section of MGPUScaling.ini.
++	mgpu::LoadSettings(ini);
++	const char* section = mgpu::kFrameGenerationSection;
++
++	settings.frameGenerationMode = ini.GetBoolValue(section, "bFrameGenerationMode", true);
++	settings.frameLimitMode = ini.GetBoolValue(section, "bFrameLimitMode", true);
++	settings.disableInMenus = ini.GetBoolValue(section, "bDisableInMenus", true);
++	settings.debugLogging = ini.GetBoolValue(section, "bEnableDebugLogging", false);
++	settings.frameGenType = (int)ini.GetLongValue(section, "iFrameGenType", 0);
  	// MCM stepper is 0-indexed (0=2x, 1=3x, 2=4x) but we store as numFramesToGenerate (1, 2, 3)
- 	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
-+	settings.secondaryGPU = ini.GetBoolValue("Settings", "bFrameGenOnSecondaryGPU", false);
-+	settings.secondaryGPUName = ini.GetValue("Settings", "sSecondaryGPUName", "");
+-	settings.frameGenFrames = std::clamp((int)ini.GetLongValue("Settings", "iFrameGenFrames", 0) + 1, 1, 3);
++	settings.frameGenFrames = std::clamp((int)ini.GetLongValue(section, "iFrameGenFrames", 0) + 1, 1, 3);
++	settings.secondaryGPU = ini.GetBoolValue(section, "bFrameGenOnSecondaryGPU", false);
++	settings.secondaryGPUName = ini.GetValue(section, "sSecondaryGPUName", "");
 +	// bTransportHudLess was the old name of this switch; keep reading it so an existing
 +	// settings.ini (or a test build someone edited) is not silently reset to the default.
-+	if (ini.KeyExists("Settings", "bSendHudlessFrame"))
-+		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bSendHudlessFrame", true);
++	if (ini.KeyExists(section, "bSendHudlessFrame"))
++		settings.sendHudlessFrame = ini.GetBoolValue(section, "bSendHudlessFrame", true);
 +	else
-+		settings.sendHudlessFrame = ini.GetBoolValue("Settings", "bTransportHudLess", true);
-+	settings.asyncUnpack = ini.GetBoolValue("Settings", "bAsyncUnpack", true);
-+	settings.earlyTransfer = ini.GetBoolValue("Settings", "bEarlyTransfer", true);
-+	settings.earlyUnpack = ini.GetBoolValue("Settings", "bEarlyUnpack", true);
-+	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iHalfResDepthMV", 1)), 0, 2);
-+	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRRuntime", 1)), 0, 1);
-+	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRSwapChainProvider", 0)), 0, 1);
-+	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue("Settings", "iFSRFrameGenProvider", 0)), 0, 1);
++		settings.sendHudlessFrame = ini.GetBoolValue(section, "bTransportHudLess", true);
++	settings.asyncUnpack = ini.GetBoolValue(section, "bAsyncUnpack", true);
++	settings.earlyTransfer = ini.GetBoolValue(section, "bEarlyTransfer", true);
++	settings.earlyUnpack = ini.GetBoolValue(section, "bEarlyUnpack", true);
++	settings.halfResDepthMV = std::clamp(static_cast<int>(ini.GetLongValue(section, "iHalfResDepthMV", 1)), 0, 2);
++	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRRuntime", 1)), 0, 1);
++	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
++	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +157,22 @@ void Upscaling::LoadSettings()
+@@ -138,6 +158,22 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -5265,7 +5893,7 @@ index 3483d96..e7c143d 100644
  		loggedOnce = true;
  	}
  }
-@@ -169,6 +204,30 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,6 +205,30 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
@@ -5296,7 +5924,7 @@ index 3483d96..e7c143d 100644
  
  	for (int index = 0; index < 2; index++) {
  		D3D11_TEXTURE2D_DESC texDesc{};
-@@ -193,6 +252,9 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -193,6 +253,9 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -5306,7 +5934,7 @@ index 3483d96..e7c143d 100644
  
  		HUDLessBufferShared[index] = new Texture2D(texDesc);
  		HUDLessBufferShared[index]->CreateSRV(srvDesc);
-@@ -204,6 +266,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -204,6 +267,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -5317,7 +5945,7 @@ index 3483d96..e7c143d 100644
  		depthBufferShared[index] = new Texture2D(texDesc);
  		depthBufferShared[index]->CreateSRV(srvDesc);
  		depthBufferShared[index]->CreateRTV(rtvDesc);
-@@ -218,6 +284,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -218,6 +285,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -5328,7 +5956,7 @@ index 3483d96..e7c143d 100644
  		motionVectorBufferShared[index] = new Texture2D(texDesc);
  		motionVectorBufferShared[index]->CreateSRV(srvDesc);
  		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
-@@ -228,14 +298,14 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -228,14 +299,14 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -5345,7 +5973,7 @@ index 3483d96..e7c143d 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +318,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +319,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -5354,7 +5982,7 @@ index 3483d96..e7c143d 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +338,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +339,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -5363,7 +5991,7 @@ index 3483d96..e7c143d 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +358,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +359,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -5372,7 +6000,7 @@ index 3483d96..e7c143d 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +378,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +379,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -5381,10 +6009,13 @@ index 3483d96..e7c143d 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,6 +387,64 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,17 +388,134 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
+-	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
+-	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
+-	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
 +	// Secondary-GPU mode: the resources above were opened on the render GPU. Register them
 +	// with the bridge and hand the frame-generation backends the copies on the secondary GPU
 +	// instead (FidelityFX::Present reads the *Shared12 arrays). UIColorAlpha is DLSS-G only.
@@ -5443,10 +6074,10 @@ index 3483d96..e7c143d 100644
 +		REX::INFO("[FG-GPU1] bSendHudlessFrame=0: the extra UI-free frame is not sent (HUD will smear, ~25% less PCIe)");
 +	}
 +
- 	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\CopyDepthToSharedBufferCS.hlsl", "cs_5_0");
- 	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateSharedBuffersCS.hlsl", "cs_5_0");
- 	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\GenerateUIBufferCS.hlsl", "cs_5_0");
-@@ -324,10 +452,69 @@ void Upscaling::CreateFrameGenerationResources()
++	copyDepthToSharedBufferCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"CopyDepthToSharedBufferCS.hlsl"), "cs_5_0");
++	generateSharedBuffersCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"GenerateSharedBuffersCS.hlsl"), "cs_5_0");
++	generateUIBufferCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"GenerateUIBufferCS.hlsl"), "cs_5_0");
+ 
  	REX::INFO("[FG] Frame generation resources created (HUDLess + Depth + MVec + UIColorAlpha)");
  }
  
@@ -5474,7 +6105,7 @@ index 3483d96..e7c143d 100644
 +	const char* halfMotion = halfResMode == 2 ? "1" : "0";
 +	const D3D_SHADER_MACRO postAlpha[] = { { "ALPHA_MASK", "1" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
 +	const D3D_SHADER_MACRO copyOnly[] = { { "ALPHA_MASK", "0" }, { "HALF_MV", halfMotion }, { nullptr, nullptr } };
-+	constexpr auto kShader = L"Data\\F4SE\\Plugins\\FrameGeneration\\HalfResDepthMVCS.hlsl";
++	constexpr auto kShader = MGPU_SHADER(L"HalfResDepthMVCS.hlsl");
 +	halfResPostAlphaCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", postAlpha);
 +	halfResCopyCS = (ID3D11ComputeShader*)CompileShader(kShader, "cs_5_0", "main", copyOnly);
 +
@@ -5482,7 +6113,7 @@ index 3483d96..e7c143d 100644
 +	if (!ready)
 +		REX::ERROR("[FG-GPU1] HalfResDepthMVCS.hlsl did not compile; sending depth and motion vectors at full resolution");
 +	if (ready && halfResMode == 1)
-+		ready = bridge->CreateDepthUpsampler(a_width, a_height, L"Data\\F4SE\\Plugins\\FrameGeneration\\DepthFromHalfResCS.hlsl");
++		ready = bridge->CreateDepthUpsampler(a_width, a_height, MGPU_SHADER(L"DepthFromHalfResCS.hlsl"));
 +
 +	if (!ready) {
 +		if (halfResPostAlphaCS)
@@ -5516,7 +6147,7 @@ index 3483d96..e7c143d 100644
  	
  	auto& colorMain = rendererData->renderTargets[(uint)RenderTarget::kMain];
  	auto& colorPostAlpha = rendererData->renderTargets[(uint)RenderTarget::kMainTemp];
-@@ -358,10 +545,16 @@ void Upscaling::PostAlpha()
+@@ -358,10 +546,16 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
@@ -5537,7 +6168,7 @@ index 3483d96..e7c143d 100644
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +566,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +567,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -5552,7 +6183,7 @@ index 3483d96..e7c143d 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +580,9 @@ void Upscaling::PostAlpha()
+@@ -387,6 +581,9 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
@@ -5562,7 +6193,7 @@ index 3483d96..e7c143d 100644
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -401,18 +597,59 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -401,18 +598,59 @@ void Upscaling::CopyBuffersToSharedResources()
  
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -5627,7 +6258,7 @@ index 3483d96..e7c143d 100644
  
  
  			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
-@@ -558,22 +795,124 @@ void Upscaling::PostDisplay()
+@@ -558,22 +796,124 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
@@ -5708,7 +6339,7 @@ index 3483d96..e7c143d 100644
 +	const std::string displayH = std::to_string(dx12SwapChain->swapChainDesc.Height);
 +	const D3D_SHADER_MACRO defines[] = { { "RENDER_WIDTH", renderW.c_str() }, { "RENDER_HEIGHT", renderH.c_str() },
 +		{ "DISPLAY_WIDTH", displayW.c_str() }, { "DISPLAY_HEIGHT", displayH.c_str() }, { nullptr, nullptr } };
-+	sceneBlitCS = (ID3D11ComputeShader*)CompileShader(L"Data\\F4SE\\Plugins\\FrameGeneration\\SecondaryUpscaleCS.hlsl",
++	sceneBlitCS = (ID3D11ComputeShader*)CompileShader(MGPU_SHADER(L"SecondaryUpscaleCS.hlsl"),
 +		"cs_5_0", "Blit", defines);
 +	if (!sceneBlitCS)
 +		return false;
@@ -5835,26 +6466,661 @@ index 838f927..e73ffeb 100644
  	void PreAlpha();
  	void PostAlpha();
  	void CopyBuffersToSharedResources();
-diff --git a/plugins/Upscaling/src/Upscaling.cpp b/plugins/Upscaling/src/Upscaling.cpp
-index b9d8e3c..38aaf2d 100644
+diff --git a/plugins/MGPUScaling/CMakeLists.txt b/plugins/MGPUScaling/CMakeLists.txt
+new file mode 100644
+index 0000000..5e2598c
+--- /dev/null
++++ b/plugins/MGPUScaling/CMakeLists.txt
+@@ -0,0 +1,62 @@
++# MGPU Scaling: AAAMGPUScaling.dll, the frame-generation plugin (plugins/FrameGeneration/src, the
++# FG-GPU1 build of AAAFrameGeneration) and the upscaler (src/upscaler, the FG-GPU1 build of
++# Upscaling, in namespace up) as one F4SE plugin. Both plugins' own XSEPlugin.cpp are replaced by
++# src/XSEPlugin.cpp.
++set(PLUGIN_NAME "MGPUScaling")
++
++add_library(${PLUGIN_NAME} SHARED)
++
++set(FRAMEGEN_DIR "${CMAKE_SOURCE_DIR}/plugins/FrameGeneration/src")
++file(GLOB FRAMEGEN_SOURCES
++	LIST_DIRECTORIES false
++	CONFIGURE_DEPENDS
++	"${FRAMEGEN_DIR}/*.cpp"
++	"${FRAMEGEN_DIR}/*.h"
++)
++list(FILTER FRAMEGEN_SOURCES EXCLUDE REGEX "/XSEPlugin\.cpp$")
++
++file(GLOB_RECURSE PLUGIN_SOURCES
++	LIST_DIRECTORIES false
++	CONFIGURE_DEPENDS
++	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
++	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
++)
++
++target_sources(${PLUGIN_NAME} PRIVATE ${FRAMEGEN_SOURCES} ${PLUGIN_SOURCES})
++source_group("FrameGeneration" FILES ${FRAMEGEN_SOURCES})
++
++include(Common)
++configure_xse_plugin(${PLUGIN_NAME} 2 0 0)
++
++# "AAA": the frame-generation part's D3D11 device hook must be installed before any other plugin's.
++set_target_properties(${PLUGIN_NAME} PROPERTIES OUTPUT_NAME "AAAMGPUScaling")
++
++# src/ (MGPUScaling.h) comes from configure_xse_plugin. The frame-generation headers are found
++# through this path; the upscaler's resolve next to the files that include them, so the two sets
++# of same-named headers (Upscaling.h, FidelityFX.h, Streamline.h, DX11Hooks.h, Buffer.h) never mix.
++target_include_directories(${PLUGIN_NAME} PRIVATE
++	${FRAMEGEN_DIR}
++	${CMAKE_SOURCE_DIR}/extern/Streamline/external/ngx-sdk/include
++)
++
++# Streamline and XeSS are interface targets that skip themselves when defined already.
++add_subdirectory(${CMAKE_SOURCE_DIR}/cmake/Streamline ${CMAKE_CURRENT_BINARY_DIR}/Streamline)
++add_subdirectory(${CMAKE_SOURCE_DIR}/cmake/XeSS ${CMAKE_CURRENT_BINARY_DIR}/XeSS)
++
++# The union of both plugins' libraries. The FidelityFX SDK 1.x targets (the upscaler's FSR 3.1 on
++# the game's GPU) are defined by plugins/Upscaling, which the top-level CMakeLists adds first.
++target_link_libraries(${PLUGIN_NAME} PRIVATE
++	debug ${CMAKE_SOURCE_DIR}/include/detours/Debug/detours.lib
++	optimized ${CMAKE_SOURCE_DIR}/include/detours/Release/detours.lib
++	Microsoft::DirectXTK
++	Microsoft::DirectXTex
++	Microsoft::DirectX-Headers
++	d3d12.lib
++	magic_enum::magic_enum
++	d3dcompiler.lib
++	Streamline
++	${CMAKE_SOURCE_DIR}/extern/Streamline/external/ngx-sdk/lib/Windows_x86_64/nvsdk_ngx_d.lib
++	XeSS
++	ffx_backend_dx11_x64
++	ffx_fsr3_x64
++)
+diff --git a/plugins/MGPUScaling/src/MGPUScaling.cpp b/plugins/MGPUScaling/src/MGPUScaling.cpp
+new file mode 100644
+index 0000000..a2a39b1
+--- /dev/null
++++ b/plugins/MGPUScaling/src/MGPUScaling.cpp
+@@ -0,0 +1,98 @@
++#include "MGPUScaling.h"
++
++#include <atomic>
++#include <filesystem>
++#include <iterator>
++#include <string_view>
++#include <system_error>
++
++namespace
++{
++	std::atomic_bool upscalerActive{ false };
++
++	struct LegacyFile
++	{
++		const char* path;
++		const char* section;  // in MGPUScaling.ini
++		const char* const* keys;
++		std::size_t keyCount;
++	};
++
++	// Every key the two old plugins read from their [Settings] section.
++	constexpr const char* kFrameGenerationKeys[] = { "bFrameGenerationMode", "bFrameLimitMode", "bDisableInMenus",
++		"iFrameGenType", "iFrameGenFrames", "iFSRRuntime", "iFSRSwapChainProvider", "iFSRFrameGenProvider",
++		"bEnableDebugLogging", "bFrameGenOnSecondaryGPU", "sSecondaryGPUName", "bSendHudlessFrame", "bTransportHudLess",
++		"bAsyncUnpack", "bEarlyTransfer", "bEarlyUnpack", "iHalfResDepthMV" };
++	constexpr const char* kUpscalingKeys[] = { "iUpscaleMethodPreference", "iQualityMode", "fSharpness", "bEnableDebugLogging" };
++}
++
++void mgpu::LoadSettings(CSimpleIniA& a_ini)
++{
++	a_ini.LoadFile(kDefaultSettings);
++	a_ini.LoadFile(kUserSettings);
++}
++
++bool mgpu::DebugLoggingRequested()
++{
++	CSimpleIniA ini;
++	ini.SetUnicode();
++	LoadSettings(ini);
++	return ini.GetBoolValue(kUpscalingSection, "bEnableDebugLogging", false);
++}
++
++void mgpu::MigrateSettings()
++{
++	std::error_code error;
++	if (std::filesystem::exists(kUserSettings, error))
++		return;
++
++	// The MCM files the FG-GPU1 builds of AAAFrameGeneration.dll and Upscaling.dll used. Upscaling.ini
++	// is shared with doodlum's Upscaling MCM page, so only this plugin's own keys are taken.
++	const LegacyFile legacy[] = {
++		{ "Data\\MCM\\Settings\\FrameGeneration.ini", kFrameGenerationSection, kFrameGenerationKeys, std::size(kFrameGenerationKeys) },
++		{ "Data\\MCM\\Settings\\Upscaling.ini", kUpscalingSection, kUpscalingKeys, std::size(kUpscalingKeys) },
++	};
++
++	CSimpleIniA out;
++	out.SetUnicode();
++	int copied = 0;
++	for (const auto& file : legacy) {
++		CSimpleIniA in;
++		in.SetUnicode();
++		if (in.LoadFile(file.path) < 0)
++			continue;
++		for (std::size_t i = 0; i < file.keyCount; ++i) {
++			const char* value = in.GetValue("Settings", file.keys[i], nullptr);
++			if (!value)
++				continue;
++			// bTransportHudLess is the old name of bSendHudlessFrame.
++			const char* key = std::string_view(file.keys[i]) == "bTransportHudLess" ? "bSendHudlessFrame" : file.keys[i];
++			if (key != file.keys[i] && out.GetValue(file.section, key, nullptr))
++				continue;
++			out.SetValue(file.section, key, value);
++			++copied;
++		}
++	}
++	if (copied == 0)
++		return;
++
++	// No UTF-8 signature: MCM reads this file too.
++	if (out.SaveFile(kUserSettings, false) < 0) {
++		REX::WARN("[INIT] could not write {}; the settings from the old FrameGeneration.ini / Upscaling.ini are not carried over",
++			kUserSettings);
++		return;
++	}
++	REX::INFO("[INIT] carried {} settings over from Data\\MCM\\Settings\\FrameGeneration.ini and Upscaling.ini into {} "
++			  "(the old files are left as they are)",
++		copied, kUserSettings);
++}
++
++bool mgpu::UpscalerActive() noexcept
++{
++	return upscalerActive.load(std::memory_order_relaxed);
++}
++
++void mgpu::SetUpscalerActive(bool a_active) noexcept
++{
++	upscalerActive.store(a_active, std::memory_order_relaxed);
++}
+diff --git a/plugins/MGPUScaling/src/MGPUScaling.h b/plugins/MGPUScaling/src/MGPUScaling.h
+new file mode 100644
+index 0000000..12b4faa
+--- /dev/null
++++ b/plugins/MGPUScaling/src/MGPUScaling.h
+@@ -0,0 +1,50 @@
++#pragma once
++
++// MGPU Scaling: one F4SE plugin, AAAMGPUScaling.dll, for what used to be two FG-GPU1 builds of
++// FO4Upscaling's plugins:
++//
++//   frame generation  plugins/FrameGeneration/src (was AAAFrameGeneration.dll): the D3D12 proxy
++//                     swap chain, FSR frame generation, the second-GPU transport and FSR 4.1
++//                     upscaling on the second GPU.
++//   upscaler          src/upscaler, namespace up (was Upscaling.dll): render scale, jitter, TAA,
++//                     mip bias and the dynamic-resolution fixes, plus FSR 3.1/DLSS on the game's GPU.
++//
++// One DLL, one log (MGPUScaling.log), one MCM page and one settings file with a section per part,
++// and its own data folder, so it shares no file with doodlum's Upscaling or FO4Upscaling's
++// AAAFrameGeneration and those mods can simply be disabled. The "AAA" keeps it the first F4SE
++// plugin to load, which the frame-generation part's D3D11 device hook needs (see XSEPlugin.cpp).
++
++#include <SimpleIni.h>
++
++// Everything the package installs under Data\F4SE\Plugins\MGPUScaling. Wide string literals, so
++// MGPU_SHADER(L"X.hlsl") is one literal.
++#define MGPU_PLUGIN_DIR L"Data\\F4SE\\Plugins\\MGPUScaling\\"
++#define MGPU_SHADER(a_file) MGPU_PLUGIN_DIR L"Shaders\\" a_file
++
++namespace mgpu
++{
++	inline constexpr const wchar_t* kFidelityFXDir = MGPU_PLUGIN_DIR L"FidelityFX\\";
++
++	// Shipped defaults, then the user's MCM changes on top.
++	inline constexpr const char* kDefaultSettings = "Data\\MCM\\Config\\MGPUScaling\\settings.ini";
++	inline constexpr const char* kUserSettings = "Data\\MCM\\Settings\\MGPUScaling.ini";
++	inline constexpr const char* kFrameGenerationSection = "FrameGeneration";
++	inline constexpr const char* kUpscalingSection = "Upscaling";
++
++	// Both files into a_ini, defaults first.
++	void LoadSettings(CSimpleIniA& a_ini);
++
++	// Before F4SE::Init (the log level): bEnableDebugLogging in the [Upscaling] section.
++	[[nodiscard]] bool DebugLoggingRequested();
++
++	// Once at load, after the log exists: when the user has no MGPUScaling.ini yet, copies the
++	// settings this plugin knows from the old plugins' MCM files (FrameGeneration.ini and
++	// Upscaling.ini, [Settings]) into it, so MCM and the plugin both show them. The old files are
++	// not touched.
++	void MigrateSettings();
++
++	// The upscaler's hooks are installed. False when another Upscaling.dll is loaded (both would
++	// hook the same render calls), and then the second GPU cannot upscale either.
++	[[nodiscard]] bool UpscalerActive() noexcept;
++	void SetUpscalerActive(bool a_active) noexcept;
++}
+diff --git a/plugins/MGPUScaling/src/XSEPlugin.cpp b/plugins/MGPUScaling/src/XSEPlugin.cpp
+new file mode 100644
+index 0000000..06aac13
+--- /dev/null
++++ b/plugins/MGPUScaling/src/XSEPlugin.cpp
+@@ -0,0 +1,108 @@
++// MGPU Scaling's F4SE entry point. It does what the two plugins' own entry points did:
++//
++//   F4SEPlugin_Load   the frame-generation part's settings and its D3D11CreateDeviceAndSwapChain
++//                     hook (as AAAFrameGeneration.dll did, first of all plugins)
++//   kPostLoad         the upscaler's D3D11 hook and render hooks (Upscaling.dll installed them in its
++//                     own Load, after the plugins that sort before it, Community Shaders included;
++//                     kPostLoad comes after every plugin's Load, which keeps them outside those)
++//   kPostPostLoad     the frame-generation part's render hooks (as before)
++//   kGameDataReady    the upscaler's menu sink and game settings (as before)
++//
++// Why "AAA": the frame-generation part creates the game's D3D11 device itself and does not call
++// the next hook in the import table, so its hook must be the first one installed (the innermost).
++// F4SE loads plugins in file-name order.
++
++#include "MGPUScaling.h"
++
++#include "DX11Hooks.h"  // frame generation (plugins/FrameGeneration/src)
++#include "Upscaling.h"  // frame generation's state, not the upscaler
++#include "upscaler/Upscaler.h"
++
++// OG F4SE uses F4SEPlugin_Query, NG uses F4SEPlugin_Version. Export both.
++extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface*, F4SE::PluginInfo* a_info)
++{
++	a_info->infoVersion = F4SE::PluginInfo::kVersion;
++	a_info->name = Plugin::NAME.data();
++	a_info->version = Plugin::VERSION[0];
++	return true;
++}
++
++extern "C" DLLEXPORT constinit auto F4SEPlugin_Version = []() noexcept {
++	F4SE::PluginVersionData data{};
++
++	data.PluginVersion(Plugin::VERSION);
++	data.PluginName(Plugin::NAME.data());
++	data.AuthorName("");
++	data.UsesAddressLibrary(true);
++	data.UsesSigScanning(false);
++	data.IsLayoutDependent(true);
++	data.HasNoStructUse(false);
++	data.CompatibleVersions({ F4SE::RUNTIME_LATEST });
++
++	return data;
++}();
++
++namespace
++{
++	void MessageHandler(F4SE::MessagingInterface::Message* a_message)
++	{
++		switch (a_message->type) {
++		case F4SE::MessagingInterface::kPostLoad:
++			up::OnPostLoad();
++			break;
++		case F4SE::MessagingInterface::kPostPostLoad:
++			Upscaling::GetSingleton()->PostPostLoad();
++			break;
++		case F4SE::MessagingInterface::kGameDataReady:
++			up::OnDataLoaded();
++			break;
++		default:
++			break;
++		}
++	}
++
++	void WarnUser(const wchar_t* a_text)
++	{
++		MessageBoxW(nullptr, a_text, L"MGPU Scaling", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
++	}
++}
++
++extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f4se)
++{
++	F4SE::InitInfo initInfo{};
++	initInfo.logName = "MGPUScaling";
++	initInfo.logLevel = mgpu::DebugLoggingRequested() ? REX::ELogLevel::Debug : REX::ELogLevel::Info;
++	initInfo.trampoline = true;
++	initInfo.trampolineSize = 1 << 11;  // the two plugins asked for 1 KiB each
++	F4SE::Init(a_f4se, initInfo);
++
++#ifndef NDEBUG
++	while (!REX::W32::IsDebuggerPresent()) {};
++#endif
++
++	// FO4Upscaling's AAAFrameGeneration.dll sorts before this plugin and hooks the same D3D11 call;
++	// its hook would create the device and this one would never run.
++	if (GetModuleHandleW(L"AAAFrameGeneration.dll")) {
++		REX::CRITICAL("[INIT] AAAFrameGeneration.dll (FO4Upscaling's frame generation, or the old FG-GPU1 build) is loaded. "
++					  "MGPU Scaling replaces it: disable that mod. MGPU Scaling does nothing this session");
++		WarnUser(L"AAAFrameGeneration.dll is installed as well.\n\n"
++				 L"MGPU Scaling replaces it (frame generation and upscaling in one plugin). Disable the other frame "
++				 L"generation mod (FO4Upscaling / FG-GPU1) in your mod manager.\n\n"
++				 L"MGPU Scaling stays off for this session.");
++		return false;
++	}
++
++	mgpu::MigrateSettings();
++
++	// Frame generation, as AAAFrameGeneration.dll did.
++	Upscaling::GetSingleton()->LoadSettings();
++	DX11Hooks::Install();
++
++	// The upscaler, as Upscaling.dll did; its hooks follow at kPostLoad.
++	up::OnLoad();
++
++	const auto messaging = F4SE::GetMessagingInterface();
++	messaging->RegisterListener(MessageHandler);
++
++	return true;
++}
+diff --git a/plugins/Upscaling/src/Buffer.h b/plugins/MGPUScaling/src/upscaler/Buffer.h
+similarity index 98%
+copy from plugins/Upscaling/src/Buffer.h
+copy to plugins/MGPUScaling/src/upscaler/Buffer.h
+index e06f7c1..10aa0ff 100644
+--- a/plugins/Upscaling/src/Buffer.h
++++ b/plugins/MGPUScaling/src/upscaler/Buffer.h
+@@ -7,6 +7,12 @@
+ #include <stdio.h>
+ #include <winrt/base.h>
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ // ========================================
+ // Helper Functions & Utilities
+ // ========================================
+@@ -626,3 +632,5 @@ public:
+ 	winrt::com_ptr<ID3D11UnorderedAccessView> uav;      ///< Unordered access view (automatically released)
+ 	winrt::com_ptr<ID3D11RenderTargetView> rtv;         ///< Render target view (automatically released)
+ };
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/DX11Hooks.cpp b/plugins/MGPUScaling/src/upscaler/DX11Hooks.cpp
+similarity index 91%
+copy from plugins/Upscaling/src/DX11Hooks.cpp
+copy to plugins/MGPUScaling/src/upscaler/DX11Hooks.cpp
+index a1ce79a..48be48c 100644
+--- a/plugins/Upscaling/src/DX11Hooks.cpp
++++ b/plugins/MGPUScaling/src/upscaler/DX11Hooks.cpp
+@@ -4,6 +4,12 @@
+ 
+ #include "Streamline.h"
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ extern bool enbLoaded;
+ 
+ struct hkD3D11CreateDeviceAndSwapChain
+@@ -86,3 +92,5 @@ namespace DX11Hooks
+ 		REX::INFO("[HOOK] IAT hook installed, original func: {:#x}", (uintptr_t)hkD3D11CreateDeviceAndSwapChain::func.get());
+ 	}
+ }
++
++}  // namespace up
+diff --git a/plugins/MGPUScaling/src/upscaler/DX11Hooks.h b/plugins/MGPUScaling/src/upscaler/DX11Hooks.h
+new file mode 100644
+index 0000000..4d5f3cc
+--- /dev/null
++++ b/plugins/MGPUScaling/src/upscaler/DX11Hooks.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
++namespace DX11Hooks
++{
++	void Install();
++}
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/FidelityFX.cpp b/plugins/MGPUScaling/src/upscaler/FidelityFX.cpp
+similarity index 97%
+copy from plugins/Upscaling/src/FidelityFX.cpp
+copy to plugins/MGPUScaling/src/upscaler/FidelityFX.cpp
+index 3b77d68..15a2cbe 100644
+--- a/plugins/Upscaling/src/FidelityFX.cpp
++++ b/plugins/MGPUScaling/src/upscaler/FidelityFX.cpp
+@@ -3,6 +3,12 @@
+ #include "Upscaling.h"
+ #include "Util.h"
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ 
+ FfxResource ffxGetResource(ID3D11Resource* dx11Resource,
+ 	[[maybe_unused]] wchar_t const* ffxResName,
+@@ -218,3 +224,5 @@ void FidelityFX::Upscale(Texture2D* a_color, float2 a_jitter, float2 a_renderSiz
+ 			REX::CRITICAL("[FidelityFX] Failed to dispatch upscaling!");
+ 	}
+ }
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/FidelityFX.h b/plugins/MGPUScaling/src/upscaler/FidelityFX.h
+similarity index 92%
+copy from plugins/Upscaling/src/FidelityFX.h
+copy to plugins/MGPUScaling/src/upscaler/FidelityFX.h
+index 65a3c9f..68f3f79 100644
+--- a/plugins/Upscaling/src/FidelityFX.h
++++ b/plugins/MGPUScaling/src/upscaler/FidelityFX.h
+@@ -8,6 +8,12 @@
+ 
+ #include <memory>
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ /**
+  * @class FidelityFX
+  * @brief Manager for AMD FidelityFX Super Resolution 3 (FSR3) upscaling
+@@ -105,3 +111,5 @@ public:
+ private:
+ 	void* fsrScratchBuffer = nullptr;  ///< FSR3 backend scratch memory (freed in DestroyFSRResources)
+ };
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/Streamline.cpp b/plugins/MGPUScaling/src/upscaler/Streamline.cpp
+similarity index 97%
+copy from plugins/Upscaling/src/Streamline.cpp
+copy to plugins/MGPUScaling/src/upscaler/Streamline.cpp
+index 2353c87..8f16a88 100644
+--- a/plugins/Upscaling/src/Streamline.cpp
++++ b/plugins/MGPUScaling/src/upscaler/Streamline.cpp
+@@ -4,6 +4,12 @@
+ 
+ #include "Util.h"
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ void Streamline::LoadInterposer()
+ {
+ 	// Check if the FrameGeneration plugin already loaded an interposer
+@@ -258,3 +264,5 @@ void Streamline::DestroyDLSSResources()
+ 	slDLSSSetOptions(viewport, dlssOptions);
+ 	slFreeResources(sl::kFeatureDLSS, viewport);
+ }
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/Streamline.h b/plugins/MGPUScaling/src/upscaler/Streamline.h
+similarity index 96%
+copy from plugins/Upscaling/src/Streamline.h
+copy to plugins/MGPUScaling/src/upscaler/Streamline.h
+index 09f3ecc..ea555a9 100644
+--- a/plugins/Upscaling/src/Streamline.h
++++ b/plugins/MGPUScaling/src/upscaler/Streamline.h
+@@ -13,6 +13,12 @@
+ #pragma warning(pop)
+ #include "Buffer.h"
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ using PFun_slSetTag2 = sl::Result(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer);
+ 
+ /**
+@@ -187,3 +193,5 @@ public:
+ 	PFun_slDLSSGetState* slDLSSGetState{};                      ///< Get DLSS state
+ 	PFun_slDLSSSetOptions* slDLSSSetOptions{};                  ///< Set DLSS options
+ };
++
++}  // namespace up
+diff --git a/plugins/MGPUScaling/src/upscaler/Upscaler.cpp b/plugins/MGPUScaling/src/upscaler/Upscaler.cpp
+new file mode 100644
+index 0000000..db19d4a
+--- /dev/null
++++ b/plugins/MGPUScaling/src/upscaler/Upscaler.cpp
+@@ -0,0 +1,60 @@
++#include "Upscaler.h"
++
++#include "DX11Hooks.h"
++#include "Upscaling.h"
++
++#include "ENB/ENBSeriesAPI.h"
++#include "MGPUScaling.h"
++
++namespace up
++{
++	bool enbLoaded = false;
++
++	namespace
++	{
++		bool installed = false;
++	}
++
++	void OnLoad()
++	{
++		if (ENB_API::RequestENBAPI()) {
++			REX::INFO("[ENB] ENB detected — native AA mode (DLAA/FSR)");
++			enbLoaded = true;
++		} else {
++			REX::INFO("[ENB] ENB not detected — full pipeline active");
++		}
++	}
++
++	bool OnPostLoad()
++	{
++		// doodlum's Upscaling and FO4Upscaling's own build are both Upscaling.dll. Both would hook
++		// the render calls this part hooks, so only one of them may run.
++		if (GetModuleHandleW(L"Upscaling.dll")) {
++			REX::CRITICAL("[INIT] another Upscaling.dll is loaded (doodlum's Upscaling, or FO4Upscaling's). MGPU Scaling "
++						  "includes the upscaler: disable that mod. This session the upscaler here, and with it FSR 4.1 on the "
++						  "second GPU, is off; frame generation still runs");
++			mgpu::SetUpscalerActive(false);
++			return false;
++		}
++
++		REX::INFO("[INIT] Installing DX11 hooks...");
++		DX11Hooks::Install();
++		REX::INFO("[INIT] DX11 hooks installed");
++
++		REX::INFO("[INIT] Installing upscaling hooks...");
++		Upscaling::InstallHooks();
++		REX::INFO("[INIT] Upscaling hooks installed");
++
++		installed = true;
++		mgpu::SetUpscalerActive(true);
++		return true;
++	}
++
++	void OnDataLoaded()
++	{
++		if (!installed)
++			return;
++		REX::INFO("[INIT] Data loaded");
++		Upscaling::GetSingleton()->OnDataLoaded();
++	}
++}
+diff --git a/plugins/MGPUScaling/src/upscaler/Upscaler.h b/plugins/MGPUScaling/src/upscaler/Upscaler.h
+new file mode 100644
+index 0000000..1a8100c
+--- /dev/null
++++ b/plugins/MGPUScaling/src/upscaler/Upscaler.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++// The upscaler's part of the plugin entry (what Upscaling.dll's XSEPlugin.cpp did). Kept free of
++// the upscaler's own headers, so the entry point can include it next to the frame-generation ones.
++
++namespace up
++{
++	// F4SEPlugin_Load, after F4SE::Init.
++	void OnLoad();
++	// kPostLoad: installs the D3D11 device hook and the render hooks, unless another Upscaling.dll
++	// is loaded. These ran in Upscaling.dll's own F4SEPlugin_Load, i.e. after every plugin that
++	// sorts before "Upscaling.dll" (Community Shaders among them) had installed its hooks; kPostLoad
++	// keeps that order now that the code loads first.
++	bool OnPostLoad();
++	// kGameDataReady.
++	void OnDataLoaded();
++}
+diff --git a/plugins/Upscaling/src/Upscaling.cpp b/plugins/MGPUScaling/src/upscaler/Upscaling.cpp
+similarity index 92%
+copy from plugins/Upscaling/src/Upscaling.cpp
+copy to plugins/MGPUScaling/src/upscaler/Upscaling.cpp
+index b9d8e3c..1e37800 100644
 --- a/plugins/Upscaling/src/Upscaling.cpp
-+++ b/plugins/Upscaling/src/Upscaling.cpp
-@@ -371,9 +371,13 @@ void Upscaling::LoadSettings()
++++ b/plugins/MGPUScaling/src/upscaler/Upscaling.cpp
+@@ -3,6 +3,19 @@
+ #include <algorithm>
+ #include <SimpleIni.h>
+ 
++#include "MGPUScaling.h"
++
++// The frame-generation part of this plugin (SecondaryUpscale.cpp) runs FSR 4.1 on the second GPU.
++extern "C" bool FGGPU1_SecondaryUpscalerReady(uint32_t a_renderWidth, uint32_t a_renderHeight);
++extern "C" void FGGPU1_SetSecondaryUpscale(bool a_active, uint32_t a_renderWidth, uint32_t a_renderHeight, float a_jitterX,
++	float a_jitterY, float a_sharpness);
++
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ extern bool enbLoaded;
+ 
+ /** @brief Hook for updating jitter, dynamic resolution, and resources */
+@@ -371,11 +384,15 @@ void Upscaling::LoadSettings()
  {
  	CSimpleIniA ini;
  	ini.SetUnicode();
-+	// Shipped defaults first, then the user's MCM changes (the frame-generation plugin reads the
-+	// same two files in the same order to size its buffers for kSecondaryGPU).
-+	ini.LoadFile("Data\\MCM\\Config\\Upscaling\\settings.ini");
- 	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
+-	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
++	// Shipped defaults first, then the user's MCM changes (the frame-generation part reads the same
++	// section the same way to size its buffers for kSecondaryGPU).
++	mgpu::LoadSettings(ini);
++	const char* section = mgpu::kUpscalingSection;
  
 -	settings.upscaleMethodPreference = static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2));
-+	settings.upscaleMethodPreference = std::min(static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2)),
+-	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
+-	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", 0.5)), 0.0f, 1.0f);
++	settings.upscaleMethodPreference = std::min(static_cast<uint>(ini.GetLongValue(section, "iUpscaleMethodPreference", 2)),
 +		static_cast<uint>(UpscaleMethod::kSecondaryGPU));
- 	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
- 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", 0.5)), 0.0f, 1.0f);
++	settings.qualityMode = static_cast<uint>(ini.GetLongValue(section, "iQualityMode", 1));
++	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue(section, "fSharpness", 0.5)), 0.0f, 1.0f);
  
-@@ -945,6 +949,11 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
+ 	REX::INFO("[SETTINGS] Loaded: upscaleMethod={}, qualityMode={}, sharpness={:.2f}",
+ 		settings.upscaleMethodPreference, settings.qualityMode, settings.sharpness);
+@@ -945,6 +962,11 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
  
  	UpscaleMethod currentUpscaleMethod = (UpscaleMethod)settings.upscaleMethodPreference;
  
@@ -5866,7 +7132,7 @@ index b9d8e3c..38aaf2d 100644
  	// If DLSS is not available, default to FSR
  	if (!streamline->featureDLSS && currentUpscaleMethod == UpscaleMethod::kDLSS) {
  		static bool loggedDLSSFallback = false;
-@@ -968,7 +977,7 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
+@@ -968,7 +990,7 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
  
  	static bool loggedOnce = false;
  	if (!loggedOnce && !a_checkMenu) {
@@ -5875,7 +7141,7 @@ index b9d8e3c..38aaf2d 100644
  			static_cast<uint>(currentUpscaleMethod), settings.upscaleMethodPreference, enbLoaded, streamline->featureDLSS);
  		loggedOnce = true;
  	}
-@@ -993,7 +1002,7 @@ void Upscaling::CheckResources()
+@@ -993,7 +1015,7 @@ void Upscaling::CheckResources()
  
  	// Detect when upscaling method changes and manage resources accordingly
  	if (previousUpscaleMethodNoMenu != upscaleMethodNoMenu) {
@@ -5884,7 +7150,43 @@ index b9d8e3c..38aaf2d 100644
  			static_cast<uint>(previousUpscaleMethodNoMenu), static_cast<uint>(upscaleMethodNoMenu));
  		// Clean up resources from the previous upscaling method
  		if (previousUpscaleMethodNoMenu == UpscaleMethod::kDisabled)
-@@ -1129,7 +1138,8 @@ void Upscaling::UpdateUpscaling()
+@@ -1017,7 +1039,7 @@ ID3D11ComputeShader* Upscaling::GetDilateMotionVectorCS()
+ {
+ 	if (!dilateMotionVectorCS) {
+ 		REX::DEBUG("Compiling DilateMotionVectorCS.hlsl");
+-		dilateMotionVectorCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/DilateMotionVectorCS.hlsl", {}, "cs_5_0"));
++		dilateMotionVectorCS.attach((ID3D11ComputeShader*)Util::CompileShader(MGPU_SHADER(L"DilateMotionVectorCS.hlsl"), {}, "cs_5_0"));
+ 	}
+ 	return dilateMotionVectorCS.get();
+ }
+@@ -1026,7 +1048,7 @@ ID3D11ComputeShader* Upscaling::GetOverrideLinearDepthCS()
+ {
+ 	if (!overrideLinearDepthCS) {
+ 		REX::DEBUG("Compiling OverrideLinearDepthCS.hlsl");
+-		overrideLinearDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/OverrideLinearDepthCS.hlsl", {}, "cs_5_0"));
++		overrideLinearDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(MGPU_SHADER(L"OverrideLinearDepthCS.hlsl"), {}, "cs_5_0"));
+ 	}
+ 	return overrideLinearDepthCS.get();
+ }
+@@ -1035,7 +1057,7 @@ ID3D11ComputeShader* Upscaling::GetOverrideDepthCS()
+ {
+ 	if (!overrideDepthCS) {
+ 		REX::DEBUG("Compiling OverrideDepthCS.hlsl");
+-		overrideDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/OverrideDepthCS.hlsl", {}, "cs_5_0"));
++		overrideDepthCS.attach((ID3D11ComputeShader*)Util::CompileShader(MGPU_SHADER(L"OverrideDepthCS.hlsl"), {}, "cs_5_0"));
+ 	}
+ 	return overrideDepthCS.get();
+ }
+@@ -1044,7 +1066,7 @@ ID3D11PixelShader* Upscaling::GetBSImagespaceShaderSSLRRaytracing()
+ {
+ 	if (!BSImagespaceShaderSSLRRaytracing) {
+ 		REX::DEBUG("Compiling BSImagespaceShaderSSLRRaytracing.hlsl");
+-		BSImagespaceShaderSSLRRaytracing.attach((ID3D11PixelShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/BSImagespaceShaderSSLRRaytracing.hlsl", {}, "ps_5_0"));
++		BSImagespaceShaderSSLRRaytracing.attach((ID3D11PixelShader*)Util::CompileShader(MGPU_SHADER(L"BSImagespaceShaderSSLRRaytracing.hlsl"), {}, "ps_5_0"));
+ 	}
+ 	return BSImagespaceShaderSSLRRaytracing.get();
+ }
+@@ -1129,7 +1151,8 @@ void Upscaling::UpdateUpscaling()
  	// Example: 0.67 scale -> log2(0.67) = -0.58
  	float currentMipBias = std::log2f(resolutionScale);
  
@@ -5894,7 +7196,7 @@ index b9d8e3c..38aaf2d 100644
  		currentMipBias -= 1.0f;
  
  	UpdateSamplerStates(currentMipBias);
-@@ -1168,14 +1178,91 @@ void Upscaling::UpdateUpscaling()
+@@ -1168,14 +1191,65 @@ void Upscaling::UpdateUpscaling()
  	Util::SetDynamicResolution(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio,
  		originalDynamicWidthRatio != 1.0f || originalDynamicHeightRatio != 1.0f);
  
@@ -5921,29 +7223,10 @@ index b9d8e3c..38aaf2d 100644
 +		return;
 +	resolved = true;
 +
-+	HMODULE frameGeneration = GetModuleHandleW(L"AAAFrameGeneration.dll");
-+	if (!frameGeneration) {
-+		REX::WARN("[UPSCALE] FSR 4.1 on the second GPU needs AAAFrameGeneration.dll (FG-GPU1 build), which is not loaded; "
-+				  "rendering at native resolution");
-+		return;
-+	}
-+	using VersionFn = uint32_t (*)();
-+	const auto version = reinterpret_cast<VersionFn>(GetProcAddress(frameGeneration, "FGGPU1_UpscaleApiVersion"));
-+	if (!version || version() != kApiVersion) {
-+		REX::WARN("[UPSCALE] AAAFrameGeneration.dll does not offer upscaling on the second GPU (version {}, need {}); "
-+				  "install the matching FG-GPU1 build. Rendering at native resolution",
-+			version ? version() : 0, kApiVersion);
-+		return;
-+	}
-+	ready = reinterpret_cast<ReadyFn>(GetProcAddress(frameGeneration, "FGGPU1_SecondaryUpscalerReady"));
-+	setFrame = reinterpret_cast<SetFrameFn>(GetProcAddress(frameGeneration, "FGGPU1_SetSecondaryUpscale"));
-+	if (!Available()) {
-+		ready = nullptr;
-+		setFrame = nullptr;
-+		REX::WARN("[UPSCALE] AAAFrameGeneration.dll is missing an FG-GPU1 export; rendering at native resolution");
-+		return;
-+	}
-+	REX::INFO("[UPSCALE] FSR 4.1 on the second GPU: connected to AAAFrameGeneration.dll");
++	// Same DLL: the frame-generation part answers directly (it was AAAFrameGeneration.dll's exports).
++	ready = &::FGGPU1_SecondaryUpscalerReady;
++	setFrame = &::FGGPU1_SetSecondaryUpscale;
++	REX::INFO("[UPSCALE] FSR 4.1 on the second GPU: handled by the frame-generation part of this plugin");
 +}
 +
 +bool Upscaling::SecondaryGPUReady()
@@ -5959,17 +7242,10 @@ index b9d8e3c..38aaf2d 100644
 +	static int previous = -1;
 +	if (previous != static_cast<int>(ready)) {
 +		REX::INFO("[UPSCALE] FSR 4.1 on the second GPU {}", ready ? "is ready: rendering at the quality mode's resolution" :
-+																	"is not ready (see AAAFrameGeneration.log): rendering at native resolution");
++																	"is not ready (see the [FSR4] lines): rendering at native resolution");
 +		previous = static_cast<int>(ready);
 +	}
 +	return ready;
-+}
-+
-+// FG-GPU1: the frame-generation plugin checks that this Upscaling.dll knows kSecondaryGPU before
-+// it sizes its buffers for it.
-+extern "C" __declspec(dllexport) uint32_t FO4Upscaling_SecondaryGPUApiVersion()
-+{
-+	return Upscaling::SecondaryGPU::kApiVersion;
 +}
 +
  void Upscaling::Upscale()
@@ -5978,7 +7254,7 @@ index b9d8e3c..38aaf2d 100644
  		return;
  
 +	// FG-GPU1: the frame buffer keeps the render-resolution scene in its top-left corner. The
-+	// frame-generation plugin's hook on this call copies it out for the second GPU and fills the
++	// frame-generation part's hook on this call copies it out for the second GPU and fills the
 +	// frame buffer for the UI, whichever of the two hooks runs first.
 +	if (upscaleMethod == UpscaleMethod::kSecondaryGPU)
 +		return;
@@ -5986,11 +7262,33 @@ index b9d8e3c..38aaf2d 100644
  	static auto rendererData = RE::BSGraphics::GetRendererData();
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  
-diff --git a/plugins/Upscaling/src/Upscaling.h b/plugins/Upscaling/src/Upscaling.h
-index d99a9c1..3e212f1 100644
+@@ -1322,3 +1396,5 @@ void Upscaling::PatchSSRShader()
+ 	// Replace the game's SSR pixel shader with our custom one that fixes scaled render targets
+ 	context->PSSetShader(GetBSImagespaceShaderSSLRRaytracing(), nullptr, 0);
+ }
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/Upscaling.h b/plugins/MGPUScaling/src/upscaler/Upscaling.h
+similarity index 83%
+copy from plugins/Upscaling/src/Upscaling.h
+copy to plugins/MGPUScaling/src/upscaler/Upscaling.h
+index d99a9c1..c89fc4f 100644
 --- a/plugins/Upscaling/src/Upscaling.h
-+++ b/plugins/Upscaling/src/Upscaling.h
-@@ -64,18 +64,62 @@ public:
++++ b/plugins/MGPUScaling/src/upscaler/Upscaling.h
+@@ -10,6 +10,12 @@
+ #include <vector>
+ #include <winrt/base.h>
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ const uint renderTargetsPatch[] = { 20, 57, 24, 25, 23, 58, 59, 28, 3, 9, 60, 61, 4, 29, 1, 36, 37, 22, 10, 11, 7, 8, 64, 14, 16 };
+ 
+ /**
+@@ -64,18 +70,60 @@ public:
  	 */
  	enum class UpscaleMethod
  	{
@@ -6008,21 +7306,19 @@ index d99a9c1..3e212f1 100644
 +	// ========================================
 +
 +	/**
-+	 * @brief The frame-generation plugin's side of kSecondaryGPU
++	 * @brief The frame-generation part's side of kSecondaryGPU
 +	 *
-+	 * AAAFrameGeneration.dll (FG-GPU1 build) exports these. This plugin keeps doing everything
-+	 * that makes a frame upscalable (render scale, jitter, TAA off, mip bias, the dynamic
-+	 * resolution fixes) and skips its own upscale; the frame-generation plugin sends the
-+	 * render-resolution scene to the second GPU, runs FSR 4.1 there and fills the full-size
-+	 * frame buffer for the UI. Without it (or before its FSR 4.1 context exists) the method
-+	 * falls back to native resolution with TAA.
++	 * The frame-generation part of this plugin implements these (SecondaryUpscale.cpp). The
++	 * upscaler keeps doing everything that makes a frame upscalable (render scale, jitter, TAA
++	 * off, mip bias, the dynamic resolution fixes) and skips its own upscale; the frame-generation
++	 * part sends the render-resolution scene to the second GPU, runs FSR 4.1 there and fills the
++	 * full-size frame buffer for the UI. Until its FSR 4.1 context exists the method falls back
++	 * to native resolution with TAA.
 +	 */
 +	struct SecondaryGPU
 +	{
 +		using ReadyFn = bool (*)(uint32_t, uint32_t);
 +		using SetFrameFn = void (*)(bool, uint32_t, uint32_t, float, float, float);
-+
-+		static constexpr uint32_t kApiVersion = 1;
 +
 +		bool resolved = false;
 +		ReadyFn ready = nullptr;
@@ -6057,3 +7353,71 @@ index d99a9c1..3e212f1 100644
  		uint qualityMode = 1;									   ///< Quality mode: 0=Native AA, 1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance
  		float sharpness = 0.5f;									   ///< Post-upscale sharpening: 0.0=off, 1.0=max
  	};
+@@ -85,7 +133,8 @@ public:
+ 	/**
+ 	 * @brief Load settings from MCM configuration file
+ 	 *
+-	 * Reads Data/MCM/Settings/Upscaling.ini and updates the settings struct
++	 * Reads the [Upscaling] section of Data/MCM/Settings/MGPUScaling.ini (over the shipped
++	 * defaults) and updates the settings struct
+ 	 */
+ 	void LoadSettings();
+ 
+@@ -365,3 +414,5 @@ private:
+ 	winrt::com_ptr<ID3D11ComputeShader> overrideDepthCS;             ///< Depth copy shader
+ 	winrt::com_ptr<ID3D11PixelShader> BSImagespaceShaderSSLRRaytracing;  ///< Custom SSR shader
+ };
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/Util.cpp b/plugins/MGPUScaling/src/upscaler/Util.cpp
+similarity index 91%
+copy from plugins/Upscaling/src/Util.cpp
+copy to plugins/MGPUScaling/src/upscaler/Util.cpp
+index 7a394d5..8e11393 100644
+--- a/plugins/Upscaling/src/Util.cpp
++++ b/plugins/MGPUScaling/src/upscaler/Util.cpp
+@@ -3,6 +3,12 @@
+ #include <d3dcompiler.h>
+ #include <winrt/base.h>
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ namespace Util
+ {
+ 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program)
+@@ -75,3 +81,5 @@ namespace Util
+ 		return nullptr;
+ 	}
+ }
++
++}  // namespace up
+diff --git a/plugins/Upscaling/src/Util.h b/plugins/MGPUScaling/src/upscaler/Util.h
+similarity index 92%
+copy from plugins/Upscaling/src/Util.h
+copy to plugins/MGPUScaling/src/upscaler/Util.h
+index e677c88..f8725dd 100644
+--- a/plugins/Upscaling/src/Util.h
++++ b/plugins/MGPUScaling/src/upscaler/Util.h
+@@ -2,6 +2,12 @@
+ 
+ #include <d3d11.h>
+ 
++// MGPU Scaling: FO4Upscaling's Upscaling plugin, merged into this DLL. Its own namespace keeps
++// its classes (Upscaling, FidelityFX, Streamline, Buffer.h, DX11Hooks) apart from the
++// frame-generation part's classes of the same names.
++namespace up
++{
++
+ namespace Util
+ {
+ 
+@@ -132,3 +138,5 @@ namespace Util
+ 
+ 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program = "main");
+ }
++
++}  // namespace up
