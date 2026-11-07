@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Buffer.h"
+#include "FrameSlots.h"
 
 #include "SimpleIni.h"
 
@@ -33,6 +34,7 @@ public:
 		int fsrRuntime = 1;              ///< 0 FidelityFX SDK 1.1.4 (FSR 3.1.4), 1 FSR SDK 2.4 (newest provider offered)
 		int fsrSwapChainProvider = 0;    ///< SDK 2.4 only: 0 newest offered, 1 newest 3.x (A/B against 4.0.0 pacing)
 		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
+		bool extraFrameInFlight = false; ///< Second-GPU mode: 3 swap-chain buffers instead of 2 (FrameSlots.h); restart
 	};
 
 	Settings settings;
@@ -65,7 +67,7 @@ public:
 	UINT laneWidth = 0;
 	UINT laneHeight = 0;
 	// PostDisplay copied this frame's scene for the second GPU (per frameIndex, cleared at Present).
-	bool frameUpscaled[2] = { false, false };
+	bool frameUpscaled[kMaxFrameSlots] = {};
 	// Render GPU: the full-size frame buffer is filled from the scene before the UI is drawn.
 	Texture2D* sceneBlitTarget = nullptr;
 	ID3D11ComputeShader* sceneBlitCS = nullptr;
@@ -78,15 +80,16 @@ public:
 	bool d3d12Interop = false;
 	double refreshRate = 0.0f;
 
-	Texture2D* HUDLessBufferShared[2];
-	Texture2D* depthBufferShared[2];
-	Texture2D* motionVectorBufferShared[2];
-	Texture2D* UIColorAlphaShared[2];
+	// One per frame in flight (DX12SwapChain::frameSlots), indexed by frameIndex.
+	Texture2D* HUDLessBufferShared[kMaxFrameSlots]{};
+	Texture2D* depthBufferShared[kMaxFrameSlots]{};
+	Texture2D* motionVectorBufferShared[kMaxFrameSlots]{};
+	Texture2D* UIColorAlphaShared[kMaxFrameSlots]{};
 
-	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[2];
-	winrt::com_ptr<ID3D12Resource> depthBufferShared12[2];
-	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[2];
-	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[2];
+	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[kMaxFrameSlots];
+	winrt::com_ptr<ID3D12Resource> depthBufferShared12[kMaxFrameSlots];
+	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[kMaxFrameSlots];
+	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[kMaxFrameSlots];
 
 	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
 	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;

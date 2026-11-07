@@ -2,7 +2,75 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
-## Latest (2026-11-07): MGPU Scaling = one DLL; HDR/AutoHDR works in game; CS crash still to A/B
+**Next session: start with [plans/UI-TILES.md](plans/UI-TILES.md)** (send only the finished frame's
+UI tiles in FSR 4.1 mode, new setting `bSendUITilesOnly`), then measure; only then
+[plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread, `bDisplayThread`).
+Both aim at the last 3-4 fps to the 71 cap with Community Shaders on (66.6-68.5 now with
+`bExtraFrameInFlight = 1`). The user asked for both as optional settings.
+
+## Latest (2026-11-07, 16:1x): bExtraFrameInFlight measured: +4–5 base fps with CS
+
+Logs saved in the session scratchpad (`runs/MGPUScaling-2slots.log`, `-3slots.log`). CS on
+(telemetry too), same build. Clean 10 s gameplay windows:
+
+| | 2 frames in flight (16:08) | 3 frames in flight (16:12–16:13) |
+|---|---|---|
+| game / presented fps | 62.9 / 125.8 | 66.6–68.5 / 133–137 |
+| 3090 idle between frames | ~3.2 ms (window had a loading outlier, removed by hand) | 2.2–2.6 ms |
+| 3090 first command → frame end | ~12.6 ms | 12.0–12.8 ms |
+| FFX Present block | 6.9 ms | 3.6–5.6 ms |
+| timeline after Present | copy 5.8–12.2, list end 15.8 | copy 3.1–5.9 → 9.3–12.3, list end 12.9–15.9 |
+
+User: "a noticeable improvement... I think". The 3090 still idles ~2.4 ms per frame. The rest of the
+block is FFX itself (`FrameInterpolationSwapchainDX12.cpp:2188`): Present first waits on
+`compositionFenceCPU` for every frame already sent, i.e. until the presenter thread composited the
+previous *real* frame, which it does only after pacing out the generated one (`:744–795`). That is
+independent of the buffer count (the buffer wait at the end of Present is what 3 buffers removed).
+So the remaining coupling is the chain length: 3090 done ~+5 → copies until ~+11.4 (the 33 MB
+finished frame is last) → 9060 read done ~+13.9 → composite/FG prepare ~+15 → interpolation → paced
+generated frame → real-frame composite. Options: (A) shorten it — send only the UI tiles of the
+finished frame in FSR 4.1 mode (it is only needed for the UI; ~5 ms of copy + read at the tail);
+(B) decouple — run the display GPU side (unpack, composite, FFX configure/prepare, FFX Present) on
+its own thread so the game thread never waits in FFX Present (bridge B-side state then needs
+locking; per-frame camera/jitter captured on the game thread). Timer now leaves out samples over
+100 ms (loading) and says how many.
+
+## Earlier (2026-11-07, 16:0x): 3090 idle timer + bExtraFrameInFlight (built 16:01)
+
+**Question:** 61–63 base with CS on (71 without CS, capped; 71 with CS and no MGPU, no FG). From the
+15:37 log: copy 5.95 ms on the 3090's copy engine, `D3D11 gate pending 0/633`, `cpu waits 0` (the
+copy never stalls the 3090); timeline `3090 copy 5.0-11.3 | 9060 unpack 6.2-13.8 | 9060 list
+14.1-14.9` vs 5.3–8.2 ms list end without CS (20:32 run); `FFX Present` block 5.9–6.6 ms avg vs
+0.2–3.1 without CS. With 2 FFX buffers, Present(N) waits for N-1 on screen, so the cycle is roughly
+(chain latency + CPU time) / 2; CS makes the 3090 finish ~5 ms after Present and the whole chain
+moves out. Not yet known whether the 3090 is saturated or idling, hence:
+- **`RenderGpuTimer`** (DX12SwapChain.h/.cpp): D3D11 timestamps (+ disjoint) on the game's context
+  at the top of Present (frame end), at the last line of Present (first command of the next frame,
+  executed only when the GPU gets that work) and at the next frame's end; ring of 8, read with
+  DONOTFLUSH. New 10 s line: `[FG-GPU1] render GPU: idle between frames avg … | frame from its first
+  command to its end avg …`. Idle includes frame-limiter sleep (at the cap it is headroom).
+- **`bExtraFrameInFlight`** ([FrameGeneration], MCM Second GPU page, restart, second-GPU mode only):
+  `FrameSlots.h` `kMaxFrameSlots = 3`; `DX12SwapChain::frameSlots` set in DX11Hooks before the
+  devices (3 with the option); FFX `BufferCount`, command lists, D3D11 shared back-buffer copies,
+  FG lanes (`HUDLessBufferShared*`, depth, MVs, UIColorAlpha), bridge (`Initialize(..., a_slots)`,
+  `SlotCount()`, `AddLane` takes an array, heap size/mirrors/depth rebuild per slot) and
+  `SecondaryUpscale` (`Slots()`, outputs/descriptors) all follow it. Arrays sized 3, only the used
+  slots created. XeSS/DLSS-G keep 2.
+
+**CS resolution question (answered from source, not measured):** CS sizes passes as its own
+full-size texture × the engine's dynamic-resolution ratio (`GetDynamicWidthRatio`); telemetry
+`working=3840x2160` is only the allocation. Our upscaler sets the ratio to 0.667 for the frame and
+forces 1.0 only around the call at `DrawWorld::DeferredComposite+0x915` (with 1440p proxy targets,
+so that pass runs at 1440p). CS's dispatches run before it (pre-composite at the function entry, SSS
+at the t15 bind `+0x812`), so they should already be at 1440p — same as FO4Upscaling on one GPU.
+User-side check: toggle SSGI/SSS live and watch base fps.
+
+**Next test:** CS on, same spot. (1) `bExtraFrameInFlight = 0`: read the `render GPU: idle` line.
+(2) `= 1`, restart: base fps, idle line, `FFX Present` block, feel of input latency. Expect
+`[FG-GPU1] 3 frames in flight (bExtraFrameInFlight) ...` at startup; the lane lines show a larger
+total only through the heaps (they print per-frame bytes, unchanged).
+
+## Earlier (2026-11-07): MGPU Scaling = one DLL; HDR/AutoHDR works in game; CS crash solved
 
 **Verified in game (15:19, the 15:15 build, AutoHDR on, Community Shaders off, doodlum's leftover
 `Upscaling.dll` removed):** user: "works perfectly". Log: `[FSR] the swap chain was created as

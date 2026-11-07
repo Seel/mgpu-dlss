@@ -263,6 +263,14 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 
 				auto proxy = DX12SwapChain::GetSingleton();
 
+				// Frames in flight (FrameSlots.h): fixed before any per-frame resource exists.
+				proxy->frameSlots = useSecondaryGPU && upscaling->settings.extraFrameInFlight ? 3u : 2u;
+				if (upscaling->settings.extraFrameInFlight && !useSecondaryGPU)
+					REX::INFO("[FG] bExtraFrameInFlight is only used with bFrameGenOnSecondaryGPU = 1; 2 frames in flight");
+				else if (proxy->frameSlots == 3)
+					REX::INFO("[FG-GPU1] 3 frames in flight (bExtraFrameInFlight): the game waits for the frame before the "
+							  "previous one to be shown, not the previous one; one frame more latency");
+
 				proxy->SetD3D11Device(*ppDevice);
 
 				ID3D11DeviceContext* context;

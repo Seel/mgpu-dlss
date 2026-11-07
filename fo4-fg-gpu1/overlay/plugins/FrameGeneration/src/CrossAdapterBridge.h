@@ -46,6 +46,8 @@
 #include <string>
 #include <vector>
 
+#include "FrameSlots.h"
+
 class CrossAdapterBridge
 {
 public:
@@ -56,7 +58,7 @@ public:
 	//   kPresent  the finished frame, final only at Present
 	enum class LaneTiming : std::uint8_t { kWorld = 0, kHudless = 1, kPresent = 2 };
 
-	static constexpr UINT kSlots = 2;     // AAAFrameGeneration double-buffers every input by frameIndex
+	static constexpr UINT kSlots = kMaxFrameSlots;  // per-frame inputs, indexed by frameIndex; SlotCount() in use
 	static constexpr UINT kMaxLanes = 8;  // per-lane transfer fence values are allocated in submission order
 
 	// Timestamp marks on B's direct list (MarkDisplayList).
@@ -96,8 +98,10 @@ public:
 	// a_deviceA: on the game's adapter. a_deviceB: on the secondary adapter.
 	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).
 	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
+	// a_slots: frames in flight (the FFX swap chain's buffer count), 2 or 3.
 	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack);
+		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots);
+	[[nodiscard]] UINT SlotCount() const noexcept { return slotCount; }
 
 	// Once B's direct queue (the FFX game queue) exists. Enables its timestamps and the
 	// fence that tells the unpack when the previous frame's direct-queue work is done.
@@ -106,13 +110,13 @@ public:
 	[[nodiscard]] bool IsActive() const noexcept { return active; }
 	[[nodiscard]] bool IsAsyncUnpack() const noexcept { return asyncUnpack; }
 
-	// Registers one double-buffered input. a_sourcesA[slot] are single-subresource
+	// Registers one per-frame input. a_sources[slot] (SlotCount() of them) are single-subresource
 	// textures on device A. With a_createMirror, same-sized textures are created on
 	// device B and returned by Mirror(); without it, the caller names a destination
 	// (the back buffer) per frame. Returns the lane index, or -1 (logged; the bridge
 	// is deactivated).
-	int AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
-		bool a_createMirror, LaneTiming a_timing = LaneTiming::kPresent);
+	int AddLane(const char* a_name, const std::array<ID3D12Resource*, kSlots>& a_sources, bool a_createMirror,
+		LaneTiming a_timing = LaneTiming::kPresent);
 
 	[[nodiscard]] ID3D12Resource* Mirror(int a_lane, UINT a_slot) const noexcept;
 
@@ -369,6 +373,7 @@ private:
 
 	HANDLE fenceEvent = nullptr;
 
+	UINT slotCount = 2;                                  // frames in flight (Initialize)
 	UINT currentSlot = 0;                                // slot of the latest Transfer
 	UINT64 transferValue = 0;                            // frame number of the latest Transfer
 	std::array<UINT64, kSlots> slotTransfer{};           // frame that last used each slot

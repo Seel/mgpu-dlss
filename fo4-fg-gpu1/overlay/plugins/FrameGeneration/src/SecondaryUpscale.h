@@ -33,10 +33,12 @@
 #include <array>
 #include <cstdint>
 
+#include "FrameSlots.h"
+
 class SecondaryUpscale
 {
 public:
-	static constexpr UINT kSlots = 2;
+	static constexpr UINT kSlots = kMaxFrameSlots;  // arrays; the session uses Slots() of them
 
 	static SecondaryUpscale* GetSingleton()
 	{
@@ -74,6 +76,8 @@ public:
 	// (CreateFrameGenerationResources). BindLanes false (logged) means frames cannot be upscaled.
 	void SetFinalLane(int a_lane);
 	[[nodiscard]] bool HasFinalMirror() const noexcept;
+	// Frames in flight this session (the bridge's slots).
+	[[nodiscard]] UINT Slots() const noexcept;
 	bool BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane);
 	void Fail(const char* a_reason);
 

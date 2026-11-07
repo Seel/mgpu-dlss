@@ -2,6 +2,9 @@
 
 #include <dxgi1_6.h>
 
+#include <algorithm>
+#include <format>
+
 #include "CrossAdapterBridge.h"
 #include "FidelityFX.h"
 #include "SecondaryUpscale.h"
@@ -59,7 +62,7 @@ void DX12SwapChain::CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, 
 		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 
 	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-			upscaling->settings.asyncUnpack))
+			upscaling->settings.asyncUnpack, frameSlots))
 		return fallBack("cross-adapter bridge initialisation failed");
 
 	secondaryGPU = true;
@@ -77,7 +80,7 @@ void DX12SwapChain::CreateD3D12CommandQueues()
 
 	DX::ThrowIfFailed(d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue)));
 
-	for (int i = 0; i < 2; i++) {
+	for (UINT i = 0; i < frameSlots; i++) {
 		DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocators[i])));
 		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
 		commandLists[i]->Close();
@@ -111,7 +114,7 @@ void DX12SwapChain::TransferEarlyLanes(CrossAdapterBridge::LaneTiming a_timing)
 void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
 {
 	swapChainDesc = {};
-	swapChainDesc.BufferCount = 2;
+	swapChainDesc.BufferCount = frameSlots;
 	swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
 	swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
 	swapChainDesc.Format = a_swapChainDesc.BufferDesc.Format;
@@ -142,8 +145,8 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
 		CreateSwapChainFSR3(a_dxgiFactory, a_swapChainDesc);
 	}
 
-	DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(&swapChainBuffers[0])));
-	DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(&swapChainBuffers[1])));
+	for (UINT slot = 0; slot < frameSlots; ++slot)
+		DX::ThrowIfFailed(swapChain->GetBuffer(slot, IID_PPV_ARGS(&swapChainBuffers[slot])));
 
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 
@@ -261,17 +264,18 @@ void DX12SwapChain::CreateInterop()
 		swapChainBufferProxy->CreateSRV(proxySrvDesc);
 	}
 
-	swapChainBufferWrapped[0] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
-	swapChainBufferWrapped[1] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
+	for (UINT slot = 0; slot < frameSlots; ++slot)
+		swapChainBufferWrapped[slot] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
 
 	if (secondaryGPU) {
 		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
 		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it. So
 		// it does when the back buffer has another format (HDR add-on): a shader converts it.
 		auto secondaryUpscale = SecondaryUpscale::GetSingleton();
-		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
-			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(),
-			secondaryUpscale->OwnsPresent());
+		std::array<ID3D12Resource*, CrossAdapterBridge::kSlots> sources{};
+		for (UINT slot = 0; slot < frameSlots; ++slot)
+			sources[slot] = swapChainBufferWrapped[slot]->resource.get();
+		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame", sources, secondaryUpscale->OwnsPresent());
 		if (finalFrameLane < 0)
 			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
 		else if (secondaryUpscale->OwnsPresent())
@@ -306,6 +310,10 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
 	auto upscalingForUI = Upscaling::GetSingleton();
+
+	// The game's work for this frame is all recorded: timestamp its end on the render GPU.
+	renderGpuTimer.Collect(d3d11Context.get());
+	renderGpuTimer.FrameEnd(d3d11Device.get(), d3d11Context.get());
 
 	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
 	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
@@ -677,6 +685,8 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			const double presentedFps = static_cast<double>(statPresentedFrames) * 1000.0 / elapsedMs;
 			REX::INFO("[FG-GPU1] presented {:.1f} fps | game {:.1f} fps | generated {:.0f}%", presentedFps, gameFps,
 				presentedFps > 0.0 ? (presentedFps - gameFps) / presentedFps * 100.0 : 0.0);
+			if (const auto gpu = renderGpuTimer.TakeSummary(); !gpu.empty())
+				REX::INFO("[FG-GPU1] render GPU: {}", gpu);
 			statGameFrames = 0;
 			statPresentedFrames = 0;
 			statPresentStart = now;
@@ -733,6 +743,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (SyncInterval == 0 && !upscaling->highFPSPhysicsFixLoaded)
 		upscaling->FrameLimiter(useFrameGenerationThisFrame);
 
+	// Everything the game records from here on is the next frame.
+	renderGpuTimer.NextFrameStart(d3d11Context.get());
+
 	return S_OK;
 }
 
@@ -744,6 +757,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
 	}
 
 	return swapChain->GetDevice(uuid, ppDevice);
+}
+
+// ---------------------------------------------------------------------------------------
+// RenderGpuTimer
+
+bool RenderGpuTimer::Create(ID3D11Device* a_device)
+{
+	D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+	D3D11_QUERY_DESC timestampDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+	for (auto& record : records) {
+		if (FAILED(a_device->CreateQuery(&disjointDesc, record.disjoint.put())) ||
+			FAILED(a_device->CreateQuery(&timestampDesc, record.end.put())) ||
+			FAILED(a_device->CreateQuery(&timestampDesc, record.start.put())) ||
+			FAILED(a_device->CreateQuery(&timestampDesc, record.nextEnd.put()))) {
+			REX::INFO("[FG-GPU1] render GPU timestamps unavailable; its idle time will not be reported");
+			return false;
+		}
+	}
+	return true;
+}
+
+void RenderGpuTimer::FrameEnd(ID3D11Device* a_device, ID3D11DeviceContext* a_context)
+{
+	if (failed || !a_device || !a_context)
+		return;
+	if (!created) {
+		created = true;
+		failed = !Create(a_device);
+		if (failed)
+			return;
+	}
+
+	// Close the record that has been waiting for this frame's end.
+	if (current < kRecords) {
+		auto& record = records[current];
+		if (record.started) {
+			a_context->End(record.nextEnd.get());
+			a_context->End(record.disjoint.get());
+			record.pending = true;
+		} else {
+			a_context->End(record.disjoint.get());  // never started: discard
+		}
+		record.open = false;
+		record.started = false;
+		current = kRecords;
+	}
+
+	// Open the next one, unless its previous use has not been read yet (skip this frame).
+	auto& record = records[next];
+	if (record.pending)
+		return;
+	a_context->Begin(record.disjoint.get());
+	a_context->End(record.end.get());
+	record.open = true;
+	current = next;
+	next = (next + 1) % kRecords;
+}
+
+void RenderGpuTimer::NextFrameStart(ID3D11DeviceContext* a_context)
+{
+	if (failed || current >= kRecords || !a_context)
+		return;
+	auto& record = records[current];
+	if (!record.open || record.started)
+		return;
+	a_context->End(record.start.get());
+	record.started = true;
+}
+
+void RenderGpuTimer::Collect(ID3D11DeviceContext* a_context)
+{
+	if (failed || !a_context)
+		return;
+	for (auto& record : records) {
+		if (!record.pending)
+			continue;
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+		if (a_context->GetData(record.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+			continue;  // not finished yet
+		UINT64 end = 0, start = 0, nextEnd = 0;
+		const bool ready = a_context->GetData(record.end.get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+		                   a_context->GetData(record.start.get(), &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+		                   a_context->GetData(record.nextEnd.get(), &nextEnd, sizeof(nextEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+		if (!ready)
+			continue;
+		record.pending = false;
+		if (disjoint.Disjoint || !disjoint.Frequency || start < end || nextEnd < start)
+			continue;
+		const double toMs = 1000.0 / static_cast<double>(disjoint.Frequency);
+		const double idle = static_cast<double>(start - end) * toMs;
+		const double span = static_cast<double>(nextEnd - start) * toMs;
+		// Loading screens and the first frame after them take seconds; they would swamp the averages.
+		if (idle > 100.0 || span > 100.0) {
+			++skipped;
+			continue;
+		}
+		idleSum += idle;
+		idleMax = (std::max)(idleMax, idle);
+		spanSum += span;
+		spanMax = (std::max)(spanMax, span);
+		++samples;
+		if (idle >= 0.5)
+			++idleFrames;
+	}
+}
+
+std::string RenderGpuTimer::TakeSummary()
+{
+	if (!samples)
+		return {};
+	const double n = static_cast<double>(samples);
+	std::string out = std::format("idle between frames avg {:.2f} ms max {:.2f} ms ({:.0f}% of frames idle >= 0.5 ms) | "
+								  "frame from its first command to its end avg {:.2f} ms max {:.2f} ms ({} frames measured{})",
+		idleSum / n, idleMax, 100.0 * static_cast<double>(idleFrames) / n, spanSum / n, spanMax, samples,
+		skipped ? std::format(", {} over 100 ms left out", skipped) : std::string{});
+	idleSum = idleMax = spanSum = spanMax = 0.0;
+	samples = idleFrames = skipped = 0;
+	return out;
 }
 
 WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)

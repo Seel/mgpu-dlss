@@ -291,6 +291,15 @@
 					}
 				},
 				{
+					"id": "bExtraFrameInFlight:FrameGeneration",
+					"text": "Extra Frame in Flight (restart)",
+					"type": "switcher",
+					"help": "Three frames in flight instead of two. With two, the game cannot start a frame until the one before the previous is through the whole chain (render GPU, PCIe copy, second GPU, frame generation, pacing) and on screen, so a slow chain lowers the frame rate even when the render GPU has time to spare. With three it waits one frame less often. Costs one frame of input latency. The log line \"render GPU: idle between frames\" shows whether the render GPU is waiting. Requires a game restart. (Default: Off)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
 					"text": "",
 					"type": "text"
 				},

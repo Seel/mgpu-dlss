@@ -33,6 +33,7 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 | `build-local.ps1` | Builds and packages the mod on this PC with the installed Visual Studio |
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
+| `plans/` | Planned work not started yet: `UI-TILES.md` (send only the UI tiles of the finished frame), `DISPLAY-THREAD.md` (FFX Present on its own thread) |
 | `../.github/workflows/fo4-fg-gpu1.yml` | GitHub Actions build (seen from this folder) |
 
 The changes:
@@ -41,6 +42,7 @@ The changes:
 - `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` are small edits.
 - `plugins/MGPUScaling/src/upscaler/` is FO4Upscaling's `Upscaling` plugin, wrapped in `namespace up` (its classes have the same names as the frame-generation part's) and patched: upscale method 3 renders for the second GPU's FSR 4.1. Its entry point is `Upscaler.cpp`.
 - `plugins/MGPUScaling/src/XSEPlugin.cpp` replaces both plugins' entry points and installs their hooks in the order the two DLLs did (see the comment there); `MGPUScaling.h/.cpp` hold the paths, the settings loader and the one-time settings migration.
+- `FrameSlots.h`: frames in flight, 2 or 3 (`bExtraFrameInFlight`); every per-frame resource is sized from it.
 - `include/PCH.h`: `stl::detour_thunk` chains behind a function another plugin hooked first instead of copying that plugin's jump unrelocated (Community Shaders' frame annotations crashed the game otherwise).
 - The top-level `CMakeLists.txt` adds the `MGPUScaling` target and drops `AAAFrameGeneration`; MCM's `config.json`/`settings.ini` are one page set with `[FrameGeneration]` and `[Upscaling]` sections.
 
@@ -91,6 +93,7 @@ bAsyncUnpack = 1             ; 1 = 9060 reads on a copy queue, lane by lane (def
 bEarlyTransfer = 1           ; 1 = depth/MVs/HUD-less cross during the frame (default); 0 = all at Present
 bEarlyUnpack = 1             ; 1 = the 9060 reads them as they land, before Present (default); 0 = reads queued at Present
 iHalfResDepthMV = 1          ; 0 = full res; 1 = half-res depth, rebuilt on the 9060 (default); 2 = half-res depth + MVs
+bExtraFrameInFlight = 0      ; 1 = 3 frames in flight instead of 2: more throughput when the chain, not the 3090, limits; +1 frame latency (restart)
 iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
 iFSRRuntime = 1              ; 0 = FidelityFX SDK 1.1.4 (FSR 3.1.4); 1 = FSR SDK 2.4, newest provider offered (default)
 iFSRSwapChainProvider = 0    ; SDK 2.4: 0 = newest swap chain (4.0.0 on RX 9000); 1 = newest 3.x (3.1.7), for A/B
@@ -205,6 +208,20 @@ Three more lines every 10 s show where a frame's time goes:
   the transfer → 9060 → present chain, not by its own rendering.
 - **D3D11 gate pending:** how often the 3090's next frame had to queue behind a copy that was
   still running. Should be ~0.
+
+One more line, from GPU timestamps on the 3090 itself:
+
+```
+[FG-GPU1] render GPU: idle between frames avg 2.40 ms max 6.10 ms (95% of frames idle >= 0.5 ms) | frame from its first command to its end avg 13.10 ms max 15.20 ms (620 frames measured)
+```
+
+- **idle between frames:** how long the 3090 had nothing to do between finishing a frame and
+  receiving the first work of the next one, i.e. while the game sat in Present, simulated the
+  next frame, or slept in a frame limiter. Near 0 below the frame cap means the 3090 itself is the
+  limit; several ms below the cap means it is waiting (for the chain, or for the CPU). At the
+  frame cap it is simply the headroom.
+- **frame from its first command to its end:** the 3090's time per frame once work arrives
+  (includes gaps inside the frame where the CPU had not sent the next draws yet).
 
 With `iHalfResDepthMV = 1` one more line appears:
 
@@ -388,6 +405,14 @@ Until then the game's render thread, and therefore the 3090, gets no new work. E
 "3090 finished frame N-1" and "frame N-1 presented" (copy, read, FSR3, pacing) is on the critical
 path. That is why `bAsyncUnpack` streams the buffers lane by lane: the 9060's read overlaps the
 3090's copy instead of following it. See SESSION-NOTES.md for the numbers.
+
+`bExtraFrameInFlight = 1` gives the FFX swap chain three back buffers, and every per-frame resource
+a third slot. Present for frame N then waits for frame N-2 instead of N-1, so the chain's latency
+stops setting the frame rate as long as it fits in two frame times; the limit becomes the slowest
+single stage (the 3090, the CPU, the copy engine or the 9060). The price is one frame more between
+input and screen (~14 ms at 71 fps), and one more slot of every lane (~75 MB of staging memory and
+~75 MB on each GPU at 4K Quality). Worth it when `render GPU: idle between frames` shows the 3090
+waiting several ms per frame below the frame cap; useless when the 3090 itself is at its limit.
 
 ## Known risks / first things to check
 

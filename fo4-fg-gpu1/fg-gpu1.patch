@@ -313,10 +313,10 @@ index 0000000..f51b7b6
 +}
 diff --git a/package/MCM/Config/MGPUScaling/config.json b/package/MCM/Config/MGPUScaling/config.json
 new file mode 100644
-index 0000000..e1d7967
+index 0000000..5532bb4
 --- /dev/null
 +++ b/package/MCM/Config/MGPUScaling/config.json
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,406 @@
 +{
 +	"modName": "MGPUScaling",
 +	"displayName": "MGPU Scaling",
@@ -610,6 +610,15 @@ index 0000000..e1d7967
 +					}
 +				},
 +				{
++					"id": "bExtraFrameInFlight:FrameGeneration",
++					"text": "Extra Frame in Flight (restart)",
++					"type": "switcher",
++					"help": "Three frames in flight instead of two. With two, the game cannot start a frame until the one before the previous is through the whole chain (render GPU, PCIe copy, second GPU, frame generation, pacing) and on screen, so a slow chain lowers the frame rate even when the render GPU has time to spare. With three it waits one frame less often. Costs one frame of input latency. The log line \"render GPU: idle between frames\" shows whether the render GPU is waiting. Requires a game restart. (Default: Off)",
++					"valueOptions": {
++						"sourceType": "ModSettingBool"
++					}
++				},
++				{
 +					"text": "",
 +					"type": "text"
 +				},
@@ -716,10 +725,10 @@ index 0000000..e1d7967
 +}
 diff --git a/package/MCM/Config/MGPUScaling/settings.ini b/package/MCM/Config/MGPUScaling/settings.ini
 new file mode 100644
-index 0000000..adf5719
+index 0000000..ebfde4b
 --- /dev/null
 +++ b/package/MCM/Config/MGPUScaling/settings.ini
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,140 @@
 +; MGPU Scaling: shipped defaults. MCM (MGPU Scaling) writes your changes to
 +; Data\MCM\Settings\MGPUScaling.ini, which overrides this file; set keys there by hand too.
 +; On the first start without that file, the plugin copies your settings from the old
@@ -829,6 +838,15 @@ index 0000000..adf5719
 +; Requires restart. Default: 1
 +iHalfResDepthMV = 1
 +
++; [FG-GPU1] Three frames in flight instead of two. FFX's Present for a frame returns only once the
++; frame that used the next back buffer is on screen: with two buffers that is the previous frame, so
++; the game cannot start the next frame until the previous one went through the whole chain (render
++; GPU, PCIe copy, second GPU, frame generation and pacing). If that chain, not the render GPU, holds
++; the frame rate down, three buffers let the render GPU keep working. Costs one frame of input
++; latency. The log line "[FG-GPU1] render GPU: idle between frames" shows how long the render GPU
++; waits each frame. Requires restart. Default: false
++bExtraFrameInFlight = 0
++
 +[Upscaling]
 +; Upscaling reconstructs lower resolutions to the native resolution using advanced algorithms, improving image quality and performance.
 +; AMD Robust Contrast Adaptive Sharpening improves image clarity, even when upscaling is disabled or in 3D menus.
@@ -853,10 +871,10 @@ index 0000000..adf5719
 +bEnableDebugLogging = 0
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..b5a8e63
+index 0000000..0ee5ff4
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,1904 @@
+@@ -0,0 +1,1907 @@
 +#include "CrossAdapterBridge.h"
 +
 +#include <d3dcompiler.h>
@@ -1334,11 +1352,12 @@ index 0000000..b5a8e63
 +// Setup
 +
 +bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-+	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack)
++	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots)
 +{
 +	Shutdown();
 +	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
 +		return false;
++	slotCount = std::clamp(a_slots, 2u, kSlots);
 +
 +	deviceA.copy_from(a_deviceA);
 +	deviceB.copy_from(a_deviceB);
@@ -1469,14 +1488,16 @@ index 0000000..b5a8e63
 +		REX::INFO("[FG-GPU1] display GPU direct-queue timestamps unavailable");
 +}
 +
-+int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
++int CrossAdapterBridge::AddLane(const char* a_name, const std::array<ID3D12Resource*, kSlots>& a_sources,
 +	bool a_createMirror, LaneTiming a_timing)
 +{
 +	if (!active)
 +		return -1;
-+	if (!a_sourceSlot0 || !a_sourceSlot1) {
-+		Fail("AddLane (null source)", E_POINTER);
-+		return -1;
++	for (UINT slot = 0; slot < slotCount; ++slot) {
++		if (!a_sources[slot]) {
++			Fail("AddLane (null source)", E_POINTER);
++			return -1;
++		}
 +	}
 +	if (lanes.size() >= kMaxLanes) {
 +		Fail("AddLane (too many lanes)", E_INVALIDARG);
@@ -1486,9 +1507,9 @@ index 0000000..b5a8e63
 +	Lane lane;
 +	lane.name = a_name;
 +	lane.timing = a_timing;
-+	lane.sourceA[0].copy_from(a_sourceSlot0);
-+	lane.sourceA[1].copy_from(a_sourceSlot1);
-+	lane.desc = a_sourceSlot0->GetDesc();
++	for (UINT slot = 0; slot < slotCount; ++slot)
++		lane.sourceA[slot].copy_from(a_sources[slot]);
++	lane.desc = a_sources[0]->GetDesc();
 +
 +	if (lane.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || lane.desc.MipLevels != 1 ||
 +		lane.desc.DepthOrArraySize != 1 || lane.desc.SampleDesc.Count != 1) {
@@ -1513,7 +1534,7 @@ index 0000000..b5a8e63
 +	lane.bytes = totalA;
 +	lane.slotStride = AlignUp(totalA, kHeapAlignment);
 +
-+	const UINT64 heapSize = lane.slotStride * kSlots;
++	const UINT64 heapSize = lane.slotStride * slotCount;
 +	HRESULT hr = CreateSharedHeapPair(heapSize, lane.heapA, lane.heapB);
 +	if (FAILED(hr)) {
 +		Fail("cross-adapter heap (CreateHeap SHARED | SHARED_CROSS_ADAPTER / OpenSharedHandle)", hr);
@@ -1550,7 +1571,7 @@ index 0000000..b5a8e63
 +		mirrorDesc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
 +		D3D12_HEAP_PROPERTIES defaultHeap{};
 +		defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-+		for (UINT slot = 0; slot < kSlots; ++slot) {
++		for (UINT slot = 0; slot < slotCount; ++slot) {
 +			hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &mirrorDesc,
 +				D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(lane.mirrorB[slot].put()));
 +			if (FAILED(hr)) {
@@ -2326,7 +2347,7 @@ index 0000000..b5a8e63
 +	uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
 +	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 +
-+	for (UINT slot = 0; slot < kSlots; ++slot) {
++	for (UINT slot = 0; slot < slotCount; ++slot) {
 +		// COMMON between uses, like the mirrors: FFX's read promotes it implicitly.
 +		hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &targetDesc,
 +			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(upsampler.target[slot].put()));
@@ -2366,7 +2387,7 @@ index 0000000..b5a8e63
 +	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 +	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 +	srvDesc.Texture2D.MipLevels = 1;
-+	for (UINT slot = 0; slot < kSlots; ++slot) {
++	for (UINT slot = 0; slot < slotCount; ++slot) {
 +		if (!lane.mirrorB[slot]) {
 +			REX::ERROR("[FG-GPU1] depth lane has no mirror on the display GPU; depth rebuild disabled");
 +			return;
@@ -2763,10 +2784,10 @@ index 0000000..b5a8e63
 +}
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
 new file mode 100644
-index 0000000..07df767
+index 0000000..5902ce4
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,416 @@
 +#pragma once
 +
 +// CrossAdapterBridge - frame generation on a second GPU.
@@ -2815,6 +2836,8 @@ index 0000000..07df767
 +#include <string>
 +#include <vector>
 +
++#include "FrameSlots.h"
++
 +class CrossAdapterBridge
 +{
 +public:
@@ -2825,7 +2848,7 @@ index 0000000..07df767
 +	//   kPresent  the finished frame, final only at Present
 +	enum class LaneTiming : std::uint8_t { kWorld = 0, kHudless = 1, kPresent = 2 };
 +
-+	static constexpr UINT kSlots = 2;     // AAAFrameGeneration double-buffers every input by frameIndex
++	static constexpr UINT kSlots = kMaxFrameSlots;  // per-frame inputs, indexed by frameIndex; SlotCount() in use
 +	static constexpr UINT kMaxLanes = 8;  // per-lane transfer fence values are allocated in submission order
 +
 +	// Timestamp marks on B's direct list (MarkDisplayList).
@@ -2865,8 +2888,10 @@ index 0000000..07df767
 +	// a_deviceA: on the game's adapter. a_deviceB: on the secondary adapter.
 +	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).
 +	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
++	// a_slots: frames in flight (the FFX swap chain's buffer count), 2 or 3.
 +	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-+		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack);
++		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots);
++	[[nodiscard]] UINT SlotCount() const noexcept { return slotCount; }
 +
 +	// Once B's direct queue (the FFX game queue) exists. Enables its timestamps and the
 +	// fence that tells the unpack when the previous frame's direct-queue work is done.
@@ -2875,13 +2900,13 @@ index 0000000..07df767
 +	[[nodiscard]] bool IsActive() const noexcept { return active; }
 +	[[nodiscard]] bool IsAsyncUnpack() const noexcept { return asyncUnpack; }
 +
-+	// Registers one double-buffered input. a_sourcesA[slot] are single-subresource
++	// Registers one per-frame input. a_sources[slot] (SlotCount() of them) are single-subresource
 +	// textures on device A. With a_createMirror, same-sized textures are created on
 +	// device B and returned by Mirror(); without it, the caller names a destination
 +	// (the back buffer) per frame. Returns the lane index, or -1 (logged; the bridge
 +	// is deactivated).
-+	int AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
-+		bool a_createMirror, LaneTiming a_timing = LaneTiming::kPresent);
++	int AddLane(const char* a_name, const std::array<ID3D12Resource*, kSlots>& a_sources, bool a_createMirror,
++		LaneTiming a_timing = LaneTiming::kPresent);
 +
 +	[[nodiscard]] ID3D12Resource* Mirror(int a_lane, UINT a_slot) const noexcept;
 +
@@ -3138,6 +3163,7 @@ index 0000000..07df767
 +
 +	HANDLE fenceEvent = nullptr;
 +
++	UINT slotCount = 2;                                  // frames in flight (Initialize)
 +	UINT currentSlot = 0;                                // slot of the latest Transfer
 +	UINT64 transferValue = 0;                            // frame number of the latest Transfer
 +	std::array<UINT64, kSlots> slotTransfer{};           // frame that last used each slot
@@ -3179,7 +3205,7 @@ index 0000000..07df767
 +	LARGE_INTEGER qpcFrequency{};
 +};
 diff --git a/plugins/FrameGeneration/src/DX11Hooks.cpp b/plugins/FrameGeneration/src/DX11Hooks.cpp
-index 81be80f..5f5de78 100644
+index 81be80f..b4024b8 100644
 --- a/plugins/FrameGeneration/src/DX11Hooks.cpp
 +++ b/plugins/FrameGeneration/src/DX11Hooks.cpp
 @@ -4,6 +4,7 @@
@@ -3249,7 +3275,22 @@ index 81be80f..5f5de78 100644
  					Software,
  					Flags,
  					pFeatureLevels,
-@@ -249,7 +276,10 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
+@@ -236,6 +263,14 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
+ 
+ 				auto proxy = DX12SwapChain::GetSingleton();
+ 
++				// Frames in flight (FrameSlots.h): fixed before any per-frame resource exists.
++				proxy->frameSlots = useSecondaryGPU && upscaling->settings.extraFrameInFlight ? 3u : 2u;
++				if (upscaling->settings.extraFrameInFlight && !useSecondaryGPU)
++					REX::INFO("[FG] bExtraFrameInFlight is only used with bFrameGenOnSecondaryGPU = 1; 2 frames in flight");
++				else if (proxy->frameSlots == 3)
++					REX::INFO("[FG-GPU1] 3 frames in flight (bExtraFrameInFlight): the game waits for the frame before the "
++							  "previous one to be shown, not the previous one; one frame more latency");
++
+ 				proxy->SetD3D11Device(*ppDevice);
+ 
+ 				ID3D11DeviceContext* context;
+@@ -249,7 +284,10 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
  					dlssg->InitStreamline();
  				}
  
@@ -3261,7 +3302,7 @@ index 81be80f..5f5de78 100644
  				adapter->Release();
  
  				// XeSS-FG: create contexts after D3D12 device, no device/factory upgrade needed
-@@ -342,7 +372,9 @@ void DX11Hooks::Install()
+@@ -342,7 +380,9 @@ void DX11Hooks::Install()
  	// Always load FidelityFX as fallback
  	fidelityFX->LoadFFX();
  
@@ -3273,22 +3314,25 @@ index 81be80f..5f5de78 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..6b652da 100644
+index e10d528..0047590 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-@@ -1,9 +1,10 @@
+@@ -1,9 +1,13 @@
  #include "DX12SwapChain.h"
  
 -#include <dx12/ffx_api_dx12.hpp>
  #include <dxgi1_6.h>
  
++#include <algorithm>
++#include <format>
++
 +#include "CrossAdapterBridge.h"
  #include "FidelityFX.h"
 +#include "SecondaryUpscale.h"
  #include "Streamline.h"
  #include "UICompositor.h"
  #include "Upscaling.h"
-@@ -29,6 +30,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
+@@ -29,6 +33,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
  	REX::INFO("[FG] D3D12 device created");
  }
  
@@ -3321,7 +3365,7 @@ index e10d528..6b652da 100644
 +		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 +
 +	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-+			upscaling->settings.asyncUnpack))
++			upscaling->settings.asyncUnpack, frameSlots))
 +		return fallBack("cross-adapter bridge initialisation failed");
 +
 +	secondaryGPU = true;
@@ -3332,7 +3376,13 @@ index e10d528..6b652da 100644
  void DX12SwapChain::CreateD3D12CommandQueues()
  {
  	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-@@ -44,9 +82,32 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+@@ -39,18 +80,41 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+ 
+ 	DX::ThrowIfFailed(d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue)));
+ 
+-	for (int i = 0; i < 2; i++) {
++	for (UINT i = 0; i < frameSlots; i++) {
+ 		DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocators[i])));
  		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
  		commandLists[i]->Close();
  	}
@@ -3365,7 +3415,19 @@ index e10d528..6b652da 100644
  void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
  {
  	swapChainDesc = {};
-@@ -86,29 +147,46 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+-	swapChainDesc.BufferCount = 2;
++	swapChainDesc.BufferCount = frameSlots;
+ 	swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
+ 	swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
+ 	swapChainDesc.Format = a_swapChainDesc.BufferDesc.Format;
+@@ -81,34 +145,51 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+ 		CreateSwapChainFSR3(a_dxgiFactory, a_swapChainDesc);
+ 	}
+ 
+-	DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(&swapChainBuffers[0])));
+-	DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(&swapChainBuffers[1])));
++	for (UINT slot = 0; slot < frameSlots; ++slot)
++		DX::ThrowIfFailed(swapChain->GetBuffer(slot, IID_PPV_ARGS(&swapChainBuffers[slot])));
  
  	frameIndex = swapChain->GetCurrentBackBufferIndex();
  
@@ -3410,14 +3472,15 @@ index e10d528..6b652da 100644
 -	ffxSwapChainDesc.swapchain = &swapChain;
 -
  	auto fidelityFX = FidelityFX::GetSingleton();
-+	REX::INFO("[FG] Creating FSR3 swap chain via FFX ({})", fidelityFX->RuntimeName());
- 
+-
 -	if (ffx::CreateContext(fidelityFX->swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
 -		REX::CRITICAL("[FidelityFX] Failed to create swap chain context!");
 -	}
 -
 -	fidelityFX->SetupFrameGeneration();
 -	REX::INFO("[FG] FSR3 swap chain created: {}x{}", swapChainDesc.Width, swapChainDesc.Height);
++	REX::INFO("[FG] Creating FSR3 swap chain via FFX ({})", fidelityFX->RuntimeName());
++
 +	// Swap chain context + frame generation context; with iFSRRuntime = 1 this logs the providers
 +	// offered/selected and falls back to SDK 1.1.4 if the 2.4 runtime cannot create them.
 +	fidelityFX->CreateSwapChain(a_dxgiFactory, &swapChainDesc, a_swapChainDesc.OutputWindow, commandQueue.get(), &swapChain);
@@ -3428,7 +3491,7 @@ index e10d528..6b652da 100644
  }
  
  void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
-@@ -145,9 +223,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -145,9 +226,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -3444,7 +3507,7 @@ index e10d528..6b652da 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +248,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +251,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -3453,23 +3516,24 @@ index e10d528..6b652da 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +261,22 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +264,23 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
 -	swapChainBufferWrapped[0] = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
 -	swapChainBufferWrapped[1] = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
-+	swapChainBufferWrapped[0] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
-+	swapChainBufferWrapped[1] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
++	for (UINT slot = 0; slot < frameSlots; ++slot)
++		swapChainBufferWrapped[slot] = new WrappedResource(texDesc11, d3d11Device.get(), interop);
 +
 +	if (secondaryGPU) {
 +		// The finished frame crosses to the secondary GPU and is unpacked straight into its back buffer.
 +		// With FSR 4.1 upscaling there it goes to a mirror instead: the UI is composited from it. So
 +		// it does when the back buffer has another format (HDR add-on): a shader converts it.
 +		auto secondaryUpscale = SecondaryUpscale::GetSingleton();
-+		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame",
-+			swapChainBufferWrapped[0]->resource.get(), swapChainBufferWrapped[1]->resource.get(),
-+			secondaryUpscale->OwnsPresent());
++		std::array<ID3D12Resource*, CrossAdapterBridge::kSlots> sources{};
++		for (UINT slot = 0; slot < frameSlots; ++slot)
++			sources[slot] = swapChainBufferWrapped[slot]->resource.get();
++		finalFrameLane = CrossAdapterBridge::GetSingleton()->AddLane("final frame", sources, secondaryUpscale->OwnsPresent());
 +		if (finalFrameLane < 0)
 +			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
 +		else if (secondaryUpscale->OwnsPresent())
@@ -3478,7 +3542,18 @@ index e10d528..6b652da 100644
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -239,17 +335,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -211,6 +311,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ {
+ 	auto upscalingForUI = Upscaling::GetSingleton();
+ 
++	// The game's work for this frame is all recorded: timestamp its end on the render GPU.
++	renderGpuTimer.Collect(d3d11Context.get());
++	renderGpuTimer.FrameEnd(d3d11Device.get(), d3d11Context.get());
++
+ 	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
+ 	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
+ 	// so presenting HUDLess prevents UI from being warped. UIColorAndAlpha tells DLSS-G
+@@ -239,17 +343,69 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -3553,7 +3628,7 @@ index e10d528..6b652da 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -358,9 +506,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -358,9 +514,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			xessFrameId++;
  		}
  	} else {
@@ -3582,7 +3657,7 @@ index e10d528..6b652da 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +536,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +544,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -3605,7 +3680,7 @@ index e10d528..6b652da 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +619,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +627,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -3624,7 +3699,7 @@ index e10d528..6b652da 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +639,49 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +647,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -3666,6 +3741,8 @@ index e10d528..6b652da 100644
 +			const double presentedFps = static_cast<double>(statPresentedFrames) * 1000.0 / elapsedMs;
 +			REX::INFO("[FG-GPU1] presented {:.1f} fps | game {:.1f} fps | generated {:.0f}%", presentedFps, gameFps,
 +				presentedFps > 0.0 ? (presentedFps - gameFps) / presentedFps * 100.0 : 0.0);
++			if (const auto gpu = renderGpuTimer.TakeSummary(); !gpu.empty())
++				REX::INFO("[FG-GPU1] render GPU: {}", gpu);
 +			statGameFrames = 0;
 +			statPresentedFrames = 0;
 +			statPresentStart = now;
@@ -3674,7 +3751,7 @@ index e10d528..6b652da 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +690,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +700,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -3713,7 +3790,142 @@ index e10d528..6b652da 100644
  	// Clear resources
  	upscaling->Reset();
  
-@@ -614,7 +875,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
+@@ -472,6 +743,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+ 	if (SyncInterval == 0 && !upscaling->highFPSPhysicsFixLoaded)
+ 		upscaling->FrameLimiter(useFrameGenerationThisFrame);
+ 
++	// Everything the game records from here on is the next frame.
++	renderGpuTimer.NextFrameStart(d3d11Context.get());
++
+ 	return S_OK;
+ }
+ 
+@@ -485,6 +759,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
+ 	return swapChain->GetDevice(uuid, ppDevice);
+ }
+ 
++// ---------------------------------------------------------------------------------------
++// RenderGpuTimer
++
++bool RenderGpuTimer::Create(ID3D11Device* a_device)
++{
++	D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
++	D3D11_QUERY_DESC timestampDesc{ D3D11_QUERY_TIMESTAMP, 0 };
++	for (auto& record : records) {
++		if (FAILED(a_device->CreateQuery(&disjointDesc, record.disjoint.put())) ||
++			FAILED(a_device->CreateQuery(&timestampDesc, record.end.put())) ||
++			FAILED(a_device->CreateQuery(&timestampDesc, record.start.put())) ||
++			FAILED(a_device->CreateQuery(&timestampDesc, record.nextEnd.put()))) {
++			REX::INFO("[FG-GPU1] render GPU timestamps unavailable; its idle time will not be reported");
++			return false;
++		}
++	}
++	return true;
++}
++
++void RenderGpuTimer::FrameEnd(ID3D11Device* a_device, ID3D11DeviceContext* a_context)
++{
++	if (failed || !a_device || !a_context)
++		return;
++	if (!created) {
++		created = true;
++		failed = !Create(a_device);
++		if (failed)
++			return;
++	}
++
++	// Close the record that has been waiting for this frame's end.
++	if (current < kRecords) {
++		auto& record = records[current];
++		if (record.started) {
++			a_context->End(record.nextEnd.get());
++			a_context->End(record.disjoint.get());
++			record.pending = true;
++		} else {
++			a_context->End(record.disjoint.get());  // never started: discard
++		}
++		record.open = false;
++		record.started = false;
++		current = kRecords;
++	}
++
++	// Open the next one, unless its previous use has not been read yet (skip this frame).
++	auto& record = records[next];
++	if (record.pending)
++		return;
++	a_context->Begin(record.disjoint.get());
++	a_context->End(record.end.get());
++	record.open = true;
++	current = next;
++	next = (next + 1) % kRecords;
++}
++
++void RenderGpuTimer::NextFrameStart(ID3D11DeviceContext* a_context)
++{
++	if (failed || current >= kRecords || !a_context)
++		return;
++	auto& record = records[current];
++	if (!record.open || record.started)
++		return;
++	a_context->End(record.start.get());
++	record.started = true;
++}
++
++void RenderGpuTimer::Collect(ID3D11DeviceContext* a_context)
++{
++	if (failed || !a_context)
++		return;
++	for (auto& record : records) {
++		if (!record.pending)
++			continue;
++		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
++		if (a_context->GetData(record.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
++			continue;  // not finished yet
++		UINT64 end = 0, start = 0, nextEnd = 0;
++		const bool ready = a_context->GetData(record.end.get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
++		                   a_context->GetData(record.start.get(), &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
++		                   a_context->GetData(record.nextEnd.get(), &nextEnd, sizeof(nextEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
++		if (!ready)
++			continue;
++		record.pending = false;
++		if (disjoint.Disjoint || !disjoint.Frequency || start < end || nextEnd < start)
++			continue;
++		const double toMs = 1000.0 / static_cast<double>(disjoint.Frequency);
++		const double idle = static_cast<double>(start - end) * toMs;
++		const double span = static_cast<double>(nextEnd - start) * toMs;
++		// Loading screens and the first frame after them take seconds; they would swamp the averages.
++		if (idle > 100.0 || span > 100.0) {
++			++skipped;
++			continue;
++		}
++		idleSum += idle;
++		idleMax = (std::max)(idleMax, idle);
++		spanSum += span;
++		spanMax = (std::max)(spanMax, span);
++		++samples;
++		if (idle >= 0.5)
++			++idleFrames;
++	}
++}
++
++std::string RenderGpuTimer::TakeSummary()
++{
++	if (!samples)
++		return {};
++	const double n = static_cast<double>(samples);
++	std::string out = std::format("idle between frames avg {:.2f} ms max {:.2f} ms ({:.0f}% of frames idle >= 0.5 ms) | "
++								  "frame from its first command to its end avg {:.2f} ms max {:.2f} ms ({} frames measured{})",
++		idleSum / n, idleMax, 100.0 * static_cast<double>(idleFrames) / n, spanSum / n, spanMax, samples,
++		skipped ? std::format(", {} over 100 ms left out", skipped) : std::string{});
++	idleSum = idleMax = spanSum = spanMax = 0.0;
++	samples = idleFrames = skipped = 0;
++	return out;
++}
++
+ WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)
+ {
+ 	// Create D3D11 shared texture directly instead of wrapping D3D12 resource
+@@ -614,7 +1006,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
  {
@@ -3729,18 +3941,79 @@ index e10d528..6b652da 100644
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT , UINT , UINT , DXGI_FORMAT , UINT )
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.h b/plugins/FrameGeneration/src/DX12SwapChain.h
-index 692f459..04712c8 100644
+index 692f459..262f1cb 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.h
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.h
-@@ -10,6 +10,7 @@
+@@ -9,7 +9,11 @@
+ #include <d3d11_4.h>
  #include <d3d12.h>
  
++#include <array>
++#include <string>
++
  #include "Buffer.h"
 +#include "CrossAdapterBridge.h"
  
  class WrappedResource
  {
-@@ -73,7 +74,13 @@ public:
+@@ -57,6 +61,45 @@ public:
+ 	virtual HRESULT STDMETHODCALLTYPE GetLastPresentCount(_Out_ UINT* pLastPresentCount);
+ };
+ 
++// The render GPU's slack: D3D11 timestamps on the game's context at the end of each frame (top of
++// Present), at the first command recorded after Present returned (the GPU only reaches it once the
++// next frame's work is submitted), and at the end of the next frame. The gap between the first two
++// is time the render GPU had nothing to execute: it finished the frame before the game had sent
++// any of the next one (the game was waiting in Present, simulating, or held by the frame limiter).
++// Read back a few frames later without waiting; reported every 10 s.
++class RenderGpuTimer
++{
++public:
++	void FrameEnd(ID3D11Device* a_device, ID3D11DeviceContext* a_context);  // top of Present
++	void NextFrameStart(ID3D11DeviceContext* a_context);                     // last thing before Present returns
++	void Collect(ID3D11DeviceContext* a_context);
++	// "idle between frames ..." for the 10 s line; empty when nothing was measured.
++	std::string TakeSummary();
++
++private:
++	static constexpr UINT kRecords = 8;
++	struct Record
++	{
++		winrt::com_ptr<ID3D11Query> disjoint;
++		winrt::com_ptr<ID3D11Query> end;
++		winrt::com_ptr<ID3D11Query> start;
++		winrt::com_ptr<ID3D11Query> nextEnd;
++		bool open = false;     // end issued, start/nextEnd still to come
++		bool started = false;  // start issued
++		bool pending = false;  // closed, waiting for its data
++	};
++	bool Create(ID3D11Device* a_device);
++
++	std::array<Record, kRecords> records;
++	UINT current = kRecords;  // the open record, kRecords if none
++	UINT next = 0;
++	bool created = false;
++	bool failed = false;
++
++	double idleSum = 0.0, idleMax = 0.0, spanSum = 0.0, spanMax = 0.0;
++	UINT64 samples = 0, idleFrames = 0, skipped = 0;
++};
++
+ class DX12SwapChain
+ {
+ public:
+@@ -68,17 +111,27 @@ public:
+ 
+ 	winrt::com_ptr<ID3D12Device> d3d12Device;
+ 	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
+-	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[2];
+-	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[2];
++	// Frames in flight: the FFX swap chain's buffer count and the number of every per-frame
++	// resource (FrameSlots.h). 3 with bExtraFrameInFlight in second-GPU mode, else 2.
++	UINT frameSlots = 2;
++
++	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[kMaxFrameSlots];
  
  	IDXGISwapChain4* swapChain;
  
@@ -3754,7 +4027,19 @@ index 692f459..04712c8 100644
  
  	Texture2D* swapChainBufferProxy;
  	WrappedResource* swapChainBufferProxyENB;
-@@ -91,11 +98,30 @@ public:
+ 
+-	WrappedResource* swapChainBufferWrapped[2];
++	WrappedResource* swapChainBufferWrapped[kMaxFrameSlots]{};
+ 
+ 	winrt::com_ptr<ID3D11Device5> d3d11Device;
+ 	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;
+@@ -86,16 +139,36 @@ public:
+ 	winrt::com_ptr<ID3D11Fence> d3d11Fence;
+ 	winrt::com_ptr<ID3D12Fence> d3d12Fence;
+ 
+-	winrt::com_ptr<ID3D12Resource> swapChainBuffers[2];
++	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kMaxFrameSlots];
+ 
  	UINT frameIndex = 0;
  	UINT64 fenceValue = 0;
  
@@ -3764,6 +4049,7 @@ index 692f459..04712c8 100644
 +	UINT64 statGameFrames = 0;
 +	UINT64 statPresentedFrames = 0;
 +	LARGE_INTEGER statPresentStart{};
++	RenderGpuTimer renderGpuTimer;
 +
  	LARGE_INTEGER qpf;
  
@@ -3785,7 +4071,7 @@ index 692f459..04712c8 100644
  	void CreateD3D12CommandQueues();
  	void CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC swapChainDesc);
  	void CreateSwapChainFSR3(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc);
-@@ -109,6 +135,9 @@ public:
+@@ -109,6 +182,9 @@ public:
  	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
  
  	HRESULT GetBuffer(void** ppSurface);
@@ -4775,12 +5061,30 @@ index 78bb041..0de7d01 100644
 +	void DestroyContexts(IDXGISwapChain4** a_swapChain);
 +	void LogEnvironment(HWND a_window);
  };
+diff --git a/plugins/FrameGeneration/src/FrameSlots.h b/plugins/FrameGeneration/src/FrameSlots.h
+new file mode 100644
+index 0000000..9d40662
+--- /dev/null
++++ b/plugins/FrameGeneration/src/FrameSlots.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++// Frames in flight. Every per-frame resource (the swap chain's back buffers, the D3D11 shared
++// textures, the bridge's staging slots and mirrors, the FSR 4.1 outputs) is indexed by the FFX
++// swap chain's back-buffer index and exists DX12SwapChain::frameSlots times: 2, or 3 with
++// bExtraFrameInFlight. Arrays are sized for the most.
++//
++// Why 3 can be faster: FFX's Present for frame N returns only once the frame that used the next
++// back buffer is on screen. With 2 buffers that is frame N-1, so the game cannot start frame N+1
++// until frame N-1 went through the whole chain (render GPU, PCIe copy, display GPU, frame
++// generation and pacing); with 3 it is frame N-2, one frame time later. Costs one frame of latency.
++inline constexpr unsigned int kMaxFrameSlots = 3;
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.cpp b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
 new file mode 100644
-index 0000000..e57f07e
+index 0000000..e4af938
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/SecondaryUpscale.cpp
-@@ -0,0 +1,807 @@
+@@ -0,0 +1,818 @@
 +#include "SecondaryUpscale.h"
 +
 +#include <d3dcompiler.h>
@@ -5045,7 +5349,8 @@ index 0000000..e57f07e
 +	D3D12_HEAP_PROPERTIES defaultHeap{};
 +	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 +	if (a_upscale) {
-+		for (auto& output : outputs) {
++		for (UINT slot = 0; slot < Slots(); ++slot) {
++			auto& output = outputs[slot];
 +			hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
 +				IID_PPV_ARGS(output.put()));
 +			if (FAILED(hr))
@@ -5118,10 +5423,20 @@ index 0000000..e57f07e
 +	return false;
 +}
 +
++UINT SecondaryUpscale::Slots() const noexcept
++{
++	return CrossAdapterBridge::GetSingleton()->SlotCount();
++}
++
 +bool SecondaryUpscale::HasFinalMirror() const noexcept
 +{
 +	auto bridge = CrossAdapterBridge::GetSingleton();
-+	return OwnsPresent() && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
++	if (!OwnsPresent() || finalLane < 0)
++		return false;
++	for (UINT slot = 0; slot < Slots(); ++slot)
++		if (!bridge->Mirror(finalLane, slot))
++			return false;
++	return true;
 +}
 +
 +void SecondaryUpscale::SetFinalLane(int a_lane)
@@ -5140,7 +5455,7 @@ index 0000000..e57f07e
 +	auto bridge = CrossAdapterBridge::GetSingleton();
 +	if (!HasFinalMirror())
 +		return false;
-+	for (UINT slot = 0; slot < kSlots; ++slot) {
++	for (UINT slot = 0; slot < Slots(); ++slot) {
 +		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
 +		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
 +		// t0 and t2 are not read by Copy; null descriptors keep the table fully initialised.
@@ -5175,7 +5490,7 @@ index 0000000..e57f07e
 +	sceneLane = a_sceneLane;
 +	depthLane = a_depthLane;
 +	motionLane = a_motionLane;
-+	for (UINT slot = 0; slot < kSlots; ++slot) {
++	for (UINT slot = 0; slot < Slots(); ++slot) {
 +		ID3D12Resource* scene = bridge->Mirror(sceneLane, slot);
 +		ID3D12Resource* finished = bridge->Mirror(finalLane, slot);
 +		if (!scene || !finished || !bridge->Mirror(depthLane, slot) || !bridge->Mirror(motionLane, slot)) {
@@ -5590,10 +5905,10 @@ index 0000000..e57f07e
 +}
 diff --git a/plugins/FrameGeneration/src/SecondaryUpscale.h b/plugins/FrameGeneration/src/SecondaryUpscale.h
 new file mode 100644
-index 0000000..81b7c1d
+index 0000000..c777d1a
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/SecondaryUpscale.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,201 @@
 +#pragma once
 +
 +// SecondaryUpscale - FG-GPU1: FSR 4.1 upscaling on the display GPU.
@@ -5629,10 +5944,12 @@ index 0000000..81b7c1d
 +#include <array>
 +#include <cstdint>
 +
++#include "FrameSlots.h"
++
 +class SecondaryUpscale
 +{
 +public:
-+	static constexpr UINT kSlots = 2;
++	static constexpr UINT kSlots = kMaxFrameSlots;  // arrays; the session uses Slots() of them
 +
 +	static SecondaryUpscale* GetSingleton()
 +	{
@@ -5670,6 +5987,8 @@ index 0000000..81b7c1d
 +	// (CreateFrameGenerationResources). BindLanes false (logged) means frames cannot be upscaled.
 +	void SetFinalLane(int a_lane);
 +	[[nodiscard]] bool HasFinalMirror() const noexcept;
++	// Frames in flight this session (the bridge's slots).
++	[[nodiscard]] UINT Slots() const noexcept;
 +	bool BindLanes(int a_sceneLane, int a_depthLane, int a_motionLane);
 +	void Fail(const char* a_reason);
 +
@@ -5792,7 +6111,7 @@ index 0000000..81b7c1d
 +	bool loggedSizeMismatch = false;
 +};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..8374e97 100644
+index 3483d96..3276f2c 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
 @@ -2,8 +2,12 @@
@@ -5827,7 +6146,7 @@ index 3483d96..8374e97 100644
  		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
  		if (shaderErrors) shaderErrors->Release();
  		if (shaderBlob) shaderBlob->Release();
-@@ -120,17 +125,32 @@ void Upscaling::LoadSettings()
+@@ -120,17 +125,33 @@ void Upscaling::LoadSettings()
  {
  	CSimpleIniA ini;
  	ini.SetUnicode();
@@ -5867,10 +6186,11 @@ index 3483d96..8374e97 100644
 +	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRRuntime", 1)), 0, 1);
 +	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
 +	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
++	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +158,22 @@ void Upscaling::LoadSettings()
+@@ -138,6 +159,24 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -5890,15 +6210,18 @@ index 3483d96..8374e97 100644
 +		REX::INFO("[Frame Generation] iFSRRuntime: {} (0=FidelityFX SDK 1.1.4 / FSR 3.1.4, 1=FSR SDK 2.4, newest provider offered) "
 +				  "iFSRSwapChainProvider: {} iFSRFrameGenProvider: {} (0=newest offered, 1=newest 3.x)",
 +			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
++		REX::INFO("[Frame Generation] bExtraFrameInFlight: {} (second-GPU mode: 3 frames in flight instead of 2, +1 frame latency)",
++			settings.extraFrameInFlight);
  		loggedOnce = true;
  	}
  }
-@@ -169,6 +205,30 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,8 +208,32 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
 +	auto dx12SwapChain = DX12SwapChain::GetSingleton();
-+
+ 
+-	for (int index = 0; index < 2; index++) {
 +	D3D11_TEXTURE2D_DESC mainDesc{};
 +	reinterpret_cast<ID3D11Texture2D*>(main.texture)->GetDesc(&mainDesc);
 +
@@ -5921,10 +6244,12 @@ index 3483d96..8374e97 100644
 +	int sceneLane = -1;
 +	int depthLane = -1;
 +	int motionLane = -1;
- 
- 	for (int index = 0; index < 2; index++) {
++
++	for (UINT index = 0; index < dx12SwapChain->frameSlots; index++) {
  		D3D11_TEXTURE2D_DESC texDesc{};
-@@ -193,6 +253,9 @@ void Upscaling::CreateFrameGenerationResources()
+ 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+ 		D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+@@ -193,6 +256,9 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -5934,7 +6259,7 @@ index 3483d96..8374e97 100644
  
  		HUDLessBufferShared[index] = new Texture2D(texDesc);
  		HUDLessBufferShared[index]->CreateSRV(srvDesc);
-@@ -204,6 +267,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -204,6 +270,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -5945,7 +6270,7 @@ index 3483d96..8374e97 100644
  		depthBufferShared[index] = new Texture2D(texDesc);
  		depthBufferShared[index]->CreateSRV(srvDesc);
  		depthBufferShared[index]->CreateRTV(rtvDesc);
-@@ -218,6 +285,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -218,6 +288,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -5956,7 +6281,7 @@ index 3483d96..8374e97 100644
  		motionVectorBufferShared[index] = new Texture2D(texDesc);
  		motionVectorBufferShared[index]->CreateSRV(srvDesc);
  		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
-@@ -228,14 +299,14 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -228,14 +302,14 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -5973,7 +6298,7 @@ index 3483d96..8374e97 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +319,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +322,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -5982,7 +6307,7 @@ index 3483d96..8374e97 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +339,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +342,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -5991,7 +6316,7 @@ index 3483d96..8374e97 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +359,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +362,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -6000,7 +6325,7 @@ index 3483d96..8374e97 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +379,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +382,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -6009,7 +6334,7 @@ index 3483d96..8374e97 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,17 +388,134 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,17 +391,141 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
@@ -6021,14 +6346,18 @@ index 3483d96..8374e97 100644
 +	// instead (FidelityFX::Present reads the *Shared12 arrays). UIColorAlpha is DLSS-G only.
 +	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain) {
 +		auto bridge = CrossAdapterBridge::GetSingleton();
-+		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2],
++		const UINT slots = bridge->SlotCount();
++		const auto transport = [bridge, slots](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[kMaxFrameSlots],
 +			CrossAdapterBridge::LaneTiming a_timing) {
-+			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true, a_timing);
++			std::array<ID3D12Resource*, CrossAdapterBridge::kSlots> sources{};
++			for (UINT slot = 0; slot < slots; ++slot)
++				sources[slot] = a_resources[slot].get();
++			const int lane = bridge->AddLane(a_name, sources, true, a_timing);
 +			if (lane < 0) {
 +				REX::CRITICAL("[FG-GPU1] cannot transport '{}'; frame generation will read stale data", a_name);
 +				return lane;
 +			}
-+			for (UINT slot = 0; slot < 2; ++slot)
++			for (UINT slot = 0; slot < slots; ++slot)
 +				a_resources[slot].copy_from(bridge->Mirror(lane, slot));
 +			return lane;
 +		};
@@ -6040,8 +6369,11 @@ index 3483d96..8374e97 100644
 +		if (halfResMode == 1 && depthLane >= 0) {
 +			// FSR3 reads the full-resolution depth rebuilt from the half-resolution mirror.
 +			bridge->SetDepthUpsampleLane(depthLane);
-+			if (bridge->UpsampledDepth(0) && bridge->UpsampledDepth(1)) {
-+				for (UINT slot = 0; slot < 2; ++slot)
++			bool rebuilt = true;
++			for (UINT slot = 0; slot < slots; ++slot)
++				rebuilt = rebuilt && bridge->UpsampledDepth(slot);
++			if (rebuilt) {
++				for (UINT slot = 0; slot < slots; ++slot)
 +					depthBufferShared12[slot].copy_from(bridge->UpsampledDepth(slot));
 +			} else {
 +				REX::CRITICAL("[FG-GPU1] depth rebuild unavailable; FSR3 gets half-resolution depth at full render size. Set iHalfResDepthMV=0 or 2");
@@ -6147,7 +6479,7 @@ index 3483d96..8374e97 100644
  	
  	auto& colorMain = rendererData->renderTargets[(uint)RenderTarget::kMain];
  	auto& colorPostAlpha = rendererData->renderTargets[(uint)RenderTarget::kMainTemp];
-@@ -358,10 +546,16 @@ void Upscaling::PostAlpha()
+@@ -358,10 +556,16 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
@@ -6168,7 +6500,7 @@ index 3483d96..8374e97 100644
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +567,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +577,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -6183,7 +6515,7 @@ index 3483d96..8374e97 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +581,9 @@ void Upscaling::PostAlpha()
+@@ -387,6 +591,9 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
@@ -6193,7 +6525,7 @@ index 3483d96..8374e97 100644
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -401,18 +598,59 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -401,18 +608,59 @@ void Upscaling::CopyBuffersToSharedResources()
  
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -6258,7 +6590,7 @@ index 3483d96..8374e97 100644
  
  
  			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
-@@ -558,22 +796,124 @@ void Upscaling::PostDisplay()
+@@ -558,22 +806,124 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
@@ -6389,10 +6721,18 @@ index 3483d96..8374e97 100644
  
  void Upscaling::GenerateUIBuffer()
 diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
-index 838f927..e73ffeb 100644
+index 838f927..cf75d73 100644
 --- a/plugins/FrameGeneration/src/Upscaling.h
 +++ b/plugins/FrameGeneration/src/Upscaling.h
-@@ -23,10 +23,55 @@ public:
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "Buffer.h"
++#include "FrameSlots.h"
+ 
+ #include "SimpleIni.h"
+ 
+@@ -23,29 +24,78 @@ public:
  		bool debugLogging = false;
  		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
  		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
@@ -6406,6 +6746,7 @@ index 838f927..e73ffeb 100644
 +		int fsrRuntime = 1;              ///< 0 FidelityFX SDK 1.1.4 (FSR 3.1.4), 1 FSR SDK 2.4 (newest provider offered)
 +		int fsrSwapChainProvider = 0;    ///< SDK 2.4 only: 0 newest offered, 1 newest 3.x (A/B against 4.0.0 pacing)
 +		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
++		bool extraFrameInFlight = false; ///< Second-GPU mode: 3 swap-chain buffers instead of 2 (FrameSlots.h); restart
  	};
  
  	Settings settings;
@@ -6438,7 +6779,7 @@ index 838f927..e73ffeb 100644
 +	UINT laneWidth = 0;
 +	UINT laneHeight = 0;
 +	// PostDisplay copied this frame's scene for the second GPU (per frameIndex, cleared at Present).
-+	bool frameUpscaled[2] = { false, false };
++	bool frameUpscaled[kMaxFrameSlots] = {};
 +	// Render GPU: the full-size frame buffer is filled from the scene before the UI is drawn.
 +	Texture2D* sceneBlitTarget = nullptr;
 +	ID3D11ComputeShader* sceneBlitCS = nullptr;
@@ -6448,7 +6789,28 @@ index 838f927..e73ffeb 100644
  	bool highFPSPhysicsFixLoaded = false;
  
  	FrameGenType activeFrameGenType = FrameGenType::kFSR3;
-@@ -46,6 +91,8 @@ public:
+ 	bool d3d12Interop = false;
+ 	double refreshRate = 0.0f;
+ 
+-	Texture2D* HUDLessBufferShared[2];
+-	Texture2D* depthBufferShared[2];
+-	Texture2D* motionVectorBufferShared[2];
+-	Texture2D* UIColorAlphaShared[2];
++	// One per frame in flight (DX12SwapChain::frameSlots), indexed by frameIndex.
++	Texture2D* HUDLessBufferShared[kMaxFrameSlots]{};
++	Texture2D* depthBufferShared[kMaxFrameSlots]{};
++	Texture2D* motionVectorBufferShared[kMaxFrameSlots]{};
++	Texture2D* UIColorAlphaShared[kMaxFrameSlots]{};
+ 
+-	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[2];
+-	winrt::com_ptr<ID3D12Resource> depthBufferShared12[2];
+-	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[2];
+-	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[2];
++	winrt::com_ptr<ID3D12Resource> HUDLessBufferShared12[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12Resource> depthBufferShared12[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12Resource> motionVectorBufferShared12[kMaxFrameSlots];
++	winrt::com_ptr<ID3D12Resource> UIColorAlphaShared12[kMaxFrameSlots];
+ 
  	ID3D11ComputeShader* copyDepthToSharedBufferCS = nullptr;
  	ID3D11ComputeShader* generateSharedBuffersCS = nullptr;
  	ID3D11ComputeShader* generateUIBufferCS = nullptr;
@@ -6457,7 +6819,7 @@ index 838f927..e73ffeb 100644
  
  	bool setupBuffers = false;
  
-@@ -57,6 +104,8 @@ public:
+@@ -57,6 +107,8 @@ public:
  	void PostPostLoad();
  
  	void CreateFrameGenerationResources();

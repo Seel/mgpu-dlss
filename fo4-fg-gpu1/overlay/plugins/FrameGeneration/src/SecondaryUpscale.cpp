@@ -262,7 +262,8 @@ bool SecondaryUpscale::CreatePipeline(bool a_upscale)
 	D3D12_HEAP_PROPERTIES defaultHeap{};
 	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 	if (a_upscale) {
-		for (auto& output : outputs) {
+		for (UINT slot = 0; slot < Slots(); ++slot) {
+			auto& output = outputs[slot];
 			hr = device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
 				IID_PPV_ARGS(output.put()));
 			if (FAILED(hr))
@@ -335,10 +336,20 @@ bool SecondaryUpscale::ReadyFor(uint32_t a_width, uint32_t a_height)
 	return false;
 }
 
+UINT SecondaryUpscale::Slots() const noexcept
+{
+	return CrossAdapterBridge::GetSingleton()->SlotCount();
+}
+
 bool SecondaryUpscale::HasFinalMirror() const noexcept
 {
 	auto bridge = CrossAdapterBridge::GetSingleton();
-	return OwnsPresent() && finalLane >= 0 && bridge->Mirror(finalLane, 0) && bridge->Mirror(finalLane, 1);
+	if (!OwnsPresent() || finalLane < 0)
+		return false;
+	for (UINT slot = 0; slot < Slots(); ++slot)
+		if (!bridge->Mirror(finalLane, slot))
+			return false;
+	return true;
 }
 
 void SecondaryUpscale::SetFinalLane(int a_lane)
@@ -357,7 +368,7 @@ bool SecondaryUpscale::WriteFinishedDescriptors()
 	auto bridge = CrossAdapterBridge::GetSingleton();
 	if (!HasFinalMirror())
 		return false;
-	for (UINT slot = 0; slot < kSlots; ++slot) {
+	for (UINT slot = 0; slot < Slots(); ++slot) {
 		D3D12_CPU_DESCRIPTOR_HANDLE handle = descriptors->GetCPUDescriptorHandleForHeapStart();
 		handle.ptr += static_cast<SIZE_T>(slot * kDescriptorsPerSlot) * descriptorSize;
 		// t0 and t2 are not read by Copy; null descriptors keep the table fully initialised.
@@ -392,7 +403,7 @@ bool SecondaryUpscale::BindLanes(int a_sceneLane, int a_depthLane, int a_motionL
 	sceneLane = a_sceneLane;
 	depthLane = a_depthLane;
 	motionLane = a_motionLane;
-	for (UINT slot = 0; slot < kSlots; ++slot) {
+	for (UINT slot = 0; slot < Slots(); ++slot) {
 		ID3D12Resource* scene = bridge->Mirror(sceneLane, slot);
 		ID3D12Resource* finished = bridge->Mirror(finalLane, slot);
 		if (!scene || !finished || !bridge->Mirror(depthLane, slot) || !bridge->Mirror(motionLane, slot)) {

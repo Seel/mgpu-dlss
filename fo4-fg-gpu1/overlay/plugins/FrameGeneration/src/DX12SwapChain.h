@@ -9,6 +9,9 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 
+#include <array>
+#include <string>
+
 #include "Buffer.h"
 #include "CrossAdapterBridge.h"
 
@@ -58,6 +61,45 @@ public:
 	virtual HRESULT STDMETHODCALLTYPE GetLastPresentCount(_Out_ UINT* pLastPresentCount);
 };
 
+// The render GPU's slack: D3D11 timestamps on the game's context at the end of each frame (top of
+// Present), at the first command recorded after Present returned (the GPU only reaches it once the
+// next frame's work is submitted), and at the end of the next frame. The gap between the first two
+// is time the render GPU had nothing to execute: it finished the frame before the game had sent
+// any of the next one (the game was waiting in Present, simulating, or held by the frame limiter).
+// Read back a few frames later without waiting; reported every 10 s.
+class RenderGpuTimer
+{
+public:
+	void FrameEnd(ID3D11Device* a_device, ID3D11DeviceContext* a_context);  // top of Present
+	void NextFrameStart(ID3D11DeviceContext* a_context);                     // last thing before Present returns
+	void Collect(ID3D11DeviceContext* a_context);
+	// "idle between frames ..." for the 10 s line; empty when nothing was measured.
+	std::string TakeSummary();
+
+private:
+	static constexpr UINT kRecords = 8;
+	struct Record
+	{
+		winrt::com_ptr<ID3D11Query> disjoint;
+		winrt::com_ptr<ID3D11Query> end;
+		winrt::com_ptr<ID3D11Query> start;
+		winrt::com_ptr<ID3D11Query> nextEnd;
+		bool open = false;     // end issued, start/nextEnd still to come
+		bool started = false;  // start issued
+		bool pending = false;  // closed, waiting for its data
+	};
+	bool Create(ID3D11Device* a_device);
+
+	std::array<Record, kRecords> records;
+	UINT current = kRecords;  // the open record, kRecords if none
+	UINT next = 0;
+	bool created = false;
+	bool failed = false;
+
+	double idleSum = 0.0, idleMax = 0.0, spanSum = 0.0, spanMax = 0.0;
+	UINT64 samples = 0, idleFrames = 0, skipped = 0;
+};
+
 class DX12SwapChain
 {
 public:
@@ -69,8 +111,12 @@ public:
 
 	winrt::com_ptr<ID3D12Device> d3d12Device;
 	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
-	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[2];
-	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[2];
+	// Frames in flight: the FFX swap chain's buffer count and the number of every per-frame
+	// resource (FrameSlots.h). 3 with bExtraFrameInFlight in second-GPU mode, else 2.
+	UINT frameSlots = 2;
+
+	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[kMaxFrameSlots];
+	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[kMaxFrameSlots];
 
 	IDXGISwapChain4* swapChain;
 
@@ -85,7 +131,7 @@ public:
 	Texture2D* swapChainBufferProxy;
 	WrappedResource* swapChainBufferProxyENB;
 
-	WrappedResource* swapChainBufferWrapped[2];
+	WrappedResource* swapChainBufferWrapped[kMaxFrameSlots]{};
 
 	winrt::com_ptr<ID3D11Device5> d3d11Device;
 	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;
@@ -93,7 +139,7 @@ public:
 	winrt::com_ptr<ID3D11Fence> d3d11Fence;
 	winrt::com_ptr<ID3D12Fence> d3d12Fence;
 
-	winrt::com_ptr<ID3D12Resource> swapChainBuffers[2];
+	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kMaxFrameSlots];
 
 	UINT frameIndex = 0;
 	UINT64 fenceValue = 0;
@@ -104,6 +150,7 @@ public:
 	UINT64 statGameFrames = 0;
 	UINT64 statPresentedFrames = 0;
 	LARGE_INTEGER statPresentStart{};
+	RenderGpuTimer renderGpuTimer;
 
 	LARGE_INTEGER qpf;
 

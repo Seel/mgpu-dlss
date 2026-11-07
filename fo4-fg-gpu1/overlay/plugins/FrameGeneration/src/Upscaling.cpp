@@ -151,6 +151,7 @@ void Upscaling::LoadSettings()
 	settings.fsrRuntime = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRRuntime", 1)), 0, 1);
 	settings.fsrSwapChainProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRSwapChainProvider", 0)), 0, 1);
 	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
+	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -174,6 +175,8 @@ void Upscaling::LoadSettings()
 		REX::INFO("[Frame Generation] iFSRRuntime: {} (0=FidelityFX SDK 1.1.4 / FSR 3.1.4, 1=FSR SDK 2.4, newest provider offered) "
 				  "iFSRSwapChainProvider: {} iFSRFrameGenProvider: {} (0=newest offered, 1=newest 3.x)",
 			settings.fsrRuntime, settings.fsrSwapChainProvider, settings.fsrFrameGenProvider);
+		REX::INFO("[Frame Generation] bExtraFrameInFlight: {} (second-GPU mode: 3 frames in flight instead of 2, +1 frame latency)",
+			settings.extraFrameInFlight);
 		loggedOnce = true;
 	}
 }
@@ -230,7 +233,7 @@ void Upscaling::CreateFrameGenerationResources()
 	int depthLane = -1;
 	int motionLane = -1;
 
-	for (int index = 0; index < 2; index++) {
+	for (UINT index = 0; index < dx12SwapChain->frameSlots; index++) {
 		D3D11_TEXTURE2D_DESC texDesc{};
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 		D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
@@ -393,14 +396,18 @@ void Upscaling::CreateFrameGenerationResources()
 	// instead (FidelityFX::Present reads the *Shared12 arrays). UIColorAlpha is DLSS-G only.
 	if (dx12SwapChain->secondaryGPU && dx12SwapChain->swapChain) {
 		auto bridge = CrossAdapterBridge::GetSingleton();
-		const auto transport = [bridge](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[2],
+		const UINT slots = bridge->SlotCount();
+		const auto transport = [bridge, slots](const char* a_name, winrt::com_ptr<ID3D12Resource> (&a_resources)[kMaxFrameSlots],
 			CrossAdapterBridge::LaneTiming a_timing) {
-			const int lane = bridge->AddLane(a_name, a_resources[0].get(), a_resources[1].get(), true, a_timing);
+			std::array<ID3D12Resource*, CrossAdapterBridge::kSlots> sources{};
+			for (UINT slot = 0; slot < slots; ++slot)
+				sources[slot] = a_resources[slot].get();
+			const int lane = bridge->AddLane(a_name, sources, true, a_timing);
 			if (lane < 0) {
 				REX::CRITICAL("[FG-GPU1] cannot transport '{}'; frame generation will read stale data", a_name);
 				return lane;
 			}
-			for (UINT slot = 0; slot < 2; ++slot)
+			for (UINT slot = 0; slot < slots; ++slot)
 				a_resources[slot].copy_from(bridge->Mirror(lane, slot));
 			return lane;
 		};
@@ -412,8 +419,11 @@ void Upscaling::CreateFrameGenerationResources()
 		if (halfResMode == 1 && depthLane >= 0) {
 			// FSR3 reads the full-resolution depth rebuilt from the half-resolution mirror.
 			bridge->SetDepthUpsampleLane(depthLane);
-			if (bridge->UpsampledDepth(0) && bridge->UpsampledDepth(1)) {
-				for (UINT slot = 0; slot < 2; ++slot)
+			bool rebuilt = true;
+			for (UINT slot = 0; slot < slots; ++slot)
+				rebuilt = rebuilt && bridge->UpsampledDepth(slot);
+			if (rebuilt) {
+				for (UINT slot = 0; slot < slots; ++slot)
 					depthBufferShared12[slot].copy_from(bridge->UpsampledDepth(slot));
 			} else {
 				REX::CRITICAL("[FG-GPU1] depth rebuild unavailable; FSR3 gets half-resolution depth at full render size. Set iHalfResDepthMV=0 or 2");

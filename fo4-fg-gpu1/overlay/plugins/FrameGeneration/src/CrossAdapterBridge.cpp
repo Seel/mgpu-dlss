@@ -475,11 +475,12 @@ void CrossAdapterBridge::GpuTimer::Reset() noexcept
 // Setup
 
 bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
-	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack)
+	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots)
 {
 	Shutdown();
 	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
 		return false;
+	slotCount = std::clamp(a_slots, 2u, kSlots);
 
 	deviceA.copy_from(a_deviceA);
 	deviceB.copy_from(a_deviceB);
@@ -610,14 +611,16 @@ void CrossAdapterBridge::SetDisplayQueue(ID3D12CommandQueue* a_queueB)
 		REX::INFO("[FG-GPU1] display GPU direct-queue timestamps unavailable");
 }
 
-int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot0, ID3D12Resource* a_sourceSlot1,
+int CrossAdapterBridge::AddLane(const char* a_name, const std::array<ID3D12Resource*, kSlots>& a_sources,
 	bool a_createMirror, LaneTiming a_timing)
 {
 	if (!active)
 		return -1;
-	if (!a_sourceSlot0 || !a_sourceSlot1) {
-		Fail("AddLane (null source)", E_POINTER);
-		return -1;
+	for (UINT slot = 0; slot < slotCount; ++slot) {
+		if (!a_sources[slot]) {
+			Fail("AddLane (null source)", E_POINTER);
+			return -1;
+		}
 	}
 	if (lanes.size() >= kMaxLanes) {
 		Fail("AddLane (too many lanes)", E_INVALIDARG);
@@ -627,9 +630,9 @@ int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot
 	Lane lane;
 	lane.name = a_name;
 	lane.timing = a_timing;
-	lane.sourceA[0].copy_from(a_sourceSlot0);
-	lane.sourceA[1].copy_from(a_sourceSlot1);
-	lane.desc = a_sourceSlot0->GetDesc();
+	for (UINT slot = 0; slot < slotCount; ++slot)
+		lane.sourceA[slot].copy_from(a_sources[slot]);
+	lane.desc = a_sources[0]->GetDesc();
 
 	if (lane.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || lane.desc.MipLevels != 1 ||
 		lane.desc.DepthOrArraySize != 1 || lane.desc.SampleDesc.Count != 1) {
@@ -654,7 +657,7 @@ int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot
 	lane.bytes = totalA;
 	lane.slotStride = AlignUp(totalA, kHeapAlignment);
 
-	const UINT64 heapSize = lane.slotStride * kSlots;
+	const UINT64 heapSize = lane.slotStride * slotCount;
 	HRESULT hr = CreateSharedHeapPair(heapSize, lane.heapA, lane.heapB);
 	if (FAILED(hr)) {
 		Fail("cross-adapter heap (CreateHeap SHARED | SHARED_CROSS_ADAPTER / OpenSharedHandle)", hr);
@@ -691,7 +694,7 @@ int CrossAdapterBridge::AddLane(const char* a_name, ID3D12Resource* a_sourceSlot
 		mirrorDesc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
 		D3D12_HEAP_PROPERTIES defaultHeap{};
 		defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		for (UINT slot = 0; slot < kSlots; ++slot) {
+		for (UINT slot = 0; slot < slotCount; ++slot) {
 			hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &mirrorDesc,
 				D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(lane.mirrorB[slot].put()));
 			if (FAILED(hr)) {
@@ -1467,7 +1470,7 @@ bool CrossAdapterBridge::CreateDepthUpsampler(UINT a_width, UINT a_height, const
 	uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
 	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 
-	for (UINT slot = 0; slot < kSlots; ++slot) {
+	for (UINT slot = 0; slot < slotCount; ++slot) {
 		// COMMON between uses, like the mirrors: FFX's read promotes it implicitly.
 		hr = deviceB->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &targetDesc,
 			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(upsampler.target[slot].put()));
@@ -1507,7 +1510,7 @@ void CrossAdapterBridge::SetDepthUpsampleLane(int a_lane)
 	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	srvDesc.Texture2D.MipLevels = 1;
-	for (UINT slot = 0; slot < kSlots; ++slot) {
+	for (UINT slot = 0; slot < slotCount; ++slot) {
 		if (!lane.mirrorB[slot]) {
 			REX::ERROR("[FG-GPU1] depth lane has no mirror on the display GPU; depth rebuild disabled");
 			return;
