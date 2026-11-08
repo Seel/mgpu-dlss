@@ -101,11 +101,35 @@ $src = "$WorkDir\FO4Upscaling"
 Fetch-Pinned "https://github.com/northaxosky/FO4Upscaling.git" $src $UpstreamSha -Recursive
 
 Step "Applying the GPU1 overlay"
+# What the last build left in the checkout for each overlay file, to tell which ones change now.
+$overlayRoot = (Resolve-Path "$Here\overlay").Path
+$overlayFiles = @(Get-ChildItem -Recurse -File $overlayRoot | ForEach-Object {
+    [pscustomobject]@{ Source = $_.FullName; Target = Join-Path $src $_.FullName.Substring($overlayRoot.Length + 1) }
+})
+$previous = @{}
+foreach ($file in $overlayFiles) {
+    if (Test-Path $file.Target) { $previous[$file.Target] = (Get-FileHash $file.Target -Algorithm SHA256).Hash }
+}
 # Back to the pinned commit first, so files the overlay no longer carries (it moved or dropped
 # some) do not linger from earlier builds. Only the source folders; build\ and extern\ stay.
+# reset first: regenerating fg-gpu1.patch marks new files with `git add -N`, and checkout and
+# clean leave such intent-to-add files in place, where the CMake glob would compile them.
+Run git @("-C", $src, "reset", "-q")
 Run git @("-C", $src, "checkout", "-q", "--", ".")
 Run git @("-C", $src, "clean", "-fdq", "--", "plugins", "package", "include", "cmake")
 Copy-Item -Recurse -Force "$Here\overlay\*" $src
+# Copy-Item keeps the overlay files' timestamps. A file edited while the previous build ran is then
+# older than its object file and would not be recompiled, so every file whose content changed
+# since the last build is stamped now; unchanged ones keep their time and are not rebuilt.
+$now = Get-Date
+$touched = 0
+foreach ($file in $overlayFiles) {
+    if ($previous[$file.Target] -ne (Get-FileHash $file.Source -Algorithm SHA256).Hash) {
+        (Get-Item $file.Target).LastWriteTime = $now
+        $touched++
+    }
+}
+Write-Host "$touched overlay file(s) changed since the last build"
 & git -C $src status --short
 
 Step "vcpkg @ $($VcpkgSha.Substring(0,7))"

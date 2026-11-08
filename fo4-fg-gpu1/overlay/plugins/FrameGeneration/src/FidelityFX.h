@@ -80,6 +80,11 @@ public:
 	// The swap chain's real format, read from its back buffer after creation (an HDR add-on may have
 	// changed it from the game's RGBA8). Frame generation is created with it.
 	DXGI_FORMAT displayFormat = DXGI_FORMAT_UNKNOWN;
+	// Frame generation knows the RGBA8 HUD-less frame's format: SDK 2.4 is told it, SDK 1.1.4 assumes
+	// the back buffer's. False with 1.1.4 under a back buffer of another format (HDR add-on); frame
+	// generation then stays off (DX12SwapChain::Present), because giving FFX no HUD-less frame
+	// instead leaves it without a scene (black screen, found on test/mv-freeze-hud-bars).
+	bool hudlessFormatKnown = true;
 
 	// FG-GPU1: FSR 4.1 upscaling on the display GPU (SDK 2.4 only; see SecondaryUpscale).
 	ffx::Context upscaleContext{};

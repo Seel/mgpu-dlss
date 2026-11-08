@@ -25,6 +25,10 @@
 // the swap chain's format and native frames go through it too (Copy). Without FSR 4.1 upscaling
 // the same pass is set up on its own ("conversion only"): the finished frame gets a mirror and is
 // copied into the back buffer through the composite. With an RGBA8 swap chain nothing changes.
+//
+// Single-GPU mode (bFrameGenOnSecondaryGPU = 0) uses only that conversion pass, on the game's GPU:
+// InitializeLocalConversion at swap-chain creation, SetLocalFrames with the D3D12 side of the game's
+// finished frames, then RecordLocalConversion instead of the plain copy into the back buffer.
 
 #include <d3d12.h>
 #include <dxgi.h>
@@ -54,6 +58,20 @@ public:
 	// pass is set up on its own (Converting()).
 	bool Initialize(ID3D12Device* a_device, ID3D12CommandQueue* a_queue, UINT a_displayWidth, UINT a_displayHeight,
 		DXGI_FORMAT a_displayFormat);
+
+	// Single-GPU mode, at swap-chain creation, when the back buffers (a_displayFormat) are not the
+	// format the game renders (a_sourceFormat): sets up the conversion pass on the game's GPU for
+	// a_slots frames in flight. False (logged): nothing is set up, the caller keeps its plain copy.
+	bool InitializeLocalConversion(ID3D12Device* a_device, UINT a_width, UINT a_height, DXGI_FORMAT a_displayFormat,
+		DXGI_FORMAT a_sourceFormat, UINT a_slots);
+	// The D3D12 side of the game's finished frame per slot (CreateInterop). False (logged) when the
+	// conversion cannot read them.
+	bool SetLocalFrames(const std::array<ID3D12Resource*, kSlots>& a_frames);
+	// Single-GPU conversion set up and bound: RecordLocalConversion replaces the plain copy.
+	[[nodiscard]] bool ConvertsLocally() const noexcept { return local && converting && localBound; }
+	// On the frame's direct list: the game's finished frame of a_slot converted into a_backBuffer
+	// (PRESENT before and after).
+	void RecordLocalConversion(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_backBuffer);
 
 	// Set up for it: the lanes are sized for the render resolution and the finished frame is
 	// unpacked into a mirror. Fixed for the session.
@@ -124,7 +142,11 @@ private:
 	// signature, descriptors and the display-format composite; Copy when the swap chain is not RGBA8.
 	bool CreatePipeline(bool a_upscale);
 	bool CreateComputePipeline(const char* a_entry, winrt::com_ptr<ID3D12PipelineState>& a_pipeline);
+	// a_format can be written from a shader (typed UAV store) on a_device.
+	static bool Storable(ID3D12Device* a_device, DXGI_FORMAT a_format);
 	bool WriteFinishedDescriptors();
+	// Copy's table per slot: t1 = a_finished[slot] (read as a_format), u0 = the composite.
+	bool WriteCopyDescriptors(const std::array<ID3D12Resource*, kSlots>& a_finished, DXGI_FORMAT a_format);
 	void RecordCopyThroughComposite(ID3D12GraphicsCommandList* a_list, UINT a_slot, ID3D12Resource* a_finished,
 		ID3D12Resource* a_backBuffer);
 	bool TrySubmit(UINT a_slot);
@@ -135,6 +157,14 @@ private:
 	bool bound = false;
 	bool failed = false;
 	DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+	// Single-GPU conversion: the game's finished frames on the same device, bound by SetLocalFrames.
+	bool local = false;
+	bool localBound = false;
+	bool loggedLocalFrame = false;
+	UINT localSlots = 2;
+	DXGI_FORMAT sourceFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+	std::array<ID3D12Resource*, kSlots> localFrames{};  // not owned (DX12SwapChain's WrappedResources)
 
 	UINT renderWidth = 0;
 	UINT renderHeight = 0;

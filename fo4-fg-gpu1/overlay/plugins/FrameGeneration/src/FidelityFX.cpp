@@ -362,14 +362,17 @@ bool FidelityFX::CreateContexts(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DE
 	} else {
 		REX::WARN("[FSR] could not read the swap chain's back buffer; assuming format {}", static_cast<int>(displayFormat));
 	}
+	// The HUD-less copy is RGBA8 (see the hudless descriptor below); only SDK 2.4 can be told so.
+	hudlessFormatKnown = sdk24 || displayFormat == DXGI_FORMAT_R8G8B8A8_UNORM;
 	if (displayFormat != a_desc->Format) {
 		REX::WARN("[FSR] the swap chain was created as format {} but is format {} (an HDR add-on such as ReShade's AutoHDR "
-				  "changed it); frame generation and the display GPU's output follow it. Change HDR settings only with the "
-				  "game closed",
+				  "changed it); frame generation and everything this plugin writes into the back buffers follow it. Change "
+				  "HDR settings only with the game closed",
 			static_cast<int>(a_desc->Format), static_cast<int>(displayFormat));
-		if (!sdk24)
-			REX::ERROR("[FSR] {} cannot be told that the UI-free frame stays RGBA8 under a {} back buffer; generated "
-					   "frames may be wrong. Use iFSRRuntime = 1 with HDR add-ons",
+		if (!hudlessFormatKnown)
+			REX::ERROR("[FSR] {} cannot be told that the UI-free frame stays RGBA8 under a format {} back buffer, so frame "
+					   "generation stays off this session (frames are shown as rendered). Use iFSRRuntime = 1 with HDR "
+					   "add-ons",
 				RuntimeName(), static_cast<int>(displayFormat));
 	}
 
@@ -723,7 +726,6 @@ void FidelityFX::Present(bool a_useFrameGeneration, const FrameOverride* a_overr
 		configParameters.frameGenerationCallbackUserContext = &frameGenContext;
 
 		configParameters.HUDLessColor = HUDLessColor ? ffxApiGetResourceDX12(HUDLessColor) : FfxApiResource({});
-
 	}
 	else {
 		configParameters.frameGenerationEnabled = false;

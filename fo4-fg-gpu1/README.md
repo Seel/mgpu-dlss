@@ -43,7 +43,7 @@ Synchronisation never makes the 3090 wait for the copy of the frame it just fini
 The changes:
 - `CrossAdapterBridge.h/.cpp` are new: adapter choice, cross-adapter heaps and fences, the copy queue, unpacking, stats.
 - `PeerCopy.h/.cpp` are new: the 9060's Vulkan side of `bDirectGPUCopy` (CPU-visible VRAM blocks the 3090 writes into, the copy into D3D12 landing heaps, the shared fence).
-- `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU, and the conversion into a swap chain an HDR add-on changed.
+- `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU, and the conversion into a swap chain an HDR add-on changed (on the second GPU, or on the game's GPU in single-GPU mode).
 - `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` are small edits.
 - `plugins/MGPUScaling/src/upscaler/` is FO4Upscaling's `Upscaling` plugin, wrapped in `namespace up` (its classes have the same names as the frame-generation part's) and patched: upscale method 3 renders for the second GPU's FSR 4.1. Its entry point is `Upscaler.cpp`.
 - `plugins/MGPUScaling/src/XSEPlugin.cpp` replaces both plugins' entry points and installs their hooks in the order the two DLLs did (see the comment there); `MGPUScaling.h/.cpp` hold the paths, the settings loader and the one-time settings migration.
@@ -385,8 +385,26 @@ freezes, and possibly the crash after loading a save. Now:
   (`[FG-GPU1] the swap chain is R10G10B10A2_UNORM (HDR10) ... every frame is converted`);
 - the game-side lanes stay RGBA8, so nothing changes on the 3090 or across PCIe.
 
-Limits: this needs `iFSRRuntime = 1` (the 1.1.4 runtime cannot be told the UI-free frame's format)
-and the second-GPU mode (single-GPU frame generation still cannot convert). **Change HDR settings
+**Single-GPU mode** (`bFrameGenOnSecondaryGPU = 0`, game and monitor on the same GPU) works the same
+way, on that GPU: FFX's swap chain is the one ReShade attaches to, frame generation is created for
+the format AutoHDR gave it with an RGBA8 UI-free frame, and the finished frame goes into the back
+buffer through the same conversion pass (`Copy` in `SecondaryUpscaleCS.hlsl`: one full-screen read,
+write and copy; not measured yet, expected well under 1 ms at 4K) instead of a plain copy, with
+frame generation on or off. The log says
+`[FG] the swap chain is R10G10B10A2_UNORM (HDR10) (format 24), the game renders R8G8B8A8_UNORM
+(format 28): every frame is converted on the game's GPU ...` at startup and
+`[FG] first frame converted into the ... back buffer on the game's GPU` once frames flow. (Before
+this, single-GPU mode logged `[FG] the swap chain is format 24 but the game renders format 28 ...
+only bFrameGenOnSecondaryGPU = 1 converts between them` and showed a wrong picture.) FSR 4.1 is a
+second-GPU feature and is not involved; the upscaler on the game's GPU (`iUpscaleMethodPreference`
+1 or 2) renders before all of this and is unaffected. DLSS-G and XeSS frame generation
+(`iFrameGenType` 1/2, not shipped in this package) get the converted frame too but are not told the
+UI-free frame's format; the log warns.
+
+Limits: this needs `iFSRRuntime = 1`. The 1.1.4 runtime cannot be told that the UI-free frame stays
+RGBA8, so under an HDR back buffer frame generation stays off for the session (logged as an error;
+the picture is right, just not doubled). Giving FFX no UI-free frame instead leaves it without a
+scene (black screen, seen while testing `bSendHudlessFrame = 0`). **Change HDR settings
 only with the game closed**: toggling HDR in the AutoHDR overlay resizes the swap chain behind FFX
 and this plugin, which cannot see it (ReShade hides the format change), so expect a wrong picture
 until a restart. ReShade
@@ -528,7 +546,7 @@ rate (~10 GB/s), and `display GPU: unpack` the local copy out of the landing hea
 - **`bDirectGPUCopy` is new.** First in-game run (2026-11-08, CS, ReShade AutoHDR, FSR 4.1 Quality, 3 frames in flight): every frame crossed directly at the 70.9 fps cap, check values never late, but **Alt+F4 hung the PC** (no bugcheck, power button). The first build freed the 9060's VRAM blocks in its destructors, after the drivers had started unloading and while the 3090 still had them open. The current build releases them in the right order before anything unloads (see "At exit" in [Direct GPU-to-GPU copy](#direct-gpu-to-gpu-copy-bdirectgpucopy-experimental)); `tools/p2p-probe --exit-gpu` checks that with copies in flight. Not yet re-tested in game: after quitting, the log should end with `direct GPU copy: the game is exiting; closed the render GPU's views ...`. If frame generation turns itself off, look for `direct GPU copy guard`; for anything else odd, set it back to 0. It creates a Vulkan instance in the game process with implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~` while it is created), so overlays' Vulkan layers stay out.
 - **Cross-adapter heap 3090 → 9060 XT.** MGPU Bridge proved AMD → NVIDIA. This direction should work the same way, and if it fails the code tries the reverse automatically. If both fail, the log shows the HRESULT and frame generation stays on the 3090.
 - **A failure after startup is not recovered.** Once the bridge is up, the first failed HRESULT — including the 2 s timeout waiting for the previous frame's copy if the secondary GPU's queue stalls — disables the transport for the rest of the session. `secondaryGPU` stays selected, so the game keeps running but no new frame reaches the screen (`CRITICAL [FG-GPU1] transport is down`). Restart the game; there is no automatic single-GPU fallback after this point.
-- **HDR add-ons are followed at startup only.** A swap-chain format set while FFX creates it is handled (previous section); one changed later (HDR toggled in game) is not seen and needs a restart. The finished-frame copy refuses formats it cannot copy into (it used to compare only size and row pitch, which 8-bit and 10-bit share), so if the conversion is not set up for some reason the screen stays black and the log has `lane 'final frame' is ... format 28 but its destination is ... format 24; skipping the copy`.
+- **HDR add-ons are followed at startup only.** A swap-chain format set while FFX creates it is handled (previous section); one changed later (HDR toggled in game) is not seen and needs a restart. The finished-frame copy refuses formats it cannot copy into (it used to compare only size and row pitch, which 8-bit and 10-bit share), so if the conversion is not set up for some reason the screen stays black and the log has `lane 'final frame' is ... format 28 but its destination is ... format 24; skipping the copy`. In single-GPU mode a conversion that could not be set up is logged as an `[FG]` error and the plain copy stays (wrong colours, as before this version).
 - **Other upscaling / frame generation plugins.** `AAAFrameGeneration.dll` (FO4Upscaling, old FG-GPU1) keeps MGPU Scaling off for the session (message box); another `Upscaling.dll` (doodlum's, FO4Upscaling's) turns MGPU Scaling's upscaler off. Remove them. The upscaler's hooks are installed at F4SE's PostLoad, i.e. after every plugin's own load, where `Upscaling.dll` used to install them; plugins that sort after "Upscaling" and hook the same render calls would now be nested inside it.
 - **FO4 Community Shaders**: its current source disables all of CS when an `Upscaling.dll` below plugin version 1.2 is installed (it takes it for doodlum's); the old FG-GPU1 `Upscaling.dll` was version 1.0 (the CS build installed here, `bcad629`, predates that check). MGPU Scaling ships no `Upscaling.dll`. Keep CS's own Upscaling and FrameGeneration features off: they would create a second swap chain and a second ReShade runtime on the 3090. CS's **frame annotations** (`[diagnostics] frame_annotations`) hook `DrawWorld::Forward` and `DrawWorld::Imagespace` before this plugin does; FO4Upscaling's detour library cannot sit on top of another plugin's hook (it copies the hook's jump unrelocated), which crashed the game on the first world frame. MGPU Scaling now chains behind such a hook instead and logs `[HOOK] ... was already hooked by another plugin ...; chained behind it`.
 - **PCIe budget at 4K.** Start at 2560×1440 if the copy time is too high. The log prints the exact payload per lane; colour, HUD-less colour and depth are 4 B/px, but if the game's motion-vector target is RGBA16F (8 B/px) the total is ~166 MB/frame at 4K rather than the 133 MB quoted above. Trimming the depth/motion copies to the render resolution is the next optimisation (not done yet).

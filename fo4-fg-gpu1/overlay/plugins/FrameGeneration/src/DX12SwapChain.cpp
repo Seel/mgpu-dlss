@@ -162,11 +162,18 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
 	if (displayFormat != swapChainDesc.Format)
 		REX::INFO("[FG] back buffers: format {}, the game renders format {}", static_cast<int>(displayFormat),
 			static_cast<int>(swapChainDesc.Format));
-	if (displayFormat != swapChainDesc.Format && !secondaryGPU)
-		REX::ERROR("[FG] the swap chain is format {} but the game renders format {} (an HDR add-on changed it); only "
-				   "bFrameGenOnSecondaryGPU = 1 converts between them, so the picture will be wrong. Disable the add-on "
-				   "(e.g. ReShade's AutoHDR) or use the second-GPU mode",
-			static_cast<int>(displayFormat), static_cast<int>(swapChainDesc.Format));
+	// Single-GPU mode: the game's finished frame cannot be copied into back buffers of another format
+	// (an HDR add-on changed them); the conversion pass second-GPU mode uses runs on this GPU instead.
+	// Its frames are bound in CreateInterop. Without it the plain copy stays, and the picture is wrong.
+	if (displayFormat != swapChainDesc.Format && !secondaryGPU && swapChain) {
+		const bool converting = SecondaryUpscale::GetSingleton()->InitializeLocalConversion(d3d12Device.get(),
+			swapChainDesc.Width, swapChainDesc.Height, displayFormat, swapChainDesc.Format, frameSlots);
+		if (converting && upscaling->activeFrameGenType != Upscaling::FrameGenType::kFSR3)
+			REX::WARN("[FG] {} frame generation is not told that its UI-free frame stays format {} under the format {} "
+					  "back buffers; generated frames may be wrong. Use iFrameGenType = 0 (FSR3) with HDR add-ons",
+				upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG ? "DLSS-G" : "XeSS",
+				static_cast<int>(swapChainDesc.Format), static_cast<int>(displayFormat));
+	}
 
 	// FG-GPU1: FSR 4.1 upscaling on this GPU when the upscaler is set to it, and/or the conversion
 	// into back buffers whose format an HDR add-on changed. Decided here, before the lanes exist,
@@ -281,6 +288,13 @@ void DX12SwapChain::CreateInterop()
 			REX::CRITICAL("[FG-GPU1] the finished frame cannot be transported; the screen will stay black. Set bFrameGenOnSecondaryGPU=0");
 		else if (secondaryUpscale->OwnsPresent())
 			secondaryUpscale->SetFinalLane(finalFrameLane);
+	} else if (SecondaryUpscale::GetSingleton()->Converting()) {
+		// Single GPU, back buffers in another format (HDR add-on): Present converts the finished frame
+		// from these into the back buffer instead of copying it.
+		std::array<ID3D12Resource*, SecondaryUpscale::kSlots> frames{};
+		for (UINT slot = 0; slot < frameSlots; ++slot)
+			frames[slot] = swapChainBufferWrapped[slot]->resource.get();
+		SecondaryUpscale::GetSingleton()->SetLocalFrames(frames);
 	}
 }
 
@@ -433,8 +447,12 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			swapChainBuffers[frameIndex].get());
 	}
 
-	// Transfer frame to swap chain buffer (single-GPU path)
-	if (!secondaryGPU) {
+	// Transfer frame to swap chain buffer (single-GPU path). Back buffers in another format than the
+	// game's (an HDR add-on such as ReShade's AutoHDR changed them) get it through the conversion
+	// pass; the content stays SDR, frame generation reads its RGBA8 HUD-less copy as before.
+	if (!secondaryGPU && secondaryUpscale->ConvertsLocally()) {
+		secondaryUpscale->RecordLocalConversion(commandLists[frameIndex].get(), frameIndex, swapChainBuffers[frameIndex].get());
+	} else if (!secondaryGPU) {
 		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
 		auto dstResource = swapChainBuffers[frameIndex].get();
 
@@ -470,6 +488,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// bDirectGPUCopy's guard tripped: the frames cross through system memory again, and frame generation
 	// stays off for the rest of the session so the change is impossible to miss (the log says why).
 	if (crossAdapter && bridge->DirectCopyTripped())
+		useFrameGenerationThisFrame = false;
+	// FSR SDK 1.1.4 under a back buffer an HDR add-on changed cannot be told the UI-free frame's
+	// format (FidelityFX::CreateContexts logged it): no frame generation, frames shown as rendered.
+	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kFSR3 && !FidelityFX::GetSingleton()->hudlessFormatKnown)
 		useFrameGenerationThisFrame = false;
 
 	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG) {
