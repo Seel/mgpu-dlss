@@ -8,11 +8,12 @@ Handoff for a fresh session. Read this first; it assumes no memory of the previo
 2. ~~**Re-baseline in game.**~~ **Done (user, 2026-11-08 ~01:30):** the fps drop was not the PC. The user
    had deleted `Data\MCM\Settings\FrameGeneration.ini`, thinking `MGPUScaling.ini` (MCM) now held
    everything; with it back the fps is back (01:11 run: 58.6-67.4 game fps, direct copy on, AutoHDR
-   on, FSR 3 `iUpscaleMethodPreference=2`). Open question, not chased: `MGPUScaling.dll` reads
-   `FrameGeneration.ini` only once, to carry settings into a missing `MGPUScaling.ini`
-   (`mgpu::MigrateSettings`), and the RAM profile was restored at the same time, so the code path
-   that made the old file matter is not identified. If fps drops again with the file present, look
-   for another reader of it before anything else.
+   on, FSR 3 `iUpscaleMethodPreference=2`). The user tested with the RAM fixed first: fps stayed
+   low until the ini was restored, so the file really matters. Open question, parked by the user
+   for UI tiles: `MGPUScaling.dll` reads `FrameGeneration.ini` only once, to carry settings into a
+   missing `MGPUScaling.ini` (`mgpu::MigrateSettings`), so something else reads it. Suspects: the
+   leftover `Data\F4SE\Plugins\FrameGeneration` folder / an old FG plugin still loading, or MCM.
+   Check the F4SE log's loaded plugin list and `F4SE\Plugins` for a second FG DLL.
 3. **Quit once with Alt+F4 and once from the main menu** with direct copy on. The last log line must
    be `direct GPU copy: ... closed the render GPU's views of the display GPU's VRAM, then freed the
    blocks`. Seen 4 times so far, always "terminating itself" (FO4 ends via TerminateProcess). No hang
