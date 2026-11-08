@@ -2,39 +2,29 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
-## TODO for the next session (written 2026-11-08 ~01:00)
+## TODO for the next session (written 2026-11-08 ~01:00, updated 2026-11-08 afternoon)
 
-The PC is being put back together: a hard hang on exit (fixed, below) forced a power-off, and the
-board came back with the RAM at JEDEC 2133 MT/s instead of the user's tuned profile (notes say
-quad-channel DDR4-3800 with tweaked timings; 4 x G.Skill F4-4400C19). Every fps number since 00:05
-on 2026-11-08 is ~25% low for that reason alone. In order:
-
-1. **Check the PC first.** `Get-CimInstance Win32_PhysicalMemory | Select ConfiguredClockSpeed,
-   ConfiguredVoltage` should show the tuned speed (not 2133 / 1200 mV). Resizable BAR still on:
-   `nvidia-smi -q -d MEMORY` BAR1 32768 MiB, and `tools/p2p-probe/p2p-probe.exe` (no arguments)
-   should say the AMD block is "type 2 (heap 1, 15.92 GiB)". If either is off, stop and tell the user.
-2. **Re-baseline in game** (user plays, agent reads logs). Run `tools/save-runs.ps1` first so runs do
-   not overwrite each other (logs land in `D:\fgb\runs\<time>-direct<0|1>-<hdr|sdr>`). Same spot,
-   ~10 s to settle, ~60 s each: `bDirectGPUCopy=1`, then `=0`, AutoHDR on. The user's
-   `Data\MCM\Settings\MGPUScaling.ini` currently has the second GPU, FG, FSR 4.1
-   (`iUpscaleMethodPreference =3`), `bSendHudlessFrame=1`, `bExtraFrameInFlight=1`,
-   `bDirectGPUCopy=1`. Expect ~62-71 game fps like the 00:02 run. At 2133 MT/s direct copy was ~3%
-   faster than system memory (50.5 vs 48.6), AutoHDR cost nothing measurable.
+1. ~~**Check the PC first.**~~ **Done.** RAM back at 3800 MT/s since the 01:01 boot.
+2. ~~**Re-baseline in game.**~~ **Done (user, 2026-11-08):** the fps drop was not the PC. The user
+   had deleted `Data\MCM\Settings\FrameGeneration.ini`, thinking `MGPUScaling.ini` (MCM) now held
+   everything; with it back the fps is back (01:11 run: 58.6-67.4 game fps, direct copy on, AutoHDR
+   on, FSR 3 `iUpscaleMethodPreference=2`). Open question, not chased: `MGPUScaling.dll` reads
+   `FrameGeneration.ini` only once, to carry settings into a missing `MGPUScaling.ini`
+   (`mgpu::MigrateSettings`), and the RAM profile was restored at the same time, so the code path
+   that made the old file matter is not identified. If fps drops again with the file present, look
+   for another reader of it before anything else.
 3. **Quit once with Alt+F4 and once from the main menu** with direct copy on. The last log line must
    be `direct GPU copy: ... closed the render GPU's views of the display GPU's VRAM, then freed the
    blocks`. Seen 4 times so far, always "terminating itself" (FO4 ends via TerminateProcess). No hang
    since the fix.
-4. **The merged AutoHDR branch.** Session "AutoHDR (10-bit swap chain) in single-GPU mode" left
-   `claude/admiring-blackwell-f97e03` (531ec98, worktree `.claude/worktrees/admiring-blackwell-f97e03`,
-   not pushed): single-GPU AutoHDR + build-script fixes, merged with everything from this branch up
-   to 0046e81. Its build `D:\fgh\MGPU-Scaling.zip` is untested in game. Test single-GPU + AutoHDR
-   (`bFrameGenOnSecondaryGPU=0`) and second-GPU mode with it; then ask the user whether to merge it
-   back into `test/mv-freeze-hud-bars` (or main). Uncommitted notes/probe changes on this branch
-   (contention mode, these notes, `tools/save-runs.ps1`) are not in it.
+4. **Test the merged AutoHDR work in game.** `claude/admiring-blackwell-f97e03` (single-GPU AutoHDR
+   + build-script fixes) was merged into `test/mv-freeze-hud-bars` and main on 2026-11-08 at the
+   user's request, before an in-game test. Test single-GPU + AutoHDR (`bFrameGenOnSecondaryGPU=0`)
+   and second-GPU mode with a build from main.
 5. **Optional, direct copy:** it adds ~0.2 ms of render-thread time per frame (`submit` 0.60 vs
    0.42 ms with it off; one vkQueueSubmit plus a D3D12 fence Signal/Wait per lane). Moving the
    Vulkan submissions to a worker thread would remove it; only worth it if the user wants the last %.
-6. **Later (user put these off):** [plans/UI-TILES.md](plans/UI-TILES.md) part 2 (send only the
+6. **Next focus (user, 2026-11-08):** [plans/UI-TILES.md](plans/UI-TILES.md) part 2 (send only the
    finished frame's UI tiles in FSR 4.1 mode, `bSendUITilesOnly`), then
    [plans/DISPLAY-THREAD.md](plans/DISPLAY-THREAD.md) (FFX Present on its own thread). They aim at
    the last few fps to the 71 cap with Community Shaders on; part 1 (HUD motion-vector freeze) is on
@@ -76,7 +66,8 @@ detached. Every probe run had closed the 3090's view first. Fix:
 `direct GPU copy: the game is terminating itself; closed the render GPU's views ..., then freed the
 blocks`, no hang.
 
-**Resolved (00:5x): the lower base fps is the PC, not the mod.** After the forced power-off at
+**Superseded (see TODO item 2): the user traced the fps drop to a deleted
+`MCM\Settings\FrameGeneration.ini`, not the RAM.** Kept as written at 00:5x: After the forced power-off at
 00:04 the RAM came back at JEDEC defaults: 4 x G.Skill F4-4400C19 at **2133 MT/s, 1.20 V**
 (`Win32_PhysicalMemory`), where the notes have quad-channel DDR4-3800. ReBAR stayed on. A/B at one
 spot after that boot (logs in `D:\fgb\runs\20261108-0043..` to `-0048..`):
