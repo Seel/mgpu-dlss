@@ -2,10 +2,10 @@
 
 Handoff for a fresh session. Read this first; it assumes no memory of the previous conversation.
 
-## TODO for the next session (written 2026-11-08 ~01:00, updated 2026-11-08 afternoon)
+## TODO for the next session (written 2026-11-08 ~01:00, updated 2026-11-08 01:36)
 
 1. ~~**Check the PC first.**~~ **Done.** RAM back at 3800 MT/s since the 01:01 boot.
-2. ~~**Re-baseline in game.**~~ **Done (user, 2026-11-08):** the fps drop was not the PC. The user
+2. ~~**Re-baseline in game.**~~ **Done (user, 2026-11-08 ~01:30):** the fps drop was not the PC. The user
    had deleted `Data\MCM\Settings\FrameGeneration.ini`, thinking `MGPUScaling.ini` (MCM) now held
    everything; with it back the fps is back (01:11 run: 58.6-67.4 game fps, direct copy on, AutoHDR
    on, FSR 3 `iUpscaleMethodPreference=2`). Open question, not chased: `MGPUScaling.dll` reads
